@@ -1,0 +1,14 @@
+# Bazel output directories and symlinks
+/bazel-*
+
+# CMake out-of-tree build directories
+/build/
+/cmake-build*/
+
+# Compiled object and archive artifacts
+*.o
+*.a
+
+# BBC MOS and sideways ROM images. The filenames are the socket map.
+/bbc_b_rom_sockets/*.rom
+/bbc_master_rom_sockets/*.rom

@@ -1,0 +1,178 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+LINUX_COPTS = select({
+    "@platforms//os:linux": ["-D_GNU_SOURCE"],
+    "//conditions:default": [],
+})
+
+COMMON_COPTS = [
+    "-std=c99",
+    "-fPIC",
+] + LINUX_COPTS
+
+COMMON_INCLUDES = [
+    "6502_interpreter",
+    "c_compiler",
+    "c_compiler/util",
+    "c_compiler/ELF",
+    "c_compiler/Loader",
+    "c_compiler/Loader/Architecture",
+    "c_compiler/6502",
+]
+
+cc_library(
+    name = "utils",
+    srcs = [
+        "c_compiler/util/binary_tree.c",
+        "c_compiler/util/bitset.c",
+        "c_compiler/util/buffer.c",
+        "c_compiler/util/config.c",
+        "c_compiler/util/dstring.c",
+        "c_compiler/util/hashtable.c",
+        "c_compiler/util/list.c",
+        "c_compiler/util/map.c",
+        "c_compiler/util/set.c",
+        "c_compiler/util/vector.c",
+    ],
+    hdrs = glob(["c_compiler/util/*.h"]),
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
+cc_library(
+    name = "elf",
+    srcs = [
+        "c_compiler/ELF/elf_format.c",
+        "c_compiler/ELF/elf_reader.c",
+        "c_compiler/ELF/elf_writer.c",
+    ],
+    hdrs = glob(["c_compiler/ELF/*.h"]),
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+    deps = [":utils"],
+)
+
+cc_library(
+    name = "filesystem_host",
+    srcs = ["c_compiler/Loader/filesystem_host.c"],
+    hdrs = ["c_compiler/Loader/filesystem_host.h"],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
+cc_library(
+    name = "chrono_host",
+    srcs = ["c_compiler/Loader/chrono_host.c"],
+    hdrs = ["c_compiler/Loader/chrono_host.h"],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+    deps = [":filesystem_host"],
+)
+
+cc_library(
+    name = "random_host",
+    srcs = ["c_compiler/Loader/random_host.c"],
+    hdrs = ["c_compiler/Loader/random_host.h"],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
+cc_library(
+    name = "loader",
+    srcs = [
+        "c_compiler/Loader/Architecture/loader_arch_6502.c",
+        "c_compiler/Loader/loader.c",
+        "c_compiler/Loader/loader_dynamic.c",
+        "c_compiler/Loader/loader_lifecycle.c",
+    ],
+    hdrs = glob([
+        "c_compiler/Loader/*.h",
+        "c_compiler/Loader/Architecture/*.h",
+    ]),
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":elf",
+        ":utils",
+    ],
+)
+
+cc_library(
+    name = "6502_lib",
+    srcs = [
+        "6502_interpreter/6502_debugger.c",
+        "6502_interpreter/6502_devices.c",
+        "6502_interpreter/6502_disassembler.c",
+        "6502_interpreter/6502_interpreter.c",
+        "6502_interpreter/6502_nmos.c",
+        "6502_interpreter/bbc_hardware.c",
+    ],
+    hdrs = glob(["6502_interpreter/*.h"]) + [
+        "c_compiler/6502/6502_machine.h",
+    ],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+    linkopts = ["-lpthread"],
+    deps = [
+        ":elf",
+        ":chrono_host",
+        ":filesystem_host",
+        ":random_host",
+        ":loader",
+        ":utils",
+    ],
+)
+
+cc_binary(
+    name = "6502",
+    srcs = ["6502_interpreter/main.c"],
+    copts = COMMON_COPTS,
+    deps = [":6502_lib"],
+)
+
+cc_library(
+    name = "bbc_ui",
+    srcs = ["6502_interpreter/bbc_host.c"],
+    hdrs = ["6502_interpreter/bbc_mac.m"],
+    copts = COMMON_COPTS + ["-x", "objective-c", "-fobjc-arc"],
+    includes = COMMON_INCLUDES,
+    deps = [":6502_lib"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+cc_binary(
+    name = "bbc",
+    srcs = ["6502_interpreter/bbc_entry.c"],
+    copts = COMMON_COPTS,
+    linkopts = [
+        "-framework",
+        "Cocoa",
+        "-framework",
+        "AudioToolbox",
+    ],
+    deps = [":bbc_ui"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+cc_test(
+    name = "bbc_hardware_test",
+    srcs = [
+        "6502_interpreter/bbc_hardware.c",
+        "6502_interpreter/bbc_hardware_test.c",
+    ] + glob(["6502_interpreter/*.h"]),
+    copts = COMMON_COPTS + ["-Wall", "-Wextra"],
+    includes = COMMON_INCLUDES,
+    linkopts = ["-lpthread"],
+)
+
+cc_test(
+    name = "6502_nmos_test",
+    srcs = ["6502_interpreter/6502_nmos_test.c"],
+    copts = COMMON_COPTS + ["-Wall", "-Wextra"],
+    includes = COMMON_INCLUDES,
+    deps = [":6502_lib"],
+)
