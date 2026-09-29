@@ -618,6 +618,7 @@ void W65C02InterpreterInit(W65C02Interpreter* interpreter, bool debug,
   interpreter->trace = trace;
   StringInit(&interpreter->rom_filename, rom_filename);
   interpreter->cycle_accurate = cycle_accurate;
+  interpreter->allow_turbo = true;
   VectorInit(&interpreter->breakpoints);
   VectorInit(&interpreter->watchpoints);
 
@@ -1546,24 +1547,52 @@ void W65C02DisassemblePc(W65C02Interpreter* interpreter) {
 // 2 MHz = 500 ns per cycle.
 #define CPU_CYCLE_NS 500
 
+bool W65C02InterpreterSetClockMhz(W65C02Interpreter* interpreter, int mhz) {
+  if (interpreter == NULL || mhz < 1 || mhz > 16) {
+    return false;
+  }
+  interpreter->clock_mhz = mhz;
+  interpreter->allow_turbo = false;
+  interpreter->turbo = false;
+  return true;
+}
+
+// Nanoseconds of wall time for one guest cycle. A fixed clock above 2 MHz
+// shortens this so the whole machine, timers included, runs faster together.
+static uint64_t NsPerCycle(const W65C02Interpreter* interpreter) {
+  int mhz = interpreter->clock_mhz;
+  uint64_t ns;
+  if (mhz < 1) {
+    mhz = 2;
+  }
+  ns = (uint64_t)CPU_CYCLE_NS * 2 / (uint64_t)mhz;
+  if (ns < 1) {
+    ns = 1;
+  }
+  return ns;
+}
+
 #ifdef __MACH__
-static uint64_t TicksPerCycle(void) {
+static uint64_t TicksForNs(uint64_t ns) {
   static mach_timebase_info_data_t info;
-  static uint64_t ticks = 0;
-  if (ticks == 0) {
+  static int ready = 0;
+  uint64_t ticks;
+  if (!ready) {
     mach_timebase_info(&info);
-    ticks = ((uint64_t)CPU_CYCLE_NS * info.denom + info.numer / 2) / info.numer;
-    if (ticks == 0) {
-      ticks = 1;
-    }
+    ready = 1;
+  }
+  ticks = (ns * info.denom + info.numer / 2) / info.numer;
+  if (ticks == 0) {
+    ticks = 1;
   }
   return ticks;
 }
 #endif
 
-// A short stretch with interrupts on and almost no stores is the keyboard
-// wait, a delay loop, or a poll of the CRTC or system VIA. A disc poll reads
-// the controller instead, and a memory fill stores constantly: those run ahead.
+// A short stretch with interrupts on and almost no stores outside page 0 is
+// the keyboard wait, a BASIC delay, or a poll of the CRTC or system VIA. A
+// disc poll reads the controller instead, and a memory fill stores constantly:
+// those run ahead.
 static void UpdatePace(W65C02Interpreter* interpreter, int cycles) {
   bool waiting;
   if (interpreter->bbc == NULL || interpreter->bbc_os_path == NULL) {
@@ -1579,7 +1608,7 @@ static void UpdatePace(W65C02Interpreter* interpreter, int cycles) {
   // A cursor blink or one disc poll looks like work for a single window.
   // Drop to real time immediately, and only run ahead after the guest has
   // stayed busy, so the frame size does not flap.
-  if (waiting || BbcMachineSounding(interpreter->bbc)) {
+  if (!interpreter->allow_turbo || waiting || BbcMachineSounding(interpreter->bbc)) {
     interpreter->turbo = false;
     interpreter->pace_busy = 0;
   } else if (interpreter->pace_busy < 4) {
@@ -1665,15 +1694,18 @@ static void ChargeCycles(W65C02Interpreter* interpreter, bool cycle_accurate, in
   interpreter->cycle_origin += (uint64_t)interpreter->owed_cycles;
   interpreter->owed_cycles = 0;
 #ifdef __MACH__
-  target = interpreter->cycle_anchor + interpreter->cycle_origin * TicksPerCycle();
-  if (target > now) {
-    mach_wait_until(target);
-  } else if (now - target > 50000000ull * TicksPerCycle() / (uint64_t)CPU_CYCLE_NS) {
-    interpreter->cycle_anchor = now;
-    interpreter->cycle_origin = 0;
+  {
+    uint64_t ticks = TicksForNs(NsPerCycle(interpreter));
+    target = interpreter->cycle_anchor + interpreter->cycle_origin * ticks;
+    if (target > now) {
+      mach_wait_until(target);
+    } else if (now - target > TicksForNs(50000000ull)) {
+      interpreter->cycle_anchor = now;
+      interpreter->cycle_origin = 0;
+    }
   }
 #else
-  target = interpreter->cycle_anchor + interpreter->cycle_origin * (uint64_t)CPU_CYCLE_NS;
+  target = interpreter->cycle_anchor + interpreter->cycle_origin * NsPerCycle(interpreter);
   if (target > now) {
     uint64_t wait = target - now;
     struct timespec delay;
@@ -1726,7 +1758,11 @@ static void W65C02TakeIrq(W65C02Interpreter* interpreter) {
 }
 
 void W65C02NoteStore(W65C02Interpreter* cpu, uint16_t addr) {
-  if (cpu->in_irq || (addr >= 0x100 && addr <= 0x1ff)) {
+  // Page 0 is the BASIC scratchpad and page 1 is the stack. A delay such as
+  // UNTIL TIME MOD 100=0 stores there on every pass. Counting those stores
+  // makes the pause look like a memory fill, so the clock runs fast and the
+  // beam is never painted.
+  if (cpu->in_irq || addr < 0x200) {
     return;
   }
   if (cpu->pace_stores < 100000) {
@@ -1932,7 +1968,7 @@ bool W65C02InterpreterPrepareBbc(W65C02Interpreter* interpreter) {
     interpreter->flags.bits.d = 0;
   }
   interpreter->nmos = !interpreter->bbc_65c02;
-  interpreter->turbo = interpreter->bbc_os_path != NULL;
+  interpreter->turbo = interpreter->allow_turbo && interpreter->bbc_os_path != NULL;
   interpreter->in_irq = 0;
   interpreter->jammed = false;
   interpreter->pc = (uint16_t)(interpreter->memory[0xfffc] |
@@ -1966,7 +2002,7 @@ void W65C02InterpreterResetCpu(W65C02Interpreter* interpreter) {
   interpreter->pace_sheila = 0;
   interpreter->pace_watch = 0;
   interpreter->pace_busy = 0;
-  interpreter->turbo = interpreter->bbc_os_path != NULL;
+  interpreter->turbo = interpreter->allow_turbo && interpreter->bbc_os_path != NULL;
   if (interpreter->sc12) {
     interpreter->flags.bits.d = 0;
   }
@@ -2349,12 +2385,15 @@ static void TestAndChangeBits(W65C02Interpreter* interpreter, uint16_t addr, boo
 }
 
 
+// N is bit 7 of the 8-bit difference. V is not changed. A signed compare
+// is N xor V, which is the caller's job; folding it into N makes BPL fire
+// when the register is less than the operand.
 #define SET_CMP_FLAGS(reg, src, result) {\
-  uint8_t _v = result;\
+  uint8_t _v = (uint8_t)(result);\
+  (void)(interpreter->reg);\
+  (void)(src);\
   SET_ZERO(_v);\
-  int overflow = (((~(interpreter->reg ^ src)) & (interpreter->reg ^ result)) & 0x80) != 0; \
-  int negative = (_v & 0x80) != 0; \
-  interpreter->flags.bits.s = (negative ^ overflow) != 0; \
+  SET_SIGN(_v);\
 }
 
 // Set overflow flag based on accumulator value, the src value being

@@ -30,7 +30,7 @@ static void Usage() {
           "           [-bbc-disc file] [-bbc-disc-port n] [-bbc-fdc 8271|1770]\n"
           "           [-bbc-fs dfs|adfs]\n"
           "           [-bbc-65c02] [-bbc-tape file] [-bbc-tape-port n]\n"
-          "           [-bbc-printer file] filename\n"
+          "           [-bbc-printer file] [-bbc-2mhz] [-bbc-mhz n] filename\n"
           "       With -bbc, Model B ROMs are read from bbc_b_rom_sockets and\n"
           "       Master ROMs from bbc_master_rom_sockets. os.rom or\n"
           "       os-<name>.rom is the OS. <socket>-<name>.rom is sideways\n"
@@ -47,7 +47,10 @@ static void Usage() {
           "       127.0.0.1:8177. -bbc-disc-port 0 closes that socket.\n"
           "       cassette inserts a tape. It connects to 127.0.0.1:8178.\n"
           "       -bbc-tape-port 0 closes that socket. -bbc-tape still loads a\n"
-          "       tape before the machine starts.\n");
+          "       tape before the machine starts.\n"
+          "       A busy program runs ahead of the wall clock. -bbc-2mhz holds\n"
+          "       the CPU at 2 MHz. -bbc-mhz n holds it at n MHz, from 1 to\n"
+          "       16, with the timers and the video still in step.\n");
   exit(1);
 }
 
@@ -209,6 +212,7 @@ int main(int argc, char *argv[]) {
   int fdc_kind = 0;
   int filing = BBC_FS_ANY;
   bool bbc_65c02 = false;
+  int bbc_mhz = 0;
   int bbc_model = BBC_MACHINE_B;
   bool bbc_sram_set = false;
   bool bbc_sram[16];
@@ -388,6 +392,23 @@ int main(int argc, char *argv[]) {
       } else if (strcmp(argv[i], "-bbc-65c02") == 0) {
         bbc_65c02 = true;
         bbc = true;
+      } else if (strcmp(argv[i], "-bbc-2mhz") == 0) {
+        bbc_mhz = 2;
+        cycle_accurate = true;
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-mhz") == 0) {
+        char* end = NULL;
+        long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value < 1 || value > 16) {
+          Usage();
+        }
+        bbc_mhz = (int)value;
+        cycle_accurate = true;
+        bbc = true;
       } else if (strcmp(argv[i], "-bbc-tape") == 0) {
         if (i == argc - 1) {
           Usage();
@@ -456,6 +477,9 @@ int main(int argc, char *argv[]) {
     rom_filename = default_rom.value;
   }
   W65C02InterpreterInit(&interpreter, debug, cycle_accurate, trace, rom_filename);
+  if (bbc_mhz > 0 && !W65C02InterpreterSetClockMhz(&interpreter, bbc_mhz)) {
+    Usage();
+  }
   StringDestruct(&default_rom);
   if (bbc) {
     int r;

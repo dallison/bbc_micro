@@ -92,7 +92,11 @@ typedef struct W65C02Interpreter {
   bool jammed;
   // Run ahead of the wall clock while the guest is computing. Real time
   // while it waits on the keyboard, the frame, or the speaker.
+  // allow_turbo is cleared by -mhz. clock_mhz is the fixed rate; 0 lets a
+  // busy guest run ahead of the wall clock.
   bool turbo;
+  bool allow_turbo;
+  int clock_mhz;
   int in_irq;
   int pace_stores;
   int pace_sheila;
@@ -130,6 +134,10 @@ void W65C02InterpreterBbcUse65C02(W65C02Interpreter* interpreter, bool enable);
 // Allocate guest RAM, map ROMs, and reset. With no OS image, a small MODE 7
 // demo is installed so the display and speaker have something to run.
 bool W65C02InterpreterPrepareBbc(W65C02Interpreter* interpreter);
+// Hold the guest at a fixed clock. The VIA, video, and sound stay locked
+// to the CPU, so a program that counts cycles still sees a BBC Micro,
+// played faster. mhz is 1..16.
+bool W65C02InterpreterSetClockMhz(W65C02Interpreter* interpreter, int mhz);
 // Execute one instruction. Returns the CPU cycles it consumed.
 int W65C02InterpreterStep(W65C02Interpreter* interpreter);
 void W65C02InterpreterResetCpu(W65C02Interpreter* interpreter);

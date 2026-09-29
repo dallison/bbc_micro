@@ -315,7 +315,12 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
 - (void)startAudio {
   AudioStreamBasicDescription format;
   memset(&format, 0, sizeof(format));
-  format.mSampleRate = 48000;
+  // A faster fixed clock produces samples faster. Play them at that rate so
+  // the pitch and the envelopes stay locked to the CPU.
+  {
+    int mhz = g_cpu.clock_mhz > 0 ? g_cpu.clock_mhz : 2;
+    format.mSampleRate = 48000.0 * (double)mhz / 2.0;
+  }
   format.mFormatID = kAudioFormatLinearPCM;
   format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
   format.mBitsPerChannel = 16;
@@ -325,6 +330,11 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   format.mBytesPerPacket = 2;
   OSStatus status = AudioQueueNewOutput(&format, AudioCallback, (__bridge void*)self, NULL,
                                         NULL, 0, &_audioQueue);
+  if (status != noErr && format.mSampleRate != 48000.0) {
+    format.mSampleRate = 48000.0;
+    status = AudioQueueNewOutput(&format, AudioCallback, (__bridge void*)self, NULL, NULL, 0,
+                                 &_audioQueue);
+  }
   if (status != noErr) {
     fprintf(stderr, "AudioQueueNewOutput failed (%d)\n", (int)status);
     return;
@@ -376,7 +386,17 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
     BbcMachineSetFire(g_cpu.bbc, 1, (buttons & (NSUInteger)2) != 0);
   }
   int cycles = 0;
-  int limit = g_cpu.turbo ? 2000000 : kFrameCycles;
+  // One timer tick is 1/50 s. At 2 MHz that is one frame. A fixed faster
+  // clock runs more frames in the same tick, with the hardware still
+  // advancing one cycle per CPU cycle.
+  int budget = kFrameCycles;
+  if (g_cpu.clock_mhz > 0) {
+    budget = kFrameCycles * g_cpu.clock_mhz / 2;
+    if (budget < 1) {
+      budget = 1;
+    }
+  }
+  int limit = g_cpu.turbo ? 2000000 : budget;
   uint64_t started = mach_absolute_time();
   static mach_timebase_info_data_t timebase;
   static uint64_t slice = 0;
@@ -390,7 +410,7 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
       break;
     }
     cycles += step;
-    if (!g_cpu.turbo && cycles >= kFrameCycles) {
+    if (!g_cpu.turbo && cycles >= budget) {
       break;
     }
     if (g_cpu.turbo && cycles > kFrameCycles && mach_absolute_time() - started > slice) {
@@ -428,9 +448,10 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
       shown = stamp;
     }
   }
-  // The beam paints scanlines as the CPU runs. Redrawing while the CPU is
-  // running ahead replaces that picture and flashes the screen on each command.
-  if (!g_cpu.turbo && BbcMachineCompletedFrames(g_cpu.bbc) == 0) {
+  // Real time paints the beam as the CPU runs. Running ahead skips the beam,
+  // so snapshot the screen. Otherwise a stretch that never waits, such as the
+  // clock face being drawn, keeps showing the previous picture.
+  if (g_cpu.turbo || BbcMachineCompletedFrames(g_cpu.bbc) == 0) {
     BbcMachineRender(g_cpu.bbc);
   }
   int width = BbcFrameWidth(g_cpu.bbc);
@@ -531,7 +552,7 @@ static void Usage(void) {
           "           [-disc file] [-disc0 file] [-disc1 file] [-disc-port n]\n"
           "           [-fdc 8271|1770] [-fs dfs|adfs] [-65c02]\n"
           "           [-tape file] [-tape-port n]\n"
-          "           [-printer file]\n"
+          "           [-printer file] [-mhz n] [-turbo]\n"
           "       The default machine is the Model B. Its ROMs come from\n"
           "       bbc_b_rom_sockets. master and master128 use\n"
           "       bbc_master_rom_sockets, a 65SC12, a WD1770, and sideways RAM\n"
@@ -550,7 +571,11 @@ static void Usage(void) {
           "       image before startup.\n"
           "       cassette inserts a tape and records guest saves back into\n"
           "       the file. It connects to 127.0.0.1:8178. -tape-port 0 closes\n"
-          "       that socket. -tape still loads a tape before startup.\n");
+          "       that socket. -tape still loads a tape before startup.\n"
+          "       The CPU runs at 2 MHz, in step with the timers and the video.\n"
+          "       -mhz n selects another fixed rate, from 1 to 16. -2mhz is\n"
+          "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
+          "       of the wall clock.\n");
 }
 
 int main(int argc, char** argv) {
@@ -570,6 +595,8 @@ int main(int argc, char** argv) {
     int fdc_kind = 0;
     int filing = BBC_FS_ANY;
     bool use_65c02 = false;
+    int clock_mhz = 2;
+    bool run_ahead = false;
     const char* tape_path = NULL;
     const char* printer_path = NULL;
     const char* roms_arg = NULL;
@@ -741,6 +768,26 @@ int main(int argc, char** argv) {
           return 1;
         }
         printer_path = argv[++i];
+      } else if (strcmp(argv[i], "-2mhz") == 0) {
+        clock_mhz = 2;
+        run_ahead = false;
+      } else if (strcmp(argv[i], "-turbo") == 0) {
+        run_ahead = true;
+      } else if (strcmp(argv[i], "-mhz") == 0) {
+        char* end = NULL;
+        long value;
+        if (i + 1 >= argc) {
+          Usage();
+          return 1;
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' ||
+            !W65C02InterpreterSetClockMhz(&g_cpu, (int)value)) {
+          Usage();
+          return 1;
+        }
+        clock_mhz = (int)value;
+        run_ahead = false;
       } else if (strcmp(argv[i], "-selftest") == 0) {
         selftest = true;
       } else if (strcmp(argv[i], "-h") == 0) {
@@ -774,6 +821,10 @@ int main(int argc, char** argv) {
       }
     }
     W65C02InterpreterInit(&g_cpu, false, true, false, NULL);
+    if (!run_ahead && !W65C02InterpreterSetClockMhz(&g_cpu, clock_mhz)) {
+      Usage();
+      return 1;
+    }
     W65C02InterpreterUseBbc(&g_cpu, mode, NULL, os_path);
     if (g_cpu.bbc == NULL || !BbcMachineSetModel(g_cpu.bbc, machine)) {
       fprintf(stderr, "Unable to select the BBC machine\n");

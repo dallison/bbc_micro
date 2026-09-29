@@ -1,3 +1,4 @@
+#include "6502_interpreter.h"
 #include "6502_nmos.h"
 
 #include <stdio.h>
@@ -86,6 +87,41 @@ int main(void) {
   mem[0x601] = 0x10;
   EXPECT(NmosExecute(&cpu, 0x80) > 0);
   EXPECT(cpu.pc == 0x602);
+
+  // CPX must leave N as bit 7 of X - M. The text-window check in the OS
+  // rejects a cursor with BPL after CPX, so a cleared N drops TAB.
+  cpu.running = true;
+  cpu.nmos = true;
+  cpu.flags.bits.i = 1;
+  cpu.flags.bits.v = 1;
+  cpu.x = 6;
+  cpu.pc = 0x700;
+  mem[0x700] = 0xec;
+  mem[0x701] = 0x80;
+  mem[0x702] = 0x00;
+  mem[0x80] = 0x13;
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.flags.bits.s == 1);
+  EXPECT(cpu.flags.bits.z == 0);
+  EXPECT(cpu.flags.bits.c == 0);
+  EXPECT(cpu.flags.bits.v == 1);
+  EXPECT(cpu.x == 6);
+
+  cpu.x = 0x20;
+  cpu.pc = 0x700;
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.flags.bits.s == 0);
+  EXPECT(cpu.flags.bits.c == 1);
+
+  cpu.a = 0x80;
+  cpu.pc = 0x710;
+  mem[0x710] = 0xc9;
+  mem[0x711] = 0x01;
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.flags.bits.s == 0);
+  EXPECT(cpu.flags.bits.z == 0);
+  EXPECT(cpu.flags.bits.c == 1);
+  EXPECT(cpu.flags.bits.v == 1);
 
   free(mem);
   if (g_failures != 0) {
