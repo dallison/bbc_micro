@@ -5,15 +5,22 @@
 
 #include "bbc_hardware.h"
 #include "bbc_font.h"
+#include "cassette.h"
+#include "cumana.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -63,6 +70,24 @@ typedef struct {
   bool sr_active;
   int sr_period;
 } BbcVia;
+
+typedef struct BbcDiscImage {
+  uint8_t* data;
+  size_t length;
+  int tracks;
+  int sides;
+  int spt;
+  bool protect;
+  char* path;
+  int fd;
+} BbcDiscImage;
+
+// A connected cumana waits here until the CPU thread mounts the image.
+struct CumanaPending {
+  int fd;
+  CumanaInsert insert;
+  struct CumanaPending* next;
+};
 
 struct BbcMachine {
   uint8_t* ram;
@@ -160,15 +185,11 @@ struct BbcMachine {
     uint8_t buffer[1024];
     uint8_t track_image[8192];
     int track_left;
-    struct {
-      uint8_t* data;
-      size_t length;
-      int tracks;
-      int sides;
-      int spt;
-      bool protect;
-      char* path;
-    } disc[2];
+    // disc[0] and disc[1] are DFS/ADFS drives 0 and 1. extra[0] and extra[1]
+    // are DFS drives 2 and 3: the second side of those two drives, used when
+    // that side was inserted as its own image.
+    BbcDiscImage disc[2];
+    BbcDiscImage extra[2];
   } fdc;
   BbcVia sys;
   BbcVia user;
@@ -221,6 +242,8 @@ struct BbcMachine {
   uint8_t* sideways[16];
   bool sideways_loaded[16];
   bool sideways_ram[16];
+  uint8_t rom_fs[16];
+  uint8_t rom_fdc[16];
   bool any_sideways;
   int model;
   bool master;
@@ -245,6 +268,36 @@ struct BbcMachine {
   int frame_width;
   int frame_height;
   unsigned frames;
+  int disc_listen_fd;
+  int disc_listen_port;
+  int disc_handshake_fd;
+  bool disc_listen_started;
+  bool disc_listen_stop;
+  pthread_t disc_listen_thread;
+  pthread_mutex_t disc_mu;
+  struct CumanaPending* disc_pending;
+  int disc_attention;
+  int disc_watch_acc;
+  int tape_fd;
+  char* tape_path;
+  bool tape_dirty;
+  bool tape_protect;
+  int tape_listen_fd;
+  int tape_listen_port;
+  int tape_handshake_fd;
+  bool tape_listen_started;
+  bool tape_listen_stop;
+  pthread_t tape_listen_thread;
+  pthread_mutex_t tape_mu;
+  struct TapePending* tape_pending;
+  int tape_attention;
+  int tape_watch_acc;
+};
+
+struct TapePending {
+  int fd;
+  CassetteInsert insert;
+  struct TapePending* next;
 };
 
 static int ScreenSubtract(const BbcMachine* bbc) {
@@ -1336,8 +1389,16 @@ static void AcaiAdvance(BbcMachine* bbc, int cycles) {
     if (bbc->acia_tx_wait <= 0) {
       bbc->acia_tx_wait = 0;
       bbc->acia_tx_empty = true;
-      if (CassetteSelected(bbc) && MotorOn(bbc) && bbc->tape_pos >= bbc->tape_len) {
+      // Recording only happens past the end of the tape. Leave the position
+      // there, or the next byte is played back instead of recorded.
+      if (CassetteSelected(bbc) && MotorOn(bbc) && !bbc->tape_protect &&
+          bbc->tape_pos >= bbc->tape_len) {
+        size_t before = bbc->tape_len;
         TapeAppend(bbc, bbc->acia_tx, 0);
+        if (bbc->tape_len > before) {
+          bbc->tape_pos = bbc->tape_len;
+          bbc->tape_dirty = true;
+        }
       }
     }
   }
@@ -1705,9 +1766,37 @@ static void FdcUpdateNmi(BbcMachine* bbc) {
   FdcSetLine(bbc, on);
 }
 
+// The surface the controller is about to touch. side_in_image is the head
+// inside that image: 0 for a disc mounted as DFS drive 2 or 3.
+static BbcDiscImage* FdcImage(const BbcMachine* bbc, int* side_in_image) {
+  BbcMachine* machine = (BbcMachine*)bbc;
+  int drive = machine->fdc.drive;
+  int side = machine->fdc.side;
+  if (side_in_image != NULL) {
+    *side_in_image = 0;
+  }
+  if (drive < 0 || drive > 1 || side < 0) {
+    return NULL;
+  }
+  if (side >= 1 && machine->fdc.extra[drive].data != NULL) {
+    return &machine->fdc.extra[drive];
+  }
+  if (machine->fdc.disc[drive].data == NULL || side >= machine->fdc.disc[drive].sides) {
+    return NULL;
+  }
+  if (side_in_image != NULL) {
+    *side_in_image = side;
+  }
+  return &machine->fdc.disc[drive];
+}
+
+static bool DriveHasDisc(const BbcMachine* bbc, int drive) {
+  return drive >= 0 && drive <= 1 &&
+         (bbc->fdc.disc[drive].data != NULL || bbc->fdc.extra[drive].data != NULL);
+}
+
 static bool FdcNoDisc(const BbcMachine* bbc) {
-  int drive = bbc->fdc.drive;
-  return drive < 0 || drive > 1 || bbc->fdc.disc[drive].data == NULL;
+  return FdcImage(bbc, NULL) == NULL;
 }
 
 static uint8_t FdcOk(const BbcMachine* bbc) {
@@ -1772,40 +1861,47 @@ static void FdcLatchSide(BbcMachine* bbc) {
 }
 
 static int FdcSectorOff(const BbcMachine* bbc, int size) {
-  const int drive = bbc->fdc.drive;
+  int side = 0;
+  BbcDiscImage* image = FdcImage(bbc, &side);
   int track;
   size_t off;
-  if (FdcNoDisc(bbc) || size < 1) {
+  if (image == NULL || size < 1) {
     return -1;
   }
   track = Fdc1770(bbc) ? bbc->fdc.track_reg : bbc->fdc.params[0];
-  if (track < 0 || track >= bbc->fdc.disc[drive].tracks || bbc->fdc.side < 0 ||
-      bbc->fdc.side >= bbc->fdc.disc[drive].sides || bbc->fdc.sector < 0 ||
-      bbc->fdc.sector >= bbc->fdc.disc[drive].spt) {
+  if (track < 0 || track >= image->tracks || side < 0 || side >= image->sides ||
+      bbc->fdc.sector < 0 || bbc->fdc.sector >= image->spt) {
     return -1;
   }
-  off = (((size_t)track * (size_t)bbc->fdc.disc[drive].sides + (size_t)bbc->fdc.side) *
-             (size_t)bbc->fdc.disc[drive].spt +
+  off = (((size_t)track * (size_t)image->sides + (size_t)side) * (size_t)image->spt +
          (size_t)bbc->fdc.sector) *
         256;
-  if (off + (size_t)size > bbc->fdc.disc[drive].length) {
+  if (off + (size_t)size > image->length) {
     return -1;
   }
   return (int)off;
 }
 
-static void DiscFlush(BbcMachine* bbc, int drive) {
+static void DiscFlushImage(BbcDiscImage* image) {
   FILE* fp;
-  if (drive < 0 || drive > 1 || bbc->fdc.disc[drive].protect || bbc->fdc.disc[drive].path == NULL ||
-      bbc->fdc.disc[drive].data == NULL) {
+  if (image == NULL || image->protect || image->data == NULL) {
     return;
   }
-  fp = fopen(bbc->fdc.disc[drive].path, "r+b");
+  if (image->fd >= 0) {
+    if (CumanaSendImage(image->fd, image->data, image->length) != 0) {
+      close(image->fd);
+      image->fd = -1;
+    }
+    return;
+  }
+  if (image->path == NULL) {
+    return;
+  }
+  fp = fopen(image->path, "r+b");
   if (fp == NULL) {
     return;
   }
-  if (fwrite(bbc->fdc.disc[drive].data, 1, bbc->fdc.disc[drive].length, fp) !=
-      bbc->fdc.disc[drive].length) {
+  if (fwrite(image->data, 1, image->length, fp) != image->length) {
     fclose(fp);
     return;
   }
@@ -1920,7 +2016,13 @@ static void FdcService(BbcMachine* bbc) {
     if (bbc->fdc.phase == FDC_READ_ID) {
       FdcAsk(bbc, true, bbc->fdc.buffer[bbc->fdc.sector_off]);
     } else {
-      FdcAsk(bbc, true, bbc->fdc.disc[bbc->fdc.drive].data[bbc->fdc.sector_off]);
+      BbcDiscImage* image = FdcImage(bbc, NULL);
+      if (image == NULL || bbc->fdc.sector_off < 0 ||
+          (size_t)bbc->fdc.sector_off >= image->length) {
+        FdcFinish(bbc, FdcMissing(bbc));
+        return;
+      }
+      FdcAsk(bbc, true, image->data[bbc->fdc.sector_off]);
     }
     bbc->fdc.sector_off++;
     bbc->fdc.bytes_left--;
@@ -1928,8 +2030,8 @@ static void FdcService(BbcMachine* bbc) {
   }
   if (bbc->fdc.phase == FDC_WRITE) {
     if (bbc->fdc.sector_off < 0) {
-      int drive = bbc->fdc.drive;
-      if (!FdcNoDisc(bbc) && bbc->fdc.disc[drive].protect) {
+      BbcDiscImage* image = FdcImage(bbc, NULL);
+      if (image != NULL && image->protect) {
         FdcFinish(bbc, FdcProtected(bbc));
         return;
       }
@@ -1965,7 +2067,6 @@ static void FdcDataTaken(BbcMachine* bbc) {
 
 static void FdcDataSupplied(BbcMachine* bbc, uint8_t value) {
   int n;
-  int drive;
   if (bbc->fdc.phase == FDC_WRITE_TRACK) {
     if (bbc->fdc.buf_i < (int)sizeof(bbc->fdc.track_image)) {
       bbc->fdc.track_image[bbc->fdc.buf_i++] = value;
@@ -1994,12 +2095,14 @@ static void FdcDataSupplied(BbcMachine* bbc, uint8_t value) {
     bbc->fdc.delay = bbc->fdc.byte_gap;
     return;
   }
-  drive = bbc->fdc.drive;
   n = bbc->fdc.buf_i;
-  if (!FdcNoDisc(bbc) && bbc->fdc.sector_off >= 0 && n > 0 &&
-      (size_t)bbc->fdc.sector_off + (size_t)n <= bbc->fdc.disc[drive].length) {
-    memcpy(bbc->fdc.disc[drive].data + bbc->fdc.sector_off, bbc->fdc.buffer, (size_t)n);
-    DiscFlush(bbc, drive);
+  {
+    BbcDiscImage* image = FdcImage(bbc, NULL);
+    if (image != NULL && bbc->fdc.sector_off >= 0 && n > 0 &&
+        (size_t)bbc->fdc.sector_off + (size_t)n <= image->length) {
+      memcpy(image->data + bbc->fdc.sector_off, bbc->fdc.buffer, (size_t)n);
+      DiscFlushImage(image);
+    }
   }
   bbc->fdc.sectors_left--;
   if (bbc->fdc.sectors_left <= 0) {
@@ -2096,31 +2199,31 @@ static void I8271Start(BbcMachine* bbc) {
       return;
     case 0x23: {
       int track = bbc->fdc.params[0];
-      int drive = bbc->fdc.drive;
+      int side = 0;
+      BbcDiscImage* image;
       uint8_t fill = bbc->fdc.params[4];
-      if (FdcNoDisc(bbc)) {
+      FdcLatchSide(bbc);
+      image = FdcImage(bbc, &side);
+      if (image == NULL) {
         FdcFinish(bbc, 0x10);
         return;
       }
-      if (bbc->fdc.disc[drive].protect) {
+      if (image->protect) {
         FdcFinish(bbc, 0x12);
         return;
       }
-      FdcLatchSide(bbc);
-      if (track >= 0 && track < bbc->fdc.disc[drive].tracks &&
-          bbc->fdc.side < bbc->fdc.disc[drive].sides) {
+      if (track >= 0 && track < image->tracks && side < image->sides) {
         int sector;
-        for (sector = 0; sector < bbc->fdc.disc[drive].spt; sector++) {
-          size_t off = (((size_t)track * (size_t)bbc->fdc.disc[drive].sides +
-                         (size_t)bbc->fdc.side) *
-                            (size_t)bbc->fdc.disc[drive].spt +
+        for (sector = 0; sector < image->spt; sector++) {
+          size_t off = (((size_t)track * (size_t)image->sides + (size_t)side) *
+                            (size_t)image->spt +
                         (size_t)sector) *
                        256;
-          if (off + 256 <= bbc->fdc.disc[drive].length) {
-            memset(bbc->fdc.disc[drive].data + off, fill, 256);
+          if (off + 256 <= image->length) {
+            memset(image->data + off, fill, 256);
           }
         }
-        DiscFlush(bbc, drive);
+        DiscFlushImage(image);
       }
       bbc->fdc.result = 0;
       bbc->fdc.phase = FDC_FINISH;
@@ -2207,11 +2310,14 @@ static void I8271Command(BbcMachine* bbc, uint8_t val) {
       if (bbc->fdc.drvout & 0x40) {
         result |= 0x04;
       }
-      if (!FdcNoDisc(bbc) && (bbc->fdc.spin % 400000) < 8000) {
+      if (DriveHasDisc(bbc, drive) && (bbc->fdc.spin % 400000) < 8000) {
         result |= 0x10;
       }
-      if (drive >= 0 && drive <= 1 && bbc->fdc.disc[drive].protect) {
-        result |= 0x08;
+      {
+        BbcDiscImage* image = FdcImage(bbc, NULL);
+        if (image != NULL && image->protect) {
+          result |= 0x08;
+        }
       }
       if (drive >= 0 && drive <= 1 && bbc->fdc.track[drive] == 0) {
         result |= 0x02;
@@ -2275,8 +2381,11 @@ static int WdSectorCount(const BbcMachine* bbc, bool multi) {
     return 1;
   }
   spt = 10;
-  if (!FdcNoDisc(bbc)) {
-    spt = bbc->fdc.disc[bbc->fdc.drive].spt;
+  {
+    BbcDiscImage* image = FdcImage(bbc, NULL);
+    if (image != NULL) {
+      spt = image->spt;
+    }
   }
   count = spt - bbc->fdc.sector_reg;
   return count < 1 ? 1 : count;
@@ -2294,9 +2403,16 @@ static void FdcCommitTrack(BbcMachine* bbc) {
     bbc->fdc.result = FdcMissing(bbc);
     return;
   }
-  if (bbc->fdc.disc[bbc->fdc.drive].protect) {
-    bbc->fdc.result = FdcProtected(bbc);
-    return;
+  {
+    BbcDiscImage* image = FdcImage(bbc, NULL);
+    if (image == NULL) {
+      bbc->fdc.result = FdcMissing(bbc);
+      return;
+    }
+    if (image->protect) {
+      bbc->fdc.result = FdcProtected(bbc);
+      return;
+    }
   }
   while (i + 6 < n) {
     int j;
@@ -2322,8 +2438,11 @@ static void FdcCommitTrack(BbcMachine* bbc) {
       }
       off = FdcSectorOff(bbc, size);
       if (off >= 0) {
-        memcpy(bbc->fdc.disc[bbc->fdc.drive].data + off, bytes + j + 1, (size_t)size);
-        wrote = true;
+        BbcDiscImage* image = FdcImage(bbc, NULL);
+        if (image != NULL) {
+          memcpy(image->data + off, bytes + j + 1, (size_t)size);
+          wrote = true;
+        }
       }
       i = j + 1 + size;
       continue;
@@ -2334,7 +2453,7 @@ static void FdcCommitTrack(BbcMachine* bbc) {
   bbc->fdc.sector = saved_sector;
   bbc->fdc.side = saved_side;
   if (wrote) {
-    DiscFlush(bbc, bbc->fdc.drive);
+    DiscFlushImage(FdcImage(bbc, NULL));
   }
   bbc->fdc.result = FdcOk(bbc);
 }
@@ -2346,10 +2465,12 @@ static int FdcBuildTrack(BbcMachine* bbc) {
   int spt = 16;
   int saved = bbc->fdc.sector;
   int gap;
+  BbcDiscImage* image;
   if (FdcNoDisc(bbc)) {
     return 0;
   }
-  spt = bbc->fdc.disc[bbc->fdc.drive].spt;
+  image = FdcImage(bbc, NULL);
+  spt = image->spt;
   for (sector = 0; sector < spt; sector++) {
     int off;
     int k;
@@ -2381,7 +2502,7 @@ static int FdcBuildTrack(BbcMachine* bbc) {
     bbc->fdc.sector = sector;
     off = FdcSectorOff(bbc, 256);
     for (k = 0; k < 256; k++) {
-      out[n++] = off >= 0 ? bbc->fdc.disc[bbc->fdc.drive].data[off + k] : 0xe5;
+      out[n++] = off >= 0 && image != NULL ? image->data[off + k] : 0xe5;
     }
     out[n++] = 0xf7;
   }
@@ -2505,11 +2626,14 @@ static void WdCommand(BbcMachine* bbc, uint8_t val) {
         bbc->fdc.delay = 200;
         return;
       }
-      if (bbc->fdc.disc[bbc->fdc.drive].protect) {
-        bbc->fdc.result = FdcProtected(bbc);
-        bbc->fdc.phase = FDC_FINISH;
-        bbc->fdc.delay = 200;
-        return;
+      {
+        BbcDiscImage* image = FdcImage(bbc, NULL);
+        if (image != NULL && image->protect) {
+          bbc->fdc.result = FdcProtected(bbc);
+          bbc->fdc.phase = FDC_FINISH;
+          bbc->fdc.delay = 200;
+          return;
+        }
       }
       bbc->fdc.buf_i = 0;
       bbc->fdc.track_left = 400000;
@@ -2590,7 +2714,29 @@ static int MasterFdcReg(uint8_t page) {
   }
 }
 
+// The paged ROM is the filing system the OS just called. Disc NMIs then run
+// from RAM with BASIC paged in, so the controller stays with that ROM until
+// a different filing system uses the drive.
+static void FdcFollowRom(BbcMachine* bbc) {
+  int slot;
+  int kind;
+  if (bbc->fdc.forced || bbc->master) {
+    return;
+  }
+  if (bbc->fdc.phase != FDC_IDLE && bbc->fdc.phase != FDC_FINISH) {
+    return;
+  }
+  slot = bbc->romsel & 0x0f;
+  kind = bbc->rom_fdc[slot];
+  if ((kind != BBC_FDC_8271 && kind != BBC_FDC_1770) || kind == bbc->fdc.kind) {
+    return;
+  }
+  bbc->fdc.kind = kind;
+  FdcResetChip(bbc);
+}
+
 static uint8_t FdcRead(BbcMachine* bbc, uint8_t reg) {
+  FdcFollowRom(bbc);
   reg = (uint8_t)(reg & 7);
   if (Fdc1770(bbc)) {
     switch (reg) {
@@ -2642,6 +2788,7 @@ static uint8_t FdcRead(BbcMachine* bbc, uint8_t reg) {
 }
 
 static void FdcWrite(BbcMachine* bbc, uint8_t reg, uint8_t value) {
+  FdcFollowRom(bbc);
   reg = (uint8_t)(reg & 7);
   if (Fdc1770(bbc)) {
     switch (reg) {
@@ -2699,6 +2846,10 @@ static void FdcWrite(BbcMachine* bbc, uint8_t reg, uint8_t value) {
   }
 }
 
+static void TapeFlush(BbcMachine* bbc);
+static void TapeClose(BbcMachine* bbc);
+static void TapeStop(BbcMachine* bbc);
+
 static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
   if (page < 0x08) {
     if ((page & 1) == 0) {
@@ -2717,8 +2868,12 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
     return;
   }
   if (page < 0x18) {
+    bool motor = MotorOn(bbc);
     bbc->serial_ula = value;
     SerialUpdate(bbc);
+    if (motor && !MotorOn(bbc)) {
+      TapeFlush(bbc);
+    }
     return;
   }
   if (page < 0x20) {
@@ -3349,8 +3504,50 @@ void BbcMachineSetFast(BbcMachine* bbc, bool fast) {
   }
 }
 
+static void DiscService(BbcMachine* bbc);
+static void TapeService(BbcMachine* bbc);
+
 void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles) {
   int via_ticks;
+  if (bbc == NULL) {
+    return;
+  }
+  // Polling the disc socket on every instruction steals so much time that the
+  // MOS keyboard scan misses keypresses. Look for a new image as soon as one
+  // is queued, and check for eject about once a frame.
+  if (bbc->disc_listen_started) {
+    bool attention;
+    bool watch;
+    if (cpu_cycles > 0) {
+      bbc->disc_watch_acc += cpu_cycles;
+    }
+    watch = bbc->disc_watch_acc >= 40000;
+    attention = __atomic_load_n(&bbc->disc_attention, __ATOMIC_ACQUIRE) != 0;
+    if ((watch || attention) &&
+        (bbc->fdc.phase == FDC_IDLE || bbc->fdc.phase == FDC_FINISH)) {
+      if (watch) {
+        bbc->disc_watch_acc = 0;
+      }
+      __atomic_store_n(&bbc->disc_attention, 0, __ATOMIC_RELAXED);
+      DiscService(bbc);
+    }
+  }
+  if (bbc->tape_listen_started) {
+    bool attention;
+    bool watch;
+    if (cpu_cycles > 0) {
+      bbc->tape_watch_acc += cpu_cycles;
+    }
+    watch = bbc->tape_watch_acc >= 40000;
+    attention = __atomic_load_n(&bbc->tape_attention, __ATOMIC_ACQUIRE) != 0;
+    if (watch || attention) {
+      if (watch) {
+        bbc->tape_watch_acc = 0;
+      }
+      __atomic_store_n(&bbc->tape_attention, 0, __ATOMIC_RELAXED);
+      TapeService(bbc);
+    }
+  }
   if (cpu_cycles <= 0) {
     return;
   }
@@ -3612,38 +3809,92 @@ static void FdcDetect(BbcMachine* bbc) {
     return;
   }
   bbc->fdc.kind = BBC_FDC_8271;
-  for (i = 0; i < 16; i++) {
-    if (!bbc->sideways_loaded[i] || bbc->sideways[i] == NULL) {
-      continue;
-    }
-    if (RomHas(bbc->sideways[i], "ADFS") || RomHas(bbc->sideways[i], "1770")) {
-      bbc->fdc.kind = BBC_FDC_1770;
-      return;
-    }
-  }
+  // A fitted ADFS or DFS ROM stays inactive until that ROM uses the drive.
+  // An ADFS image still selects the 1770, because that is the controller it
+  // needs before any ROM has run.
   for (i = 0; i < 2; i++) {
-    const char* path = bbc->fdc.disc[i].path;
-    if (path != NULL &&
-        (ExtIs(path, ".adf") || ExtIs(path, ".adm") || ExtIs(path, ".adl"))) {
-      bbc->fdc.kind = BBC_FDC_1770;
-      return;
+    const char* paths[2];
+    int p;
+    paths[0] = bbc->fdc.disc[i].path;
+    paths[1] = bbc->fdc.extra[i].path;
+    for (p = 0; p < 2; p++) {
+      if (paths[p] != NULL && (ExtIs(paths[p], ".adf") || ExtIs(paths[p], ".adm") ||
+                               ExtIs(paths[p], ".adl"))) {
+        bbc->fdc.kind = BBC_FDC_1770;
+        return;
+      }
     }
   }
 }
 
-static void DiscRelease(BbcMachine* bbc, int drive) {
-  free(bbc->fdc.disc[drive].data);
-  free(bbc->fdc.disc[drive].path);
-  memset(&bbc->fdc.disc[drive], 0, sizeof(bbc->fdc.disc[drive]));
+static void DiscRelease(BbcDiscImage* image) {
+  if (image == NULL) {
+    return;
+  }
+  if (image->fd >= 0) {
+    shutdown(image->fd, SHUT_RDWR);
+    close(image->fd);
+    image->fd = -1;
+  }
+  free(image->data);
+  free(image->path);
+  memset(image, 0, sizeof(*image));
+  image->fd = -1;
+}
+
+static void DiscDescribe(int drive, const char* name, int tracks, int sides, int spt) {
+  fprintf(stderr, "Disc %d: %s (%d track%s, %d side%s, %s)\n", drive, name, tracks,
+          tracks == 1 ? "" : "s", sides, sides == 1 ? "" : "s", spt >= 16 ? "ADFS" : "DFS");
+}
+
+// On success the image owns data and fd. On failure the caller still owns both.
+static bool DiscMount(BbcMachine* bbc, int drive, uint8_t* data, size_t length, const char* name,
+                      bool protect, int fd) {
+  int spt = 10;
+  int sides = 1;
+  int tracks = 0;
+  BbcDiscImage* slot;
+  char* stored;
+  if (bbc == NULL || data == NULL || name == NULL || drive < 0 || drive > 3) {
+    return false;
+  }
+  DiscShape(name, length, &spt, &sides, &tracks);
+  if (drive >= 2 && (sides > 1 || spt >= 16)) {
+    return false;
+  }
+  if (drive >= 2 && bbc->fdc.disc[drive - 2].data != NULL && bbc->fdc.disc[drive - 2].sides > 1) {
+    return false;
+  }
+  stored = strdup(name);
+  if (stored == NULL) {
+    return false;
+  }
+  if (drive >= 2) {
+    slot = &bbc->fdc.extra[drive - 2];
+  } else {
+    slot = &bbc->fdc.disc[drive];
+    if (sides > 1) {
+      DiscRelease(&bbc->fdc.extra[drive]);
+    }
+  }
+  DiscRelease(slot);
+  slot->data = data;
+  slot->length = length;
+  slot->spt = spt;
+  slot->sides = sides;
+  slot->tracks = tracks;
+  slot->protect = protect;
+  slot->path = stored;
+  slot->fd = fd;
+  FdcDetect(bbc);
+  DiscDescribe(drive, stored, tracks, sides, spt);
+  return true;
 }
 
 bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path) {
   char expanded[PATH_MAX];
   uint8_t* buf = NULL;
   size_t length = 0;
-  int spt = 10;
-  int sides = 1;
-  int tracks = 0;
   const char* stored;
   if (bbc == NULL || path == NULL || drive < 0 || drive > 1) {
     return false;
@@ -3663,19 +3914,383 @@ bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path) {
     fprintf(stderr, "Unable to read disc image '%s'\n", path);
     return false;
   }
-  DiscShape(stored, length, &spt, &sides, &tracks);
-  DiscRelease(bbc, drive);
-  bbc->fdc.disc[drive].data = buf;
-  bbc->fdc.disc[drive].length = length;
-  bbc->fdc.disc[drive].spt = spt;
-  bbc->fdc.disc[drive].sides = sides;
-  bbc->fdc.disc[drive].tracks = tracks;
-  bbc->fdc.disc[drive].protect = access(stored, W_OK) != 0;
-  bbc->fdc.disc[drive].path = strdup(stored);
-  FdcDetect(bbc);
-  fprintf(stderr, "Disc %d: %s (%d track%s, %d side%s, %s)\n", drive, stored, tracks,
-          tracks == 1 ? "" : "s", sides, sides == 1 ? "" : "s", spt >= 16 ? "ADFS" : "DFS");
+  if (!DiscMount(bbc, drive, buf, length, stored, access(stored, W_OK) != 0, -1)) {
+    free(buf);
+    return false;
+  }
   return true;
+}
+
+struct DiscPull {
+  BbcMachine* bbc;
+  int fd;
+};
+
+static int DiscPullRead(void* ctx, void* buf, size_t n) {
+  struct DiscPull* pull = (struct DiscPull*)ctx;
+  uint8_t* bytes = (uint8_t*)buf;
+  size_t off = 0;
+  while (off < n) {
+    struct pollfd pfd;
+    int ready;
+    bool stop;
+    ssize_t got;
+    pthread_mutex_lock(&pull->bbc->disc_mu);
+    stop = pull->bbc->disc_listen_stop;
+    pthread_mutex_unlock(&pull->bbc->disc_mu);
+    if (stop) {
+      return -1;
+    }
+    pfd.fd = pull->fd;
+    pfd.events = POLLIN;
+    ready = poll(&pfd, 1, 200);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (ready == 0) {
+      continue;
+    }
+    if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
+      return -1;
+    }
+    if ((pfd.revents & (POLLIN | POLLHUP)) == 0) {
+      continue;
+    }
+    got = read(pull->fd, bytes + off, n - off);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (got == 0) {
+      return -1;
+    }
+    off += (size_t)got;
+  }
+  return 0;
+}
+
+static void DiscEnqueue(BbcMachine* bbc, int fd, CumanaInsert* insert) {
+  struct CumanaPending* item = calloc(1, sizeof(*item));
+  struct CumanaPending* tail;
+  if (item == NULL) {
+    CumanaSendReply(fd, CUMANA_ERR, -1, "out of memory");
+    CumanaInsertFree(insert);
+    close(fd);
+    return;
+  }
+  item->fd = fd;
+  item->insert = *insert;
+  memset(insert, 0, sizeof(*insert));
+  pthread_mutex_lock(&bbc->disc_mu);
+  tail = bbc->disc_pending;
+  if (tail == NULL) {
+    bbc->disc_pending = item;
+  } else {
+    while (tail->next != NULL) {
+      tail = tail->next;
+    }
+    tail->next = item;
+  }
+  __atomic_store_n(&bbc->disc_attention, 1, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&bbc->disc_mu);
+}
+
+static void* DiscListenMain(void* arg) {
+  BbcMachine* bbc = (BbcMachine*)arg;
+  for (;;) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    int fd;
+    bool stop;
+    pthread_mutex_lock(&bbc->disc_mu);
+    stop = bbc->disc_listen_stop;
+    pthread_mutex_unlock(&bbc->disc_mu);
+    if (stop) {
+      break;
+    }
+    {
+      struct pollfd listen_pfd;
+      int ready;
+      listen_pfd.fd = bbc->disc_listen_fd;
+      listen_pfd.events = POLLIN;
+      ready = poll(&listen_pfd, 1, 200);
+      if (ready < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        break;
+      }
+      if (ready == 0) {
+        continue;
+      }
+    }
+    fd = accept(bbc->disc_listen_fd, (struct sockaddr*)&addr, &len);
+    if (fd < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      pthread_mutex_lock(&bbc->disc_mu);
+      stop = bbc->disc_listen_stop;
+      pthread_mutex_unlock(&bbc->disc_mu);
+      if (stop) {
+        break;
+      }
+      continue;
+    }
+    {
+      int one = 1;
+#ifdef SO_NOSIGPIPE
+      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    pthread_mutex_lock(&bbc->disc_mu);
+    bbc->disc_handshake_fd = fd;
+    stop = bbc->disc_listen_stop;
+    pthread_mutex_unlock(&bbc->disc_mu);
+    if (stop) {
+      close(fd);
+      break;
+    }
+    {
+      struct DiscPull pull;
+      CumanaInsert insert;
+      pull.bbc = bbc;
+      pull.fd = fd;
+      if (CumanaReadInsert(DiscPullRead, &pull, &insert) != 0) {
+        close(fd);
+      } else if (insert.drive > 3) {
+        CumanaSendReply(fd, CUMANA_ERR, -1, "drive must be 0, 1, 2, or 3");
+        CumanaInsertFree(&insert);
+        close(fd);
+      } else {
+        DiscEnqueue(bbc, fd, &insert);
+      }
+    }
+    pthread_mutex_lock(&bbc->disc_mu);
+    if (bbc->disc_handshake_fd == fd) {
+      bbc->disc_handshake_fd = -1;
+    }
+    pthread_mutex_unlock(&bbc->disc_mu);
+  }
+  return NULL;
+}
+
+static void DiscDropPending(struct CumanaPending* pending) {
+  while (pending != NULL) {
+    struct CumanaPending* next = pending->next;
+    if (pending->fd >= 0) {
+      close(pending->fd);
+    }
+    CumanaInsertFree(&pending->insert);
+    free(pending);
+    pending = next;
+  }
+}
+
+static void DiscStop(BbcMachine* bbc) {
+  struct CumanaPending* pending;
+  int handshake;
+  if (bbc == NULL || !bbc->disc_listen_started) {
+    return;
+  }
+  pthread_mutex_lock(&bbc->disc_mu);
+  bbc->disc_listen_stop = true;
+  handshake = bbc->disc_handshake_fd;
+  pthread_mutex_unlock(&bbc->disc_mu);
+  if (bbc->disc_listen_fd >= 0) {
+    shutdown(bbc->disc_listen_fd, SHUT_RDWR);
+  }
+  if (handshake >= 0) {
+    shutdown(handshake, SHUT_RDWR);
+  }
+  pthread_join(bbc->disc_listen_thread, NULL);
+  if (bbc->disc_listen_fd >= 0) {
+    close(bbc->disc_listen_fd);
+    bbc->disc_listen_fd = -1;
+  }
+  pthread_mutex_lock(&bbc->disc_mu);
+  pending = bbc->disc_pending;
+  bbc->disc_pending = NULL;
+  pthread_mutex_unlock(&bbc->disc_mu);
+  DiscDropPending(pending);
+  pthread_mutex_destroy(&bbc->disc_mu);
+  bbc->disc_listen_started = false;
+}
+
+int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
+  struct sockaddr_in addr;
+  socklen_t len;
+  int fd;
+  int one = 1;
+  if (bbc == NULL || bbc->disc_listen_started || port < 0 || port > 65535) {
+    return -1;
+  }
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
+    close(fd);
+    return -1;
+  }
+  len = sizeof(addr);
+  if (getsockname(fd, (struct sockaddr*)&addr, &len) != 0) {
+    close(fd);
+    return -1;
+  }
+  if (pthread_mutex_init(&bbc->disc_mu, NULL) != 0) {
+    close(fd);
+    return -1;
+  }
+  bbc->disc_listen_fd = fd;
+  bbc->disc_listen_port = ntohs(addr.sin_port);
+  bbc->disc_handshake_fd = -1;
+  bbc->disc_listen_stop = false;
+  bbc->disc_pending = NULL;
+  bbc->disc_listen_started = true;
+  if (pthread_create(&bbc->disc_listen_thread, NULL, DiscListenMain, bbc) != 0) {
+    bbc->disc_listen_started = false;
+    pthread_mutex_destroy(&bbc->disc_mu);
+    close(fd);
+    bbc->disc_listen_fd = -1;
+    return -1;
+  }
+  return bbc->disc_listen_port;
+}
+
+static bool DiscSlotFree(const BbcMachine* bbc, int drive) {
+  if (drive < 0 || drive > 3) {
+    return false;
+  }
+  if (drive >= 2) {
+    if (bbc->fdc.extra[drive - 2].data != NULL) {
+      return false;
+    }
+    if (bbc->fdc.disc[drive - 2].data != NULL && bbc->fdc.disc[drive - 2].sides > 1) {
+      return false;
+    }
+    return true;
+  }
+  return bbc->fdc.disc[drive].data == NULL;
+}
+
+static int DiscChoose(const BbcMachine* bbc, const CumanaInsert* insert, const char** error) {
+  int spt = 10;
+  int sides = 1;
+  int tracks = 0;
+  int drive = insert->drive;
+  int limit;
+  int i;
+  *error = "disc not inserted";
+  DiscShape(insert->name != NULL ? insert->name : "", insert->length, &spt, &sides, &tracks);
+  (void)tracks;
+  if (drive > 3) {
+    *error = "drive must be 0, 1, 2, or 3";
+    return -1;
+  }
+  if (drive >= 2 && sides > 1) {
+    *error = "a double-sided image uses drive 0 or 1";
+    return -1;
+  }
+  if (drive >= 2 && spt >= 16) {
+    *error = "an ADFS image uses drive 0 or 1";
+    return -1;
+  }
+  if (drive >= 2 && bbc->fdc.disc[drive - 2].data != NULL && bbc->fdc.disc[drive - 2].sides > 1) {
+    *error = "that side is already part of a double-sided image";
+    return -1;
+  }
+  if (drive >= 0) {
+    return drive;
+  }
+  limit = (sides > 1 || spt >= 16) ? 2 : 4;
+  for (i = 0; i < limit; i++) {
+    if (DiscSlotFree(bbc, i)) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+static void DiscWatch(BbcDiscImage* image) {
+  struct pollfd pfd;
+  char drain[32];
+  ssize_t n;
+  if (image == NULL || image->fd < 0) {
+    return;
+  }
+  pfd.fd = image->fd;
+  pfd.events = POLLIN;
+  if (poll(&pfd, 1, 0) <= 0) {
+    return;
+  }
+  if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+    return;
+  }
+  n = read(image->fd, drain, sizeof(drain));
+  if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+    DiscRelease(image);
+  }
+}
+
+static void DiscService(BbcMachine* bbc) {
+  struct CumanaPending* pending;
+  if (bbc == NULL || !bbc->disc_listen_started) {
+    return;
+  }
+  if (bbc->fdc.phase != FDC_IDLE && bbc->fdc.phase != FDC_FINISH) {
+    __atomic_store_n(&bbc->disc_attention, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  DiscWatch(&bbc->fdc.disc[0]);
+  DiscWatch(&bbc->fdc.disc[1]);
+  DiscWatch(&bbc->fdc.extra[0]);
+  DiscWatch(&bbc->fdc.extra[1]);
+  pthread_mutex_lock(&bbc->disc_mu);
+  pending = bbc->disc_pending;
+  bbc->disc_pending = NULL;
+  pthread_mutex_unlock(&bbc->disc_mu);
+  while (pending != NULL) {
+    struct CumanaPending* next = pending->next;
+    const char* error = NULL;
+    int drive;
+    int fd = pending->fd;
+    uint8_t* data = pending->insert.data;
+    size_t length = pending->insert.length;
+    const char* name = pending->insert.name != NULL ? pending->insert.name : "disc";
+    bool protect = pending->insert.protect != 0;
+    pending->fd = -1;
+    pending->insert.data = NULL;
+    drive = DiscChoose(bbc, &pending->insert, &error);
+    if (drive < 0) {
+      CumanaSendReply(fd, CUMANA_ERR, -1, error != NULL ? error : "disc not inserted");
+      close(fd);
+      free(data);
+    } else if (!DiscMount(bbc, drive, data, length, name, protect, fd)) {
+      CumanaSendReply(fd, CUMANA_ERR, -1, "disc not inserted");
+      close(fd);
+      free(data);
+    } else if (CumanaSendReply(fd, CUMANA_OK, drive, "inserted") != 0) {
+      DiscRelease(drive >= 2 ? &bbc->fdc.extra[drive - 2] : &bbc->fdc.disc[drive]);
+    }
+    CumanaInsertFree(&pending->insert);
+    free(pending);
+    pending = next;
+  }
 }
 
 void BbcMachineSetFdc(BbcMachine* bbc, int kind) {
@@ -3703,6 +4318,8 @@ void BbcMachineClearNmi(BbcMachine* bbc) {
   }
 }
 
+static void NoteRomFiling(BbcMachine* bbc, int slot, const char* name);
+
 bool BbcMachineLoadSidewaysBytes(BbcMachine* bbc, int slot, const uint8_t* bytes,
                                  size_t length) {
   if (slot < 0 || slot > 15) {
@@ -3723,6 +4340,7 @@ bool BbcMachineLoadSidewaysBytes(BbcMachine* bbc, int slot, const uint8_t* bytes
   }
   bbc->sideways_loaded[slot] = true;
   bbc->any_sideways = true;
+  NoteRomFiling(bbc, slot, NULL);
   // The new image is already in the buffer. Dropping the mapped slot skips
   // the write-back that would replace it with the old window.
   if (bbc->ram != NULL && bbc->mapped_slot == slot) {
@@ -3743,6 +4361,9 @@ bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path) {
   }
   ok = BbcMachineLoadSidewaysBytes(bbc, slot, buf, length);
   free(buf);
+  if (ok) {
+    NoteRomFiling(bbc, slot, path);
+  }
   return ok;
 }
 
@@ -4079,18 +4700,141 @@ void BbcRomFileFree(BbcRomFile* files, int count) {
   }
 }
 
-int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity) {
+static bool ContainsIgnoreCase(const char* text, const char* needle) {
+  size_t needle_n;
+  size_t i;
+  if (text == NULL || needle == NULL) {
+    return false;
+  }
+  needle_n = strlen(needle);
+  if (needle_n == 0) {
+    return false;
+  }
+  for (i = 0; text[i] != '\0'; i++) {
+    size_t j;
+    for (j = 0; j < needle_n; j++) {
+      unsigned char ch = (unsigned char)text[i + j];
+      if (ch == '\0') {
+        return false;
+      }
+      if (tolower(ch) != tolower((unsigned char)needle[j])) {
+        break;
+      }
+    }
+    if (j == needle_n) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int BbcMachineParseFilingSystem(const char* text) {
+  if (text == NULL) {
+    return -1;
+  }
+  if (EqualsIgnoreCase(text, "dfs") || EqualsIgnoreCase(text, "disc") ||
+      EqualsIgnoreCase(text, "disk")) {
+    return BBC_FS_DFS;
+  }
+  if (EqualsIgnoreCase(text, "adfs")) {
+    return BBC_FS_ADFS;
+  }
+  return -1;
+}
+
+int BbcMachineRomFilingKind(const char* name) {
+  const char* base = name;
+  const char* slash;
+  if (name == NULL) {
+    return BBC_FS_ANY;
+  }
+  slash = strrchr(name, '/');
+  if (slash != NULL && slash[1] != '\0') {
+    base = slash + 1;
+  }
+  if (ContainsIgnoreCase(base, "adfs")) {
+    return BBC_FS_ADFS;
+  }
+  if (ContainsIgnoreCase(base, "dnfs") || ContainsIgnoreCase(base, "dfs")) {
+    return BBC_FS_DFS;
+  }
+  return BBC_FS_ANY;
+}
+
+static void NoteRomFiling(BbcMachine* bbc, int slot, const char* name) {
+  int kind = BBC_FS_ANY;
+  int controller = 0;
+  bool wd = false;
+  if (slot < 0 || slot > 15) {
+    return;
+  }
+  if (name != NULL) {
+    kind = BbcMachineRomFilingKind(name);
+  }
+  if (kind == BBC_FS_ANY && bbc->sideways[slot] != NULL) {
+    if (RomHas(bbc->sideways[slot], "ADFS")) {
+      kind = BBC_FS_ADFS;
+    } else if (RomHas(bbc->sideways[slot], "DNFS") || RomHas(bbc->sideways[slot], "DFS")) {
+      kind = BBC_FS_DFS;
+    }
+  }
+  if (kind == BBC_FS_ADFS) {
+    controller = BBC_FDC_1770;
+  } else if (kind == BBC_FS_DFS) {
+    wd = (name != NULL && ContainsIgnoreCase(name, "1770")) ||
+         (bbc->sideways[slot] != NULL && RomHas(bbc->sideways[slot], "1770"));
+    controller = wd ? BBC_FDC_1770 : BBC_FDC_8271;
+  }
+  bbc->rom_fs[slot] = (uint8_t)kind;
+  bbc->rom_fdc[slot] = (uint8_t)controller;
+}
+
+int BbcMachineControllerForFiling(const BbcMachine* bbc, int filing) {
+  int i;
+  if (bbc == NULL) {
+    return 0;
+  }
+  if (bbc->master || filing == BBC_FS_ADFS) {
+    return BBC_FDC_1770;
+  }
+  if (filing != BBC_FS_DFS) {
+    return 0;
+  }
+  for (i = 0; i < 16; i++) {
+    if (bbc->sideways_loaded[i] && RomHas(bbc->sideways[i], "1770")) {
+      return BBC_FDC_1770;
+    }
+  }
+  return BBC_FDC_8271;
+}
+
+static void FreeDeferredRomPaths(char** paths, int count) {
+  int i;
+  for (i = 0; i < count; i++) {
+    free(paths[i]);
+  }
+}
+
+int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity, int filing) {
   DIR* handle;
   struct dirent* entry;
   int count = 0;
   bool saw_os = false;
+  bool saw_selected = false;
   bool saw_slot[16];
+  int slot_kind[16];
+  char* deferred_path[8];
+  int deferred_kind[8];
+  int deferred_named[8];
+  int deferred = 0;
   int i;
-  if (dir == NULL || files == NULL || capacity < 1) {
+  if (dir == NULL || files == NULL || capacity < 1 ||
+      (filing != BBC_FS_ANY && filing != BBC_FS_DFS && filing != BBC_FS_ADFS)) {
     return -1;
   }
   for (i = 0; i < 16; i++) {
     saw_slot[i] = false;
+    slot_kind[i] = BBC_FS_ANY;
   }
   handle = opendir(dir);
   if (handle == NULL) {
@@ -4109,6 +4853,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity)
     path = JoinPath(dir, entry->d_name);
     if (path == NULL) {
       closedir(handle);
+      FreeDeferredRomPaths(deferred_path, deferred);
       BbcRomFileFree(files, count);
       return -1;
     }
@@ -4118,6 +4863,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity)
         fprintf(stderr, "ROM file '%s' is not os[-name].rom or <socket>[-name].rom\n",
                 entry->d_name);
         closedir(handle);
+        FreeDeferredRomPaths(deferred_path, deferred);
         BbcRomFileFree(files, count);
         return -1;
       }
@@ -4128,24 +4874,61 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity)
               entry->d_name);
       free(path);
       closedir(handle);
+      FreeDeferredRomPaths(deferred_path, deferred);
       BbcRomFileFree(files, count);
       return -1;
+    }
+    {
+      int rom_kind = slot < 0 ? BBC_FS_ANY : BbcMachineRomFilingKind(entry->d_name);
+      if (filing != BBC_FS_ANY && rom_kind != BBC_FS_ANY && rom_kind != filing) {
+        free(path);
+        continue;
+      }
+      if (rom_kind == filing) {
+        saw_selected = true;
+      }
+      if (slot >= 0 && saw_slot[slot]) {
+        bool either_fs = (slot_kind[slot] == BBC_FS_DFS && rom_kind == BBC_FS_ADFS) ||
+                         (slot_kind[slot] == BBC_FS_ADFS && rom_kind == BBC_FS_DFS);
+        if (either_fs) {
+          // Hold it until every named socket is known, then fit it in the
+          // highest socket nobody else claimed.
+          if (deferred == 8) {
+            fprintf(stderr, "ROM directory '%s' has no free socket for %s\n", dir, entry->d_name);
+            free(path);
+            closedir(handle);
+            FreeDeferredRomPaths(deferred_path, deferred);
+            BbcRomFileFree(files, count);
+            return -1;
+          }
+          deferred_path[deferred] = path;
+          deferred_kind[deferred] = rom_kind;
+          deferred_named[deferred] = slot;
+          deferred++;
+          continue;
+        } else {
+          fprintf(stderr, "ROM directory '%s' has two images for socket %d\n", dir, slot);
+          free(path);
+          closedir(handle);
+          FreeDeferredRomPaths(deferred_path, deferred);
+          BbcRomFileFree(files, count);
+          return -1;
+        }
+      }
+      if (slot >= 0) {
+        slot_kind[slot] = rom_kind;
+      }
     }
     if (slot < 0) {
       if (saw_os) {
         fprintf(stderr, "ROM directory '%s' has more than one OS image\n", dir);
         free(path);
         closedir(handle);
+        FreeDeferredRomPaths(deferred_path, deferred);
         BbcRomFileFree(files, count);
         return -1;
       }
       saw_os = true;
-    } else if (saw_slot[slot]) {
-      fprintf(stderr, "ROM directory '%s' has two images for socket %d\n", dir, slot);
-      free(path);
-      closedir(handle);
-      BbcRomFileFree(files, count);
-      return -1;
     } else {
       saw_slot[slot] = true;
     }
@@ -4153,6 +4936,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity)
       fprintf(stderr, "ROM directory '%s' has too many images\n", dir);
       free(path);
       closedir(handle);
+      FreeDeferredRomPaths(deferred_path, deferred);
       BbcRomFileFree(files, count);
       return -1;
     }
@@ -4161,6 +4945,37 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity)
     count++;
   }
   closedir(handle);
+  for (i = 0; i < deferred; i++) {
+    int alt = -1;
+    int socket;
+    for (socket = 15; socket >= 0; socket--) {
+      if (!saw_slot[socket]) {
+        alt = socket;
+        break;
+      }
+    }
+    if (alt < 0 || count >= capacity) {
+      fprintf(stderr, "ROM directory '%s' has no free socket for a second filing system\n", dir);
+      for (; i < deferred; i++) {
+        free(deferred_path[i]);
+      }
+      BbcRomFileFree(files, count);
+      return -1;
+    }
+    fprintf(stderr, "ROM %s shares socket %d with the other filing system; fitted in socket %d\n",
+            strrchr(deferred_path[i], '/') != NULL ? strrchr(deferred_path[i], '/') + 1 : deferred_path[i],
+            deferred_named[i], alt);
+    saw_slot[alt] = true;
+    slot_kind[alt] = deferred_kind[i];
+    files[count].slot = alt;
+    files[count].path = deferred_path[i];
+    count++;
+  }
+  if (filing != BBC_FS_ANY && !saw_selected) {
+    fprintf(stderr, "ROM directory '%s' has no %s image\n", dir, filing == BBC_FS_DFS ? "DFS" : "ADFS");
+    BbcRomFileFree(files, count);
+    return -1;
+  }
   return count;
 }
 
@@ -4254,6 +5069,15 @@ BbcMachine* BbcMachineCreate(void) {
   if (pthread_mutex_init(&bbc->audio_mu, NULL) == 0) {
     bbc->audio_ready = true;
   }
+  bbc->disc_listen_fd = -1;
+  bbc->disc_handshake_fd = -1;
+  bbc->tape_fd = -1;
+  bbc->tape_listen_fd = -1;
+  bbc->tape_handshake_fd = -1;
+  for (i = 0; i < 2; i++) {
+    bbc->fdc.disc[i].fd = -1;
+    bbc->fdc.extra[i].fd = -1;
+  }
   return bbc;
 }
 
@@ -4265,14 +5089,19 @@ void BbcMachineDestroy(BbcMachine* bbc) {
   for (i = 0; i < 16; i++) {
     free(bbc->sideways[i]);
   }
+  TapeFlush(bbc);
+  TapeClose(bbc);
+  TapeStop(bbc);
+  DiscStop(bbc);
   for (i = 0; i < 2; i++) {
-    free(bbc->fdc.disc[i].data);
-    free(bbc->fdc.disc[i].path);
+    DiscRelease(&bbc->fdc.disc[i]);
+    DiscRelease(&bbc->fdc.extra[i]);
   }
   if (bbc->audio_ready) {
     pthread_mutex_destroy(&bbc->audio_mu);
   }
   free(bbc->tape);
+  free(bbc->tape_path);
   free(bbc->printed);
   free(bbc->printer_path);
   free(bbc->lynne);
@@ -4340,18 +5169,18 @@ void BbcMachineSetPrinter(BbcMachine* bbc, const char* path) {
   }
 }
 
-bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
-  uint8_t* buf = NULL;
-  size_t length = 0;
-  size_t i;
-  if (bbc == NULL || path == NULL || !ReadFile(path, &buf, &length)) {
-    return false;
-  }
+static void TapeReset(BbcMachine* bbc) {
   free(bbc->tape);
   bbc->tape = NULL;
   bbc->tape_len = 0;
   bbc->tape_pos = 0;
-  if (length >= 12 && memcmp(buf, "UEF File!", 9) == 0) {
+  bbc->tape_dirty = false;
+}
+
+static void TapeIngest(BbcMachine* bbc, const uint8_t* buf, size_t length) {
+  size_t i;
+  TapeReset(bbc);
+  if (length >= 12 && buf != NULL && memcmp(buf, "UEF File!", 9) == 0) {
     size_t cursor = 12;
     while (cursor + 6 <= length) {
       uint16_t id = (uint16_t)(buf[cursor] | (buf[cursor + 1] << 8));
@@ -4361,7 +5190,7 @@ bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
       if (cursor + chunk > length) {
         break;
       }
-      if ((id == 0x0100 || id == 0x0110) && chunk >= 2) {
+      if (id == 0x0110 && chunk >= 2) {
         int cycles = buf[cursor] | (buf[cursor + 1] << 8);
         int count = cycles / 20;
         int n;
@@ -4371,7 +5200,7 @@ bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
         for (n = 0; n < count; n++) {
           TapeAppend(bbc, 0xaa, 1);
         }
-      } else if (id == 0x0104 || id == 0x0102) {
+      } else if (id == 0x0100 || id == 0x0104 || id == 0x0102) {
         uint32_t n;
         for (n = 0; n < chunk; n++) {
           TapeAppend(bbc, buf[cursor + n], 0);
@@ -4379,7 +5208,7 @@ bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
       }
       cursor += chunk;
     }
-  } else {
+  } else if (length > 0 && buf != NULL) {
     for (i = 0; i < 32; i++) {
       TapeAppend(bbc, 0xaa, 1);
     }
@@ -4387,9 +5216,469 @@ bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
       TapeAppend(bbc, buf[i], 0);
     }
   }
-  free(buf);
   bbc->tape_pos = 0;
+  bbc->tape_dirty = false;
+}
+
+static int TapePut(uint8_t** buf, size_t* len, size_t* cap, const void* bytes, size_t n) {
+  uint8_t* grown;
+  size_t next;
+  if (n == 0) {
+    return 0;
+  }
+  if (*len > CASSETTE_MAX_IMAGE || n > CASSETTE_MAX_IMAGE - *len) {
+    return -1;
+  }
+  next = *cap == 0 ? 256 : *cap;
+  while (next < *len + n) {
+    if (next > CASSETTE_MAX_IMAGE / 2) {
+      next = CASSETTE_MAX_IMAGE;
+      break;
+    }
+    next *= 2;
+  }
+  if (next < *len + n) {
+    return -1;
+  }
+  if (next != *cap) {
+    grown = realloc(*buf, next);
+    if (grown == NULL) {
+      return -1;
+    }
+    *buf = grown;
+    *cap = next;
+  }
+  memcpy(*buf + *len, bytes, n);
+  *len += n;
+  return 0;
+}
+
+static uint8_t* TapeEncode(const BbcMachine* bbc, size_t* out_len) {
+  uint8_t header[12] = {'U', 'E', 'F', ' ', 'F', 'i', 'l', 'e', '!', 0, 0x0a, 0};
+  uint8_t* buf = NULL;
+  size_t len = 0;
+  size_t cap = 0;
+  size_t i = 0;
+  *out_len = 0;
+  if (TapePut(&buf, &len, &cap, header, sizeof(header)) != 0) {
+    free(buf);
+    return NULL;
+  }
+  while (i < bbc->tape_len) {
+    int carrier = bbc->tape[i].dcd != 0;
+    size_t start = i;
+    size_t count;
+    uint8_t chunk[6];
+    while (i < bbc->tape_len && (bbc->tape[i].dcd != 0) == carrier) {
+      i++;
+    }
+    count = i - start;
+    if (carrier) {
+      while (count > 0) {
+        size_t piece = count > 3000 ? 3000 : count;
+        uint32_t cycles = (uint32_t)piece * 20u;
+        chunk[0] = 0x10;
+        chunk[1] = 0x01;
+        chunk[2] = 2;
+        chunk[3] = 0;
+        chunk[4] = 0;
+        chunk[5] = 0;
+        if (TapePut(&buf, &len, &cap, chunk, sizeof(chunk)) != 0) {
+          free(buf);
+          return NULL;
+        }
+        chunk[0] = (uint8_t)cycles;
+        chunk[1] = (uint8_t)(cycles >> 8);
+        if (TapePut(&buf, &len, &cap, chunk, 2) != 0) {
+          free(buf);
+          return NULL;
+        }
+        count -= piece;
+      }
+    } else {
+      chunk[0] = 0x00;
+      chunk[1] = 0x01;
+      chunk[2] = (uint8_t)count;
+      chunk[3] = (uint8_t)(count >> 8);
+      chunk[4] = (uint8_t)(count >> 16);
+      chunk[5] = (uint8_t)(count >> 24);
+      if (TapePut(&buf, &len, &cap, chunk, sizeof(chunk)) != 0) {
+        free(buf);
+        return NULL;
+      }
+      for (count = 0; count < i - start; count++) {
+        if (TapePut(&buf, &len, &cap, &bbc->tape[start + count].data, 1) != 0) {
+          free(buf);
+          return NULL;
+        }
+      }
+    }
+  }
+  *out_len = len;
+  return buf;
+}
+
+static void TapeClose(BbcMachine* bbc) {
+  if (bbc->tape_fd >= 0) {
+    shutdown(bbc->tape_fd, SHUT_RDWR);
+    close(bbc->tape_fd);
+    bbc->tape_fd = -1;
+  }
+}
+
+static int TapeWriteFile(const char* path, const uint8_t* data, size_t length) {
+  FILE* fp = fopen(path, "wb");
+  if (fp == NULL) {
+    return -1;
+  }
+  if (length > 0 && fwrite(data, 1, length, fp) != length) {
+    fclose(fp);
+    return -1;
+  }
+  if (fflush(fp) != 0) {
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+  return 0;
+}
+
+static void TapeFlush(BbcMachine* bbc) {
+  uint8_t* encoded;
+  size_t length = 0;
+  if (bbc == NULL || !bbc->tape_dirty || bbc->tape_protect) {
+    return;
+  }
+  if (bbc->tape_fd < 0 && bbc->tape_path == NULL) {
+    return;
+  }
+  encoded = TapeEncode(bbc, &length);
+  if (encoded == NULL) {
+    return;
+  }
+  if (bbc->tape_fd >= 0) {
+    if (CassetteSendImage(bbc->tape_fd, encoded, length) != 0) {
+      TapeClose(bbc);
+    } else {
+      bbc->tape_dirty = false;
+    }
+  } else if (TapeWriteFile(bbc->tape_path, encoded, length) == 0) {
+    bbc->tape_dirty = false;
+  }
+  free(encoded);
+}
+
+bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
+  uint8_t* buf = NULL;
+  size_t length = 0;
+  char* copy;
+  if (bbc == NULL || path == NULL || !ReadFile(path, &buf, &length)) {
+    return false;
+  }
+  copy = strdup(path);
+  TapeIngest(bbc, buf, length);
+  free(buf);
+  free(bbc->tape_path);
+  bbc->tape_path = copy;
+  bbc->tape_protect = false;
   return true;
+}
+
+struct TapePull {
+  BbcMachine* bbc;
+  int fd;
+};
+
+static int TapePullRead(void* ctx, void* buf, size_t n) {
+  struct TapePull* pull = (struct TapePull*)ctx;
+  uint8_t* bytes = (uint8_t*)buf;
+  size_t off = 0;
+  while (off < n) {
+    struct pollfd pfd;
+    int ready;
+    bool stop;
+    ssize_t got;
+    pthread_mutex_lock(&pull->bbc->tape_mu);
+    stop = pull->bbc->tape_listen_stop;
+    pthread_mutex_unlock(&pull->bbc->tape_mu);
+    if (stop) {
+      return -1;
+    }
+    pfd.fd = pull->fd;
+    pfd.events = POLLIN;
+    ready = poll(&pfd, 1, 200);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (ready == 0 || (pfd.revents & (POLLIN | POLLHUP)) == 0) {
+      if ((pfd.revents & (POLLERR | POLLNVAL)) != 0) {
+        return -1;
+      }
+      continue;
+    }
+    got = read(pull->fd, bytes + off, n - off);
+    if (got < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (got == 0) {
+      return -1;
+    }
+    off += (size_t)got;
+  }
+  return 0;
+}
+
+static void TapeEnqueue(BbcMachine* bbc, int fd, CassetteInsert* insert) {
+  struct TapePending* item = calloc(1, sizeof(*item));
+  struct TapePending* tail;
+  if (item == NULL) {
+    CassetteSendReply(fd, CASSETTE_ERR, "out of memory");
+    CassetteInsertFree(insert);
+    close(fd);
+    return;
+  }
+  item->fd = fd;
+  item->insert = *insert;
+  memset(insert, 0, sizeof(*insert));
+  pthread_mutex_lock(&bbc->tape_mu);
+  tail = bbc->tape_pending;
+  if (tail == NULL) {
+    bbc->tape_pending = item;
+  } else {
+    while (tail->next != NULL) {
+      tail = tail->next;
+    }
+    tail->next = item;
+  }
+  __atomic_store_n(&bbc->tape_attention, 1, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&bbc->tape_mu);
+}
+
+static void* TapeListenMain(void* arg) {
+  BbcMachine* bbc = (BbcMachine*)arg;
+  for (;;) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    int fd;
+    bool stop;
+    struct pollfd listen_pfd;
+    int ready;
+    pthread_mutex_lock(&bbc->tape_mu);
+    stop = bbc->tape_listen_stop;
+    pthread_mutex_unlock(&bbc->tape_mu);
+    if (stop) {
+      break;
+    }
+    listen_pfd.fd = bbc->tape_listen_fd;
+    listen_pfd.events = POLLIN;
+    ready = poll(&listen_pfd, 1, 200);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if (ready == 0) {
+      continue;
+    }
+    fd = accept(bbc->tape_listen_fd, (struct sockaddr*)&addr, &len);
+    if (fd < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
+      break;
+    }
+    {
+      int one = 1;
+#ifdef SO_NOSIGPIPE
+      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    }
+    pthread_mutex_lock(&bbc->tape_mu);
+    bbc->tape_handshake_fd = fd;
+    stop = bbc->tape_listen_stop;
+    pthread_mutex_unlock(&bbc->tape_mu);
+    if (stop) {
+      close(fd);
+      break;
+    }
+    {
+      struct TapePull pull;
+      CassetteInsert insert;
+      pull.bbc = bbc;
+      pull.fd = fd;
+      if (CassetteReadInsert(TapePullRead, &pull, &insert) != 0) {
+        close(fd);
+      } else {
+        TapeEnqueue(bbc, fd, &insert);
+      }
+    }
+    pthread_mutex_lock(&bbc->tape_mu);
+    if (bbc->tape_handshake_fd == fd) {
+      bbc->tape_handshake_fd = -1;
+    }
+    pthread_mutex_unlock(&bbc->tape_mu);
+  }
+  return NULL;
+}
+
+static void TapeWatch(BbcMachine* bbc) {
+  struct pollfd pfd;
+  char drain[32];
+  ssize_t n;
+  int i;
+  if (bbc->tape_fd < 0) {
+    return;
+  }
+  pfd.fd = bbc->tape_fd;
+  pfd.events = POLLIN;
+  if (poll(&pfd, 1, 0) <= 0) {
+    return;
+  }
+  if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+    return;
+  }
+  n = read(bbc->tape_fd, drain, sizeof(drain));
+  if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+    TapeClose(bbc);
+    TapeReset(bbc);
+    bbc->tape_protect = false;
+    return;
+  }
+  for (i = 0; i < n; i++) {
+    if (drain[i] == CASSETTE_REWIND) {
+      bbc->tape_pos = 0;
+    }
+  }
+}
+
+static void TapeService(BbcMachine* bbc) {
+  struct TapePending* pending;
+  if (bbc == NULL || !bbc->tape_listen_started) {
+    return;
+  }
+  TapeWatch(bbc);
+  pthread_mutex_lock(&bbc->tape_mu);
+  pending = bbc->tape_pending;
+  bbc->tape_pending = NULL;
+  pthread_mutex_unlock(&bbc->tape_mu);
+  while (pending != NULL) {
+    struct TapePending* next = pending->next;
+    const char* name = pending->insert.name != NULL ? pending->insert.name : "tape";
+    if (bbc->tape_dirty) {
+      TapeFlush(bbc);
+    }
+    TapeClose(bbc);
+    free(bbc->tape_path);
+    bbc->tape_path = NULL;
+    TapeIngest(bbc, pending->insert.data, pending->insert.length);
+    bbc->tape_fd = pending->fd;
+    bbc->tape_protect = pending->insert.protect != 0;
+    pending->fd = -1;
+    if (CassetteSendReply(bbc->tape_fd, CASSETTE_OK, "inserted") != 0) {
+      TapeClose(bbc);
+      TapeReset(bbc);
+    } else {
+      fprintf(stderr, "Tape: %s\n", name);
+    }
+    CassetteInsertFree(&pending->insert);
+    free(pending);
+    pending = next;
+  }
+}
+
+static void TapeStop(BbcMachine* bbc) {
+  struct TapePending* pending;
+  int handshake;
+  if (bbc == NULL || !bbc->tape_listen_started) {
+    return;
+  }
+  pthread_mutex_lock(&bbc->tape_mu);
+  bbc->tape_listen_stop = true;
+  handshake = bbc->tape_handshake_fd;
+  pthread_mutex_unlock(&bbc->tape_mu);
+  if (bbc->tape_listen_fd >= 0) {
+    shutdown(bbc->tape_listen_fd, SHUT_RDWR);
+  }
+  if (handshake >= 0) {
+    shutdown(handshake, SHUT_RDWR);
+  }
+  pthread_join(bbc->tape_listen_thread, NULL);
+  if (bbc->tape_listen_fd >= 0) {
+    close(bbc->tape_listen_fd);
+    bbc->tape_listen_fd = -1;
+  }
+  pthread_mutex_lock(&bbc->tape_mu);
+  pending = bbc->tape_pending;
+  bbc->tape_pending = NULL;
+  pthread_mutex_unlock(&bbc->tape_mu);
+  while (pending != NULL) {
+    struct TapePending* next = pending->next;
+    if (pending->fd >= 0) {
+      close(pending->fd);
+    }
+    CassetteInsertFree(&pending->insert);
+    free(pending);
+    pending = next;
+  }
+  pthread_mutex_destroy(&bbc->tape_mu);
+  bbc->tape_listen_started = false;
+}
+
+int BbcMachineListenTapes(BbcMachine* bbc, int port) {
+  struct sockaddr_in addr;
+  socklen_t len;
+  int fd;
+  int one = 1;
+  if (bbc == NULL || bbc->tape_listen_started || port < 0 || port > 65535) {
+    return -1;
+  }
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 2) != 0) {
+    close(fd);
+    return -1;
+  }
+  len = sizeof(addr);
+  if (getsockname(fd, (struct sockaddr*)&addr, &len) != 0) {
+    close(fd);
+    return -1;
+  }
+  if (pthread_mutex_init(&bbc->tape_mu, NULL) != 0) {
+    close(fd);
+    return -1;
+  }
+  bbc->tape_listen_fd = fd;
+  bbc->tape_listen_port = ntohs(addr.sin_port);
+  bbc->tape_handshake_fd = -1;
+  bbc->tape_listen_stop = false;
+  bbc->tape_pending = NULL;
+  bbc->tape_listen_started = true;
+  if (pthread_create(&bbc->tape_listen_thread, NULL, TapeListenMain, bbc) != 0) {
+    bbc->tape_listen_started = false;
+    pthread_mutex_destroy(&bbc->tape_mu);
+    close(fd);
+    bbc->tape_listen_fd = -1;
+    return -1;
+  }
+  return bbc->tape_listen_port;
 }
 
 void BbcMachineSetKey(BbcMachine* bbc, int column, int row, bool down) {

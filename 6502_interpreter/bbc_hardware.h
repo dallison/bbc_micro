@@ -77,8 +77,23 @@ typedef struct BbcRomFile {
 // malloc'd path of ./<directory>, or that directory beside the executable
 // or its parent. NULL when none of those directories exist.
 char* BbcMachineFindRomDirectory(const char* argv0, const char* directory);
-// Fills files with malloc'd paths. Returns the count, or -1 on error.
-int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity);
+// Which filing-system ROM to take from the socket directory. BBC_FS_ANY
+// loads every image. DFS and ADFS may share a socket; pass DFS or ADFS to
+// load that one and leave the other on disk.
+#define BBC_FS_ANY 0
+#define BBC_FS_DFS 1
+#define BBC_FS_ADFS 2
+// "dfs", "disc", "disk", or "adfs". Returns -1 when unknown.
+int BbcMachineParseFilingSystem(const char* text);
+// BBC_FS_DFS, BBC_FS_ADFS, or BBC_FS_ANY from a ROM file name.
+int BbcMachineRomFilingKind(const char* name);
+// Fills files with malloc'd paths. BBC_FS_ANY fits both a DFS and an ADFS
+// image; a shared socket number puts the second in the highest free socket.
+// DFS or ADFS loads only that filing system. Returns the count, or -1.
+int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity, int filing);
+// Controller for a filing-system choice: ADFS and a 1770 DFS use the WD1770,
+// and an 8271 DFS uses the 8271. The Master always uses the WD1770.
+int BbcMachineControllerForFiling(const BbcMachine* bbc, int filing);
 void BbcRomFileFree(BbcRomFile* files, int count);
 const char* BbcRomOsPath(const BbcRomFile* files, int count);
 // Loads sideways images. skip_slot[n] leaves socket n alone. The OS image
@@ -88,11 +103,20 @@ bool BbcMachineLoadRomFiles(BbcMachine* bbc, const BbcRomFile* files, int count,
 // Sideways ROM/RAM image for slots 0-15. Shorter files are padded with &FF.
 bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path);
 // Floppy images: .ssd/.dsd for DFS, .adf/.adm/.adl for ADFS. Drive is 0 or 1.
-// Writes are stored back into the file. The controller is the 8271 unless a
-// loaded ROM says ADFS or 1770, which selects the WD1770.
+// Writes are stored back into the file. DFS and ADFS ROMs are both fitted.
+// The controller follows the filing-system ROM that uses the drive: ADFS and
+// a 1770 DFS use the WD1770, and an 8271 DFS uses the 8271.
 #define BBC_FDC_8271 1
 #define BBC_FDC_1770 2
 bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path);
+// Listen on 127.0.0.1 for cumana. port 0 lets the kernel choose. Returns the
+// bound port, or -1 when the socket cannot be opened. DFS clients use drives
+// 0-3; ADFS clients use 0 and 1. Closing the connection ejects the disc.
+int BbcMachineListenDiscs(BbcMachine* bbc, int port);
+// Listen on 127.0.0.1 for cassette. port 0 lets the kernel choose. Returns
+// the bound port, or -1 when the socket cannot be opened. One tape is
+// inserted at a time. Closing the connection ejects it.
+int BbcMachineListenTapes(BbcMachine* bbc, int port);
 void BbcMachineSetFdc(BbcMachine* bbc, int kind);
 void BbcMachineResetFdc(BbcMachine* bbc);
 // Latched by a falling edge on the FDC interrupt. The CPU consumes it.
@@ -143,6 +167,7 @@ bool BbcMachineCapsLed(const BbcMachine* bbc);
 bool BbcMachineShiftLed(const BbcMachine* bbc);
 bool BbcMachineMotorOn(const BbcMachine* bbc);
 // UEF or a raw cassette byte stream. Playback starts at the beginning.
+// A UEF chunk 0x0110 is carrier and 0x0100, 0x0102, and 0x0104 are data.
 bool BbcMachineLoadTape(BbcMachine* bbc, const char* path);
 void BbcMachineSetPrinter(BbcMachine* bbc, const char* path);
 size_t BbcMachinePrinterLength(const BbcMachine* bbc);

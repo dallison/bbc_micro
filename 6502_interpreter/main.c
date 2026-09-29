@@ -12,6 +12,8 @@
 #include "loader_arch_6502.h"
 #include "6502_interpreter.h"
 #include "bbc_hardware.h"
+#include "cassette.h"
+#include "cumana.h"
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -25,8 +27,10 @@ static void Usage() {
           "           [-bbc] [-bbc-machine b|master|master128|master256]\n"
           "           [-bbc-sram spec] [-bbc-mode 0-7] [-bbc-screen file.ppm]\n"
           "           [-bbc-os file] [-bbc-rom slot,file] [-bbc-roms dir]\n"
-          "           [-bbc-disc file] [-bbc-fdc 8271|1770]\n"
-          "           [-bbc-65c02] [-bbc-tape file] [-bbc-printer file] filename\n"
+          "           [-bbc-disc file] [-bbc-disc-port n] [-bbc-fdc 8271|1770]\n"
+          "           [-bbc-fs dfs|adfs]\n"
+          "           [-bbc-65c02] [-bbc-tape file] [-bbc-tape-port n]\n"
+          "           [-bbc-printer file] filename\n"
           "       With -bbc, Model B ROMs are read from bbc_b_rom_sockets and\n"
           "       Master ROMs from bbc_master_rom_sockets. os.rom or\n"
           "       os-<name>.rom is the OS. <socket>-<name>.rom is sideways\n"
@@ -35,7 +39,15 @@ static void Usage() {
           "       4-7. master256 makes every socket RAM. -bbc-sram 4, 8, 16,\n"
           "       or a list such as 4-7 replaces that set.\n"
           "       A Model B with an OS ROM is an NMOS 6502. -bbc-65c02 keeps\n"
-          "       the CMOS opcodes and the davecc $EF syscall.\n");
+          "       the CMOS opcodes and the davecc $EF syscall.\n"
+          "       DFS and ADFS ROMs are both fitted. The drive follows the one\n"
+          "       the OS calls. -bbc-fs dfs or -bbc-fs adfs loads only that\n"
+          "       filing system.\n"
+          "       cumana inserts a disc while -bbc is running. It connects to\n"
+          "       127.0.0.1:8177. -bbc-disc-port 0 closes that socket.\n"
+          "       cassette inserts a tape. It connects to 127.0.0.1:8178.\n"
+          "       -bbc-tape-port 0 closes that socket. -bbc-tape still loads a\n"
+          "       tape before the machine starts.\n");
   exit(1);
 }
 
@@ -190,7 +202,12 @@ int main(int argc, char *argv[]) {
   int rom_count = 0;
   const char* disc_paths[2] = {NULL, NULL};
   int disc_next = 0;
+  int disc_port = CUMANA_PORT;
+  bool disc_socket = true;
+  int tape_port = CASSETTE_PORT;
+  bool tape_socket = true;
   int fdc_kind = 0;
+  int filing = BBC_FS_ANY;
   bool bbc_65c02 = false;
   int bbc_model = BBC_MACHINE_B;
   bool bbc_sram_set = false;
@@ -293,6 +310,47 @@ int main(int argc, char *argv[]) {
           disc_next = drive + 1;
         }
         bbc = true;
+      } else if (strcmp(argv[i], "-bbc-disc-port") == 0) {
+        char* end = NULL;
+        long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value < 0 || value > 65535) {
+          Usage();
+        }
+        if (value == 0) {
+          disc_socket = false;
+        } else {
+          disc_port = (int)value;
+        }
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-tape-port") == 0) {
+        char* end = NULL;
+        long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value < 0 || value > 65535) {
+          Usage();
+        }
+        if (value == 0) {
+          tape_socket = false;
+        } else {
+          tape_port = (int)value;
+        }
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-fs") == 0) {
+        if (i == argc - 1) {
+          Usage();
+        }
+        filing = BbcMachineParseFilingSystem(argv[++i]);
+        if (filing < 0) {
+          Usage();
+        }
+        bbc = true;
       } else if (strcmp(argv[i], "-bbc-fdc") == 0) {
         if (i == argc - 1) {
           Usage();
@@ -374,7 +432,7 @@ int main(int argc, char *argv[]) {
       dir = rom_dir;
     }
     if (dir != NULL) {
-      rom_file_count = BbcMachineListRomDirectory(dir, rom_files, BBC_ROM_IMAGE_MAX);
+      rom_file_count = BbcMachineListRomDirectory(dir, rom_files, BBC_ROM_IMAGE_MAX, filing);
       if (rom_file_count < 0) {
         free(rom_dir);
         exit(1);
@@ -425,8 +483,26 @@ int main(int argc, char *argv[]) {
         exit(1);
       }
     }
+    if (disc_socket) {
+      int bound = BbcMachineListenDiscs(interpreter.bbc, disc_port);
+      if (bound < 0) {
+        fprintf(stderr, "Disc socket is not available\n");
+      } else {
+        fprintf(stderr, "Disc socket: 127.0.0.1:%d\n", bound);
+      }
+    }
+    if (tape_socket) {
+      int bound = BbcMachineListenTapes(interpreter.bbc, tape_port);
+      if (bound < 0) {
+        fprintf(stderr, "Tape socket is not available\n");
+      } else {
+        fprintf(stderr, "Tape socket: 127.0.0.1:%d\n", bound);
+      }
+    }
     if (fdc_kind != 0) {
       W65C02InterpreterBbcSetFdc(&interpreter, fdc_kind);
+    } else if (filing != BBC_FS_ANY) {
+      W65C02InterpreterBbcSetFdc(&interpreter, BbcMachineControllerForFiling(interpreter.bbc, filing));
     } else if (BbcMachineIsMaster(interpreter.bbc)) {
       W65C02InterpreterBbcSetFdc(&interpreter, BBC_FDC_1770);
     }

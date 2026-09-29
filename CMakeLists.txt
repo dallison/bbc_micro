@@ -85,6 +85,12 @@ add_executable(davecc6502 6502_interpreter/main.c)
 target_link_libraries(davecc6502 PRIVATE 6502_lib)
 set_target_properties(davecc6502 PROPERTIES OUTPUT_NAME 6502)
 
+add_executable(cumana 6502_interpreter/cumana.c)
+target_include_directories(cumana PRIVATE ${BBC_INCLUDES})
+
+add_executable(cassette 6502_interpreter/cassette.c)
+target_include_directories(cassette PRIVATE ${BBC_INCLUDES})
+
 add_executable(bbc_hardware_test
   6502_interpreter/bbc_hardware.c
   6502_interpreter/bbc_hardware_test.c

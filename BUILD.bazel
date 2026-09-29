@@ -134,6 +134,26 @@ cc_binary(
     deps = [":6502_lib"],
 )
 
+cc_binary(
+    name = "cumana",
+    srcs = [
+        "6502_interpreter/cumana.c",
+        "6502_interpreter/cumana.h",
+    ],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
+cc_binary(
+    name = "cassette",
+    srcs = [
+        "6502_interpreter/cassette.c",
+        "6502_interpreter/cassette.h",
+    ],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
 cc_library(
     name = "bbc_ui",
     srcs = ["6502_interpreter/bbc_host.c"],

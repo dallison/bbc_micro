@@ -1,8 +1,15 @@
 #include "bbc_hardware.h"
+#include "cassette.h"
+#include "cumana.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -563,6 +570,7 @@ static void TestDisc(void) {
   bbc = BbcMachineCreate();
   EXPECT(BbcMachineLoadDisc(bbc, 0, ssd));
   EXPECT(BbcMachineLoadSidewaysBytes(bbc, 15, rom, sizeof(rom)));
+  BbcMachineWrite(bbc, 0xfe30, 15);
   BbcMachineWrite(bbc, 0xfe80, 0x21);
   BbcMachineWrite(bbc, 0xfe85, 0);
   BbcMachineWrite(bbc, 0xfe86, 0);
@@ -809,7 +817,7 @@ static void TestRomDirectory(void) {
   WriteNamed(dir, "14-adfs-1.30.rom", 0x33);
   WriteNamed(dir, "4.rom", 0x44);
   WriteNamed(dir, "notes.txt", 0x55);
-  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
   EXPECT(count == 4);
   index = FindSlot(files, count, -1);
   EXPECT(index >= 0);
@@ -836,13 +844,77 @@ static void TestRomDirectory(void) {
   BbcMachineDestroy(bbc);
   free(ram);
 
+  WriteNamed(dir, "14-dfs-1.20.rom", 0x88);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
+  EXPECT(count == 5);
+  {
+    int dfs_slot = -1;
+    int adfs_slot = -1;
+    int n;
+    for (n = 0; n < count; n++) {
+      if (files[n].path != NULL && strstr(files[n].path, "14-dfs-1.20.rom") != NULL) {
+        dfs_slot = files[n].slot;
+      }
+      if (files[n].path != NULL && strstr(files[n].path, "14-adfs-1.30.rom") != NULL) {
+        adfs_slot = files[n].slot;
+      }
+    }
+    EXPECT(dfs_slot >= 0 && adfs_slot >= 0 && dfs_slot != adfs_slot);
+    EXPECT(dfs_slot == 14 || adfs_slot == 14);
+    EXPECT(dfs_slot == 13 || adfs_slot == 13);
+  }
+  BbcRomFileFree(files, count);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_DFS);
+  EXPECT(count == 4);
+  index = FindSlot(files, count, 14);
+  EXPECT(index >= 0 && strstr(files[index].path, "14-dfs-1.20.rom") != NULL);
+  EXPECT(FindSlot(files, count, 15) >= 0);
+  BbcRomFileFree(files, count);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ADFS);
+  EXPECT(count == 4);
+  index = FindSlot(files, count, 14);
+  EXPECT(index >= 0 && strstr(files[index].path, "14-adfs-1.30.rom") != NULL);
+  BbcRomFileFree(files, count);
+  snprintf(path, sizeof(path), "%s/14-dfs-1.20.rom", dir);
+  remove(path);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_DFS);
+  EXPECT(count < 0);
+  EXPECT(BbcMachineParseFilingSystem("dfs") == BBC_FS_DFS);
+  EXPECT(BbcMachineParseFilingSystem("disk") == BBC_FS_DFS);
+  EXPECT(BbcMachineParseFilingSystem("ADFS") == BBC_FS_ADFS);
+  EXPECT(BbcMachineParseFilingSystem("tape") < 0);
+  EXPECT(BbcMachineRomFilingKind("14-adfs-1.30.rom") == BBC_FS_ADFS);
+  EXPECT(BbcMachineRomFilingKind("/roms/11-dnfs-1.20.rom") == BBC_FS_DFS);
+  EXPECT(BbcMachineRomFilingKind("15-basic2.rom") == BBC_FS_ANY);
+  {
+    BbcMachine* machine = BbcMachineCreate();
+    uint8_t image[8];
+    EXPECT(machine != NULL);
+    EXPECT(BbcMachineControllerForFiling(machine, BBC_FS_DFS) == BBC_FDC_8271);
+    EXPECT(BbcMachineControllerForFiling(machine, BBC_FS_ADFS) == BBC_FDC_1770);
+    memcpy(image, "1770DFS", 7);
+    EXPECT(BbcMachineLoadSidewaysBytes(machine, 3, image, 7));
+    EXPECT(BbcMachineControllerForFiling(machine, BBC_FS_DFS) == BBC_FDC_1770);
+    memcpy(image, "ADFS", 4);
+    EXPECT(BbcMachineLoadSidewaysBytes(machine, 14, image, 4));
+    memcpy(image, "DFS", 3);
+    EXPECT(BbcMachineLoadSidewaysBytes(machine, 11, image, 3));
+    BbcMachineWrite(machine, 0xfe30, 14);
+    EXPECT(BbcMachineRead(machine, 0xfe80) == 0xfe);
+    BbcMachineWrite(machine, 0xfe30, 11);
+    EXPECT(BbcMachineRead(machine, 0xfe80) == 0x00);
+    BbcMachineWrite(machine, 0xfe30, 15);
+    EXPECT(BbcMachineRead(machine, 0xfe80) == 0x00);
+    BbcMachineDestroy(machine);
+  }
+
   WriteNamed(dir, "junk.rom", 0x66);
-  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
   EXPECT(count < 0);
   snprintf(path, sizeof(path), "%s/junk.rom", dir);
   remove(path);
   WriteNamed(dir, "15-other.rom", 0x77);
-  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
   EXPECT(count < 0);
 
   snprintf(path, sizeof(path), "%s/os-1.20.rom", dir);
@@ -897,6 +969,8 @@ static void TestMaster(void) {
   BbcMachineSetRam(bbc, ram);
   EXPECT(BbcMachineSetModel(bbc, BBC_MACHINE_MASTER));
   EXPECT(BbcMachineIsMaster(bbc));
+  EXPECT(BbcMachineControllerForFiling(bbc, BBC_FS_DFS) == BBC_FDC_1770);
+  EXPECT(BbcMachineControllerForFiling(bbc, BBC_FS_ADFS) == BBC_FDC_1770);
 
   BbcMachineWrite(bbc, 0xfe30, 4);
   ram[0x8000] = 0x42;
@@ -1100,6 +1174,457 @@ static void TestMaster(void) {
   free(ram);
 }
 
+struct CumanaTrial {
+  int port;
+  int drive;
+  const char* name;
+  const uint8_t* image;
+  size_t length;
+  pthread_mutex_t mu;
+  int ready;
+  int failed;
+  int assigned;
+  uint8_t* written;
+  size_t written_len;
+};
+
+static int CumanaConnect(int port) {
+  int fd;
+  int one = 1;
+  struct sockaddr_in addr;
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static void* CumanaRefuseMain(void* arg) {
+  struct CumanaTrial* trial = (struct CumanaTrial*)arg;
+  int fd;
+  int code = CUMANA_OK;
+  int assigned = -1;
+  char reply[64];
+  fd = CumanaConnect(trial->port);
+  if (fd < 0 ||
+      CumanaSendInsert(fd, trial->drive, 0, trial->name, trial->image, trial->length) != 0 ||
+      CumanaReadReply(fd, &code, &assigned, reply, sizeof(reply)) != 0) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    pthread_mutex_lock(&trial->mu);
+    trial->failed = 1;
+    trial->ready = 1;
+    pthread_mutex_unlock(&trial->mu);
+    return NULL;
+  }
+  close(fd);
+  pthread_mutex_lock(&trial->mu);
+  trial->failed = code != CUMANA_ERR;
+  trial->ready = 1;
+  pthread_mutex_unlock(&trial->mu);
+  return NULL;
+}
+
+static void* CumanaTrialMain(void* arg) {
+  struct CumanaTrial* trial = (struct CumanaTrial*)arg;
+  int fd;
+  int code = CUMANA_ERR;
+  int assigned = -1;
+  char reply[64];
+  uint8_t* written = NULL;
+  size_t written_len = 0;
+  fd = CumanaConnect(trial->port);
+  if (fd < 0 ||
+      CumanaSendInsert(fd, trial->drive, 0, trial->name, trial->image, trial->length) != 0 ||
+      CumanaReadReply(fd, &code, &assigned, reply, sizeof(reply)) != 0 || code != CUMANA_OK) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    pthread_mutex_lock(&trial->mu);
+    trial->failed = 1;
+    trial->ready = 1;
+    pthread_mutex_unlock(&trial->mu);
+    return NULL;
+  }
+  pthread_mutex_lock(&trial->mu);
+  trial->assigned = assigned;
+  trial->ready = 1;
+  pthread_mutex_unlock(&trial->mu);
+  if (CumanaReadImage(fd, &written, &written_len) == 0) {
+    pthread_mutex_lock(&trial->mu);
+    trial->written = written;
+    trial->written_len = written_len;
+    pthread_mutex_unlock(&trial->mu);
+  }
+  for (;;) {
+    uint8_t* extra = NULL;
+    size_t extra_len = 0;
+    if (CumanaReadImage(fd, &extra, &extra_len) != 0) {
+      break;
+    }
+    free(extra);
+  }
+  close(fd);
+  return NULL;
+}
+
+static int WaitTrial(BbcMachine* bbc, struct CumanaTrial* trial, int want_write) {
+  int i;
+  for (i = 0; i < 2000; i++) {
+    int done;
+    pthread_mutex_lock(&trial->mu);
+    done = trial->failed || (trial->ready && (!want_write || trial->written != NULL));
+    pthread_mutex_unlock(&trial->mu);
+    if (done) {
+      return 1;
+    }
+    if (bbc != NULL) {
+      BbcMachineAdvance(bbc, 200);
+    }
+    usleep(1000);
+  }
+  return 0;
+}
+
+static void TestCumana(void) {
+  uint8_t image[2560];
+  uint8_t side[2560];
+  uint8_t adl[512];
+  struct CumanaTrial drive0;
+  struct CumanaTrial drive2;
+  struct CumanaTrial refused;
+  pthread_t thread0;
+  pthread_t thread2;
+  pthread_t thread_refused;
+  BbcMachine* bbc;
+  int port;
+  int i;
+  memset(&drive0, 0, sizeof(drive0));
+  memset(&drive2, 0, sizeof(drive2));
+  memset(&refused, 0, sizeof(refused));
+  for (i = 0; i < 2560; i++) {
+    image[i] = (uint8_t)(i < 256 ? i : 0xe5);
+    side[i] = 0x42;
+  }
+  memset(adl, 0x11, sizeof(adl));
+  bbc = BbcMachineCreate();
+  EXPECT(bbc != NULL);
+  port = BbcMachineListenDiscs(bbc, 0);
+  EXPECT(port > 0);
+  pthread_mutex_init(&drive0.mu, NULL);
+  pthread_mutex_init(&drive2.mu, NULL);
+  drive0.port = port;
+  drive0.drive = 0;
+  drive0.name = "blank.ssd";
+  drive0.image = image;
+  drive0.length = sizeof(image);
+  drive2.port = port;
+  drive2.drive = 2;
+  drive2.name = "side.ssd";
+  drive2.image = side;
+  drive2.length = sizeof(side);
+  EXPECT(pthread_create(&thread0, NULL, CumanaTrialMain, &drive0) == 0);
+  EXPECT(WaitTrial(bbc, &drive0, 0));
+  EXPECT(!drive0.failed);
+  EXPECT(drive0.assigned == 0);
+  EXPECT(pthread_create(&thread2, NULL, CumanaTrialMain, &drive2) == 0);
+  EXPECT(WaitTrial(bbc, &drive2, 0));
+  EXPECT(!drive2.failed);
+  EXPECT(drive2.assigned == 2);
+
+  pthread_mutex_init(&refused.mu, NULL);
+  refused.port = port;
+  refused.drive = 2;
+  refused.name = "both.adl";
+  refused.image = adl;
+  refused.length = sizeof(adl);
+  EXPECT(pthread_create(&thread_refused, NULL, CumanaRefuseMain, &refused) == 0);
+  EXPECT(WaitTrial(bbc, &refused, 0));
+  EXPECT(!refused.failed);
+
+  BbcMachineWrite(bbc, 0xfe80, 0x53);
+  BbcMachineWrite(bbc, 0xfe81, 0x00);
+  BbcMachineWrite(bbc, 0xfe81, 0x00);
+  BbcMachineWrite(bbc, 0xfe81, 0x21);
+  EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+  EXPECT(BbcMachineRead(bbc, 0xfe84) == 0);
+  for (i = 1; i < 256; i++) {
+    EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe84) == (uint8_t)i);
+  }
+  EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+  EXPECT(BbcMachineRead(bbc, 0xfe81) == 0);
+
+  BbcMachineWrite(bbc, 0xfe80, 0x3a);
+  BbcMachineWrite(bbc, 0xfe81, 0x23);
+  BbcMachineWrite(bbc, 0xfe81, 0x20);
+  BbcMachineWrite(bbc, 0xfe80, 0x53);
+  BbcMachineWrite(bbc, 0xfe81, 0x00);
+  BbcMachineWrite(bbc, 0xfe81, 0x00);
+  BbcMachineWrite(bbc, 0xfe81, 0x21);
+  EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+  EXPECT(BbcMachineRead(bbc, 0xfe84) == 0x42);
+  for (i = 1; i < 256; i++) {
+    EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+    (void)BbcMachineRead(bbc, 0xfe84);
+  }
+  EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+  (void)BbcMachineRead(bbc, 0xfe81);
+
+  BbcMachineWrite(bbc, 0xfe80, 0x3a);
+  BbcMachineWrite(bbc, 0xfe81, 0x23);
+  BbcMachineWrite(bbc, 0xfe81, 0x00);
+  BbcMachineWrite(bbc, 0xfe80, 0x4b);
+  BbcMachineWrite(bbc, 0xfe81, 0);
+  BbcMachineWrite(bbc, 0xfe81, 1);
+  BbcMachineWrite(bbc, 0xfe81, 0x21);
+  for (i = 0; i < 256; i++) {
+    EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+    BbcMachineWrite(bbc, 0xfe84, 0x5a);
+  }
+  EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+  EXPECT(BbcMachineRead(bbc, 0xfe81) == 0);
+  EXPECT(WaitTrial(NULL, &drive0, 1));
+  EXPECT(drive0.written != NULL);
+  EXPECT(drive0.written_len == sizeof(image));
+  if (drive0.written != NULL && drive0.written_len == sizeof(image)) {
+    EXPECT(drive0.written[0] == 0);
+    EXPECT(drive0.written[255] == 255);
+    EXPECT(drive0.written[256] == 0x5a);
+    EXPECT(drive0.written[511] == 0x5a);
+  }
+
+  BbcMachineDestroy(bbc);
+  pthread_join(thread0, NULL);
+  pthread_join(thread2, NULL);
+  pthread_join(thread_refused, NULL);
+  pthread_mutex_destroy(&drive0.mu);
+  pthread_mutex_destroy(&drive2.mu);
+  pthread_mutex_destroy(&refused.mu);
+  free(drive0.written);
+}
+
+struct CassetteTrial {
+  int port;
+  const uint8_t* image;
+  size_t length;
+  pthread_mutex_t mu;
+  int ready;
+  int failed;
+  int rewind;
+  int rewound;
+  int stop;
+  uint8_t* written;
+  size_t written_len;
+};
+
+static int Contains(const uint8_t* data, size_t length, const uint8_t* needle, size_t n) {
+  size_t i;
+  if (n == 0 || data == NULL || length < n) {
+    return 0;
+  }
+  for (i = 0; i + n <= length; i++) {
+    if (memcmp(data + i, needle, n) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void* CassetteTrialMain(void* arg) {
+  struct CassetteTrial* trial = (struct CassetteTrial*)arg;
+  int fd;
+  int code = CASSETTE_ERR;
+  char reply[64];
+  uint8_t* written = NULL;
+  size_t written_len = 0;
+  fd = CumanaConnect(trial->port);
+  if (fd < 0 ||
+      CassetteSendInsert(fd, 0, "blank.uef", trial->image, trial->length) != 0 ||
+      CassetteReadReply(fd, &code, reply, sizeof(reply)) != 0 || code != CASSETTE_OK) {
+    if (fd >= 0) {
+      close(fd);
+    }
+    pthread_mutex_lock(&trial->mu);
+    trial->failed = 1;
+    trial->ready = 1;
+    pthread_mutex_unlock(&trial->mu);
+    return NULL;
+  }
+  pthread_mutex_lock(&trial->mu);
+  trial->ready = 1;
+  pthread_mutex_unlock(&trial->mu);
+  if (CassetteReadImage(fd, &written, &written_len) == 0) {
+    pthread_mutex_lock(&trial->mu);
+    trial->written = written;
+    trial->written_len = written_len;
+    pthread_mutex_unlock(&trial->mu);
+  }
+  for (;;) {
+    int rewind = 0;
+    int stop = 0;
+    pthread_mutex_lock(&trial->mu);
+    rewind = trial->rewind && !trial->rewound;
+    stop = trial->stop;
+    pthread_mutex_unlock(&trial->mu);
+    if (stop) {
+      break;
+    }
+    if (rewind) {
+      char mark = CASSETTE_REWIND;
+      if (CassetteSendAll(fd, &mark, 1) != 0) {
+        break;
+      }
+      pthread_mutex_lock(&trial->mu);
+      trial->rewound = 1;
+      pthread_mutex_unlock(&trial->mu);
+    }
+    usleep(1000);
+  }
+  close(fd);
+  return NULL;
+}
+
+static int WaitCassette(BbcMachine* bbc, struct CassetteTrial* trial, int want_write, int want_rewind) {
+  int i;
+  for (i = 0; i < 2000; i++) {
+    int done;
+    pthread_mutex_lock(&trial->mu);
+    done = trial->failed ||
+           (trial->ready && (!want_write || trial->written != NULL) &&
+            (!want_rewind || trial->rewound));
+    pthread_mutex_unlock(&trial->mu);
+    if (done) {
+      return 1;
+    }
+    if (bbc != NULL) {
+      BbcMachineAdvance(bbc, 200);
+    }
+    usleep(1000);
+  }
+  return 0;
+}
+
+static void TestCassette(void) {
+  const char* path = "/tmp/bbc-uef-test.uef";
+  uint8_t uef[] = {
+      'U', 'E', 'F', ' ', 'F', 'i', 'l', 'e', '!', 0, 0x0a, 0,
+      0x10, 0x01, 2, 0, 0, 0, 0x80, 0x02,
+      0x00, 0x01, 1, 0, 0, 0, 0x2a,
+  };
+  uint8_t blank[] = {'U', 'E', 'F', ' ', 'F', 'i', 'l', 'e', '!', 0, 0x0a, 0};
+  uint8_t saved[] = {0x00, 0x01, 2, 0, 0, 0, 0x2a, 0x55};
+  struct CassetteTrial trial;
+  pthread_t thread;
+  BbcMachine* bbc;
+  int port;
+  int i;
+  int played = 0;
+  WriteImage(path, uef, sizeof(uef));
+  bbc = BbcMachineCreate();
+  EXPECT(BbcMachineLoadTape(bbc, path));
+  BbcMachineWrite(bbc, 0xfe08, 0x03);
+  BbcMachineWrite(bbc, 0xfe08, 0x15);
+  BbcMachineWrite(bbc, 0xfe10, 0xc0);
+  BbcMachineAdvance(bbc, 1);
+  for (i = 0; i < 32; i++) {
+    EXPECT((BbcMachineRead(bbc, 0xfe08) & 0x05) == 0x05);
+    EXPECT(BbcMachineRead(bbc, 0xfe09) == 0xaa);
+    BbcMachineAdvance(bbc, 2000);
+  }
+  EXPECT((BbcMachineRead(bbc, 0xfe08) & 0x05) == 0x01);
+  EXPECT(BbcMachineRead(bbc, 0xfe09) == 0x2a);
+  BbcMachineDestroy(bbc);
+  remove(path);
+
+  memset(&trial, 0, sizeof(trial));
+  bbc = BbcMachineCreate();
+  EXPECT(bbc != NULL);
+  port = BbcMachineListenTapes(bbc, 0);
+  EXPECT(port > 0);
+  pthread_mutex_init(&trial.mu, NULL);
+  trial.port = port;
+  trial.image = blank;
+  trial.length = sizeof(blank);
+  EXPECT(pthread_create(&thread, NULL, CassetteTrialMain, &trial) == 0);
+  EXPECT(WaitCassette(bbc, &trial, 0, 0));
+  EXPECT(!trial.failed);
+  BbcMachineWrite(bbc, 0xfe08, 0x03);
+  BbcMachineWrite(bbc, 0xfe08, 0x15);
+  BbcMachineWrite(bbc, 0xfe10, 0xc0);
+  BbcMachineWrite(bbc, 0xfe09, 0x2a);
+  BbcMachineAdvance(bbc, 2000);
+  BbcMachineWrite(bbc, 0xfe09, 0x55);
+  BbcMachineAdvance(bbc, 2000);
+  BbcMachineWrite(bbc, 0xfe10, 0x40);
+  EXPECT(WaitCassette(bbc, &trial, 1, 0));
+  EXPECT(trial.written != NULL);
+  EXPECT(Contains(trial.written, trial.written_len, saved, sizeof(saved)));
+  pthread_mutex_lock(&trial.mu);
+  trial.rewind = 1;
+  pthread_mutex_unlock(&trial.mu);
+  EXPECT(WaitCassette(bbc, &trial, 1, 1));
+  BbcMachineWrite(bbc, 0xfe10, 0xc0);
+  for (i = 0; i < 8 && !played; i++) {
+    BbcMachineAdvance(bbc, 40000);
+    if ((BbcMachineRead(bbc, 0xfe08) & 0x01) != 0 && BbcMachineRead(bbc, 0xfe09) == 0x2a) {
+      played = 1;
+    }
+  }
+  EXPECT(played);
+  pthread_mutex_lock(&trial.mu);
+  trial.stop = 1;
+  pthread_mutex_unlock(&trial.mu);
+  pthread_join(thread, NULL);
+  BbcMachineDestroy(bbc);
+  pthread_mutex_destroy(&trial.mu);
+  free(trial.written);
+
+  {
+    const char* saved_path = "/tmp/bbc-tape-saved.uef";
+    uint8_t marker[] = {0x2a};
+    uint8_t* back = NULL;
+    size_t back_len = 0;
+    FILE* fp;
+    WriteImage(saved_path, blank, sizeof(blank));
+    bbc = BbcMachineCreate();
+    EXPECT(BbcMachineLoadTape(bbc, saved_path));
+    BbcMachineWrite(bbc, 0xfe08, 0x03);
+    BbcMachineWrite(bbc, 0xfe08, 0x15);
+    BbcMachineWrite(bbc, 0xfe10, 0xc0);
+    BbcMachineWrite(bbc, 0xfe09, 0x2a);
+    BbcMachineAdvance(bbc, 2000);
+    BbcMachineWrite(bbc, 0xfe10, 0x40);
+    fp = fopen(saved_path, "rb");
+    EXPECT(fp != NULL);
+    if (fp != NULL) {
+      EXPECT(fseek(fp, 0, SEEK_END) == 0);
+      back_len = (size_t)ftell(fp);
+      EXPECT(fseek(fp, 0, SEEK_SET) == 0);
+      back = (uint8_t*)malloc(back_len > 0 ? back_len : 1);
+      EXPECT(back != NULL && fread(back, 1, back_len, fp) == back_len);
+      fclose(fp);
+    }
+    EXPECT(Contains(back, back_len, marker, sizeof(marker)));
+    free(back);
+    BbcMachineDestroy(bbc);
+    remove(saved_path);
+  }
+}
+
 int main(void) {
   uint8_t* ram = calloc(65536, 1);
   BbcMachine* bbc = BbcMachineCreate();
@@ -1114,6 +1639,8 @@ int main(void) {
     TestAddressRupture();
     TestTeletextBeam();
     TestDisc();
+    TestCumana();
+    TestCassette();
     TestPeripherals();
     TestTeletextControls();
     TestRomDirectory();

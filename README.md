@@ -27,6 +27,8 @@ ctest --test-dir build
 
 `bbc_b_rom_sockets` is the Model B. `bbc_master_rom_sockets` is the Master. `os.rom` or `os-<name>.rom` is the operating system. `<socket>-<name>.rom` is sideways socket 0–15, for example `15-basic2.rom` and `14-adfs-1.30.rom`.
 
+DFS and ADFS images can both stay in that directory. Each is fitted in the socket named by its file, and Break selects the one in the higher socket, as on the machine. `*DISC` and `*ADFS` select the other. The disc controller follows the ROM that uses the drive, so an 8271 DFS and ADFS can both be present. If both files name the same socket, the second is fitted in the highest free socket. `-fs dfs` or `-fs adfs` loads only that one. `-fdc` forces the controller.
+
 ```
 bazel-bin/bbc
 bazel-bin/bbc -machine master -disc blank.adf
@@ -45,6 +47,35 @@ python3 blank_disc.py blank.adl
 ```
 
 `.ssd` and `.dsd` are DFS. `.adf` and `.adm` are single-sided ADFS. `.adl` is double-sided ADFS.
+
+`bbc` listens on `127.0.0.1:8177`. `cumana` connects and inserts an image into a drive of the running machine. Closing `cumana` ejects it, and writes the guest makes are stored back into the file.
+
+```
+cumana blank.ssd
+cumana -drive 1 blank.adf
+cumana -drive 2 side.ssd
+cumana -drive 0 blank.adl
+```
+
+DFS has drives 0–3. Drives 2 and 3 are the second side of drives 0 and 1. ADFS has drives 0 and 1; a double-sided image is one of those drives. With no `-drive`, the emulator uses the first free drive. `-disc-port 0` closes the socket. `-disc` still mounts an image before the machine starts.
+
+## Tapes
+
+`blank_tape.py` writes a UEF cassette image. A filename alone is a blank tape the emulator can record onto. `--data` stores a binary as Acorn cassette blocks, which `*LOAD` and `*RUN` can read.
+
+```
+python3 blank_tape.py blank.uef
+python3 blank_tape.py --name HELLO --load 0xE00 --exec 0xE00 --data prog.bin hello.uef
+```
+
+`bbc` listens on `127.0.0.1:8178`. `cassette` connects and inserts that file. Closing it ejects the tape. A guest `*SAVE` is written back into the file when the cassette motor stops. On a terminal, `r` rewinds and `q` ejects. A missing file starts blank and is created on the first recording. `-ro` is play-only.
+
+```
+cassette blank.uef
+cassette -ro hello.uef
+```
+
+`-tape-port 0` closes the socket. `-tape` still loads a tape before the machine starts, and a guest `*SAVE` is written back into that file when the cassette motor stops. Inside the emulator, `*TAPE` then `*SAVE` records onto whichever tape is inserted.
 
 ## davecc
 
