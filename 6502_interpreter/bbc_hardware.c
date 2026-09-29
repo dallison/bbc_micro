@@ -1524,6 +1524,16 @@ bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr) {
   return !bbc->sideways_ram[bbc->romsel & 0x0f];
 }
 
+bool BbcMachineMosRom(const BbcMachine* bbc, uint16_t addr) {
+  if (bbc == NULL || addr < 0xc000 || (addr >= 0xfc00 && addr <= 0xfeff)) {
+    return false;
+  }
+  if (bbc->master && addr <= 0xdfff) {
+    return !bbc->hazel_mapped;
+  }
+  return true;
+}
+
 static bool SidewaysActive(const BbcMachine* bbc) {
   int i;
   if (bbc->master || bbc->any_sideways) {

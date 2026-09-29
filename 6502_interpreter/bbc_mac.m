@@ -149,6 +149,19 @@ static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
   return false;
 }
 
+// AppKit's function-key characters, F1 then F2 and so on. F10 is the BBC f0 key.
+static bool FunctionCharacter(unichar ch, int* column, int* row) {
+  static const int cells[10][2] = {
+      {1, 7}, {2, 7}, {3, 7}, {4, 1}, {4, 7}, {5, 7}, {6, 1}, {6, 7}, {7, 7}, {0, 2},
+  };
+  if (ch < NSF1FunctionKey || ch > NSF1FunctionKey + 9) {
+    return false;
+  }
+  *column = cells[ch - NSF1FunctionKey][0];
+  *row = cells[ch - NSF1FunctionKey][1];
+  return true;
+}
+
 static bool LetterKey(unsigned short key_code) {
   switch (key_code) {
     case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
@@ -175,7 +188,11 @@ static void PressHostKey(NSEvent* event) {
     return;
   }
   ReleaseHostKey(event.keyCode);
-  if (g_cpu.bbc != NULL && BbcMachineIsMaster(g_cpu.bbc) &&
+  if (!mapped && chars.length > 0 &&
+      FunctionCharacter([chars characterAtIndex:0], &column, &row)) {
+    mapped = true;
+  }
+  if (!mapped && g_cpu.bbc != NULL && BbcMachineIsMaster(g_cpu.bbc) &&
       MasterKeyPosition(event.keyCode, &column, &row)) {
     mapped = true;
   }
@@ -500,6 +517,72 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   [self.view setNeedsDisplay:YES];
 }
 
+// macOS uses the top row as brightness and volume unless this preference is
+// on. Remember the user's value and turn the row into F1-F12 while the
+// emulator is the front application, then put the old value back.
+static bool g_fn_known = false;
+static bool g_fn_existed = false;
+static bool g_fn_was_on = false;
+static bool g_fn_overridden = false;
+
+static void RememberFnState(void) {
+  CFPropertyListRef value;
+  if (g_fn_known) {
+    return;
+  }
+  value = CFPreferencesCopyAppValue(CFSTR("com.apple.keyboard.fnState"),
+                                    kCFPreferencesAnyApplication);
+  g_fn_known = true;
+  if (value == NULL) {
+    return;
+  }
+  g_fn_existed = true;
+  if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+    g_fn_was_on = CFBooleanGetValue((CFBooleanRef)value);
+  } else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+    int number = 0;
+    CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &number);
+    g_fn_was_on = number != 0;
+  }
+  CFRelease(value);
+}
+
+static void StoreFnState(CFPropertyListRef value) {
+  NSString* tool =
+      @"/System/Library/PrivateFrameworks/SystemAdministration.framework/Resources/activateSettings";
+  CFPreferencesSetValue(CFSTR("com.apple.keyboard.fnState"), value, kCFPreferencesAnyApplication,
+                        kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+  CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser,
+                           kCFPreferencesAnyHost);
+  if (![[NSFileManager defaultManager] isExecutableFileAtPath:tool]) {
+    return;
+  }
+  NSTask* task = [[NSTask alloc] init];
+  NSError* error = nil;
+  task.executableURL = [NSURL fileURLWithPath:tool];
+  task.arguments = @[@"-u"];
+  task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+  task.standardError = [NSFileHandle fileHandleWithNullDevice];
+  if ([task launchAndReturnError:&error]) {
+    [task waitUntilExit];
+  }
+}
+
+static void UseHostFunctionKeys(bool enable) {
+  RememberFnState();
+  if (g_fn_was_on) {
+    return;
+  }
+  if (enable && !g_fn_overridden) {
+    StoreFnState(kCFBooleanTrue);
+    g_fn_overridden = true;
+  } else if (!enable && g_fn_overridden) {
+    StoreFnState(g_fn_existed ? (CFPropertyListRef)(g_fn_was_on ? kCFBooleanTrue : kCFBooleanFalse)
+                             : NULL);
+    g_fn_overridden = false;
+  }
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
   (void)notification;
   // 800x640 is a 5:4 monitor at a size that sits on the desktop.
@@ -525,10 +608,22 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
                                               userInfo:nil
                                                repeats:YES];
   [NSApp activateIgnoringOtherApps:YES];
+  UseHostFunctionKeys(true);
+}
+
+- (void)applicationDidBecomeActive:(NSNotification*)notification {
+  (void)notification;
+  UseHostFunctionKeys(true);
+}
+
+- (void)applicationDidResignActive:(NSNotification*)notification {
+  (void)notification;
+  UseHostFunctionKeys(false);
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
   (void)notification;
+  UseHostFunctionKeys(false);
   [self.timer invalidate];
   if (self.audioQueue != NULL) {
     AudioQueueStop(self.audioQueue, true);
@@ -561,7 +656,9 @@ static void Usage(void) {
           "       os.rom or os-<name>.rom is the OS. <socket>-<name>.rom is\n"
           "       sideways socket 0-15. -os and -rom replace one of those files.\n"
           "       The Model B CPU is the NMOS 6502. -65c02 keeps the CMOS opcodes\n"
-          "       and the davecc $EF syscall. F12 resets the machine.\n"
+          "       and the davecc $EF syscall. F1 to F9 are the BBC keys f1 to f9,\n"
+          "       and F10 is f0. F12 resets the machine. While this window is in\n"
+          "       front, that row is the BBC keys.\n"
           "       DFS and ADFS ROMs are both fitted. The drive follows the one\n"
           "       the OS calls. -fs dfs or -fs adfs loads only that filing\n"
           "       system.\n"

@@ -82,6 +82,9 @@ typedef struct W65C02Interpreter {
   int bbc_initial_mode;
   const char* bbc_screen_path;
   const char* bbc_os_path;
+  const char* bbc_ram_path;
+  uint64_t bbc_step_limit;
+  uint64_t bbc_steps;
   // Set for a BBC Micro. Cleared by -65c02 so davecc's CMOS opcodes and the
   // $EF syscall stay available on the same machine.
   bool nmos;

@@ -30,7 +30,8 @@ static void Usage() {
           "           [-bbc-disc file] [-bbc-disc-port n] [-bbc-fdc 8271|1770]\n"
           "           [-bbc-fs dfs|adfs]\n"
           "           [-bbc-65c02] [-bbc-tape file] [-bbc-tape-port n]\n"
-          "           [-bbc-printer file] [-bbc-2mhz] [-bbc-mhz n] filename\n"
+          "           [-bbc-printer file] [-bbc-2mhz] [-bbc-mhz n]\n"
+          "           [-bbc-shift] [-bbc-steps n] [-bbc-ram file] filename\n"
           "       With -bbc, Model B ROMs are read from bbc_b_rom_sockets and\n"
           "       Master ROMs from bbc_master_rom_sockets. os.rom or\n"
           "       os-<name>.rom is the OS. <socket>-<name>.rom is sideways\n"
@@ -218,6 +219,9 @@ int main(int argc, char *argv[]) {
   bool bbc_sram[16];
   const char* bbc_tape = NULL;
   const char* bbc_printer = NULL;
+  bool bbc_shift = false;
+  uint64_t bbc_step_limit = 0;
+  const char* bbc_ram = NULL;
   const char* rom_filename = NULL;
   for (int i = 1; i < argc; i++) {
     // Once the executable is known, every remaining token belongs to the
@@ -415,6 +419,27 @@ int main(int argc, char *argv[]) {
         }
         bbc_tape = argv[++i];
         bbc = true;
+      } else if (strcmp(argv[i], "-bbc-shift") == 0) {
+        bbc_shift = true;
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-steps") == 0) {
+        char* end = NULL;
+        unsigned long long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtoull(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value == 0) {
+          Usage();
+        }
+        bbc_step_limit = value;
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-ram") == 0) {
+        if (i == argc - 1) {
+          Usage();
+        }
+        bbc_ram = argv[++i];
+        bbc = true;
       } else if (strcmp(argv[i], "-bbc-printer") == 0) {
         if (i == argc - 1) {
           Usage();
@@ -540,7 +565,12 @@ int main(int argc, char *argv[]) {
     if (bbc_printer != NULL) {
       BbcMachineSetPrinter(interpreter.bbc, bbc_printer);
     }
+    if (bbc_shift && interpreter.bbc != NULL) {
+      BbcMachineSetKey(interpreter.bbc, 0, 0, true);
+    }
   }
+  interpreter.bbc_step_limit = bbc_step_limit;
+  interpreter.bbc_ram_path = bbc_ram;
   
   // The LD_TRACE_LOADED_OBJECTS variable shows the loaded objects
   // and doesn't run the program.

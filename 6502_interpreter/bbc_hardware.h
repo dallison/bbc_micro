@@ -134,6 +134,11 @@ uint8_t BbcMachineRead(BbcMachine* bbc, uint16_t addr);
 void BbcMachineBeginInstruction(BbcMachine* bbc, uint16_t pc);
 // A sideways ROM ignores writes. Sideways RAM and the Master's ANDY do not.
 bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr);
+// The MOS image ignores writes. On a Master, &C000-&DFFF is HAZEL RAM while
+// ACCCON bit 3 is set; &E000-&FBFF and &FF00-&FFFF stay ROM. DFS 2.45's
+// read-track routine stores every byte at &FF00, and a write that sticks
+// there replaces the NMI vector.
+bool BbcMachineMosRom(const BbcMachine* bbc, uint16_t addr);
 // BREAK clears ROMSEL and, on a Master, ACCCON.
 void BbcMachineBreak(BbcMachine* bbc);
 // Remember &C000-&DFFF as the MOS image HAZEL will page out.

@@ -2203,7 +2203,15 @@ int W65C02InterpreterRun(W65C02Interpreter* interpreter, Loader* loader,
   // function for that opcode.  Each handler function will set the PC to
   // the next instruction address.
   while (interpreter->running) {
+    if (interpreter->bbc_step_limit != 0 &&
+        interpreter->bbc_steps >= interpreter->bbc_step_limit) {
+      fprintf(stderr, "bbc: stopped after %llu instructions\n",
+              (unsigned long long)interpreter->bbc_steps);
+      interpreter->running = false;
+      break;
+    }
     StepOneInstruction(interpreter, true);
+    interpreter->bbc_steps++;
   }
   if (!W65C02GuestRunFiniArrays(loader, interpreter)) {
     return 1;
@@ -2271,6 +2279,16 @@ void W65C02InterpreterExtract(W65C02Interpreter* interpreter, Loader* loader, FI
 
 void W65C02InterpreterDestruct(W65C02Interpreter* interpreter) {
   size_t i;
+  if (interpreter->bbc_ram_path != NULL && interpreter->bbc_ram_path[0] != '\0' &&
+      interpreter->memory != NULL) {
+    FILE* ram = fopen(interpreter->bbc_ram_path, "wb");
+    if (ram == NULL || fwrite(interpreter->memory, 1, 65536, ram) != 65536) {
+      fprintf(stderr, "Unable to write BBC RAM to '%s'\n", interpreter->bbc_ram_path);
+    }
+    if (ram != NULL) {
+      fclose(ram);
+    }
+  }
   if (interpreter->bbc != NULL) {
     if (interpreter->bbc_screen_path != NULL && interpreter->bbc_screen_path[0] != '\0') {
       if (!BbcMachineWritePpm(interpreter->bbc, interpreter->bbc_screen_path)) {
@@ -2357,7 +2375,8 @@ static void W65C02WriteByte(W65C02Interpreter* interpreter, uint16_t addr, uint8
       return;
     }
   }
-  if (!BbcMachineSidewaysRom(interpreter->bbc, addr)) {
+  if (!BbcMachineSidewaysRom(interpreter->bbc, addr) &&
+      !BbcMachineMosRom(interpreter->bbc, addr)) {
     *p = value;
     W65C02NoteStore(interpreter, addr);
   }
@@ -2489,7 +2508,8 @@ SET_FLAGS(interpreter->reg = *(addr));
     if (IsWatchedAddress(interpreter, kWatchWrite, addr, interpreter->reg)) { \
     DebuggerLoop(interpreter);\
   } \
-    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
+    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory)) && \
+        !BbcMachineMosRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
       *(addr) = interpreter->reg;\
       W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory)); \
     } \
@@ -2517,7 +2537,8 @@ W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory));
     if (IsWatchedAddress(interpreter, kWatchWrite, addr, 0)) { \
       DebuggerLoop(interpreter);\
     } \
-    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
+    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory)) && \
+        !BbcMachineMosRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
       *(addr) = 0;\
       W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory)); \
     } \
