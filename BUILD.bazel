@@ -155,27 +155,61 @@ cc_binary(
 )
 
 cc_library(
-    name = "bbc_ui",
-    srcs = ["6502_interpreter/bbc_host.c"],
-    hdrs = ["6502_interpreter/bbc_mac.m"],
-    copts = COMMON_COPTS + ["-x", "objective-c", "-fobjc-arc"],
+    name = "bbc_session",
+    srcs = ["6502_interpreter/bbc_session.c"],
+    hdrs = ["6502_interpreter/bbc_session.h"],
+    copts = COMMON_COPTS,
     includes = COMMON_INCLUDES,
     deps = [":6502_lib"],
+)
+
+cc_library(
+    name = "bbc_ui",
+    srcs = ["6502_interpreter/bbc_host.c"],
+    hdrs = [
+        "6502_interpreter/bbc_mac.m",
+        "6502_interpreter/bbc_session.h",
+    ],
+    copts = COMMON_COPTS + ["-x", "objective-c", "-fobjc-arc"],
+    includes = COMMON_INCLUDES,
+    deps = [
+        ":6502_lib",
+        ":bbc_session",
+    ],
     target_compatible_with = ["@platforms//os:macos"],
 )
 
 cc_binary(
     name = "bbc",
-    srcs = ["6502_interpreter/bbc_entry.c"],
+    srcs = select({
+        "@platforms//os:linux": ["6502_interpreter/bbc_linux.c"],
+        "//conditions:default": ["6502_interpreter/bbc_entry.c"],
+    }),
     copts = COMMON_COPTS,
-    linkopts = [
-        "-framework",
-        "Cocoa",
-        "-framework",
-        "AudioToolbox",
-    ],
-    deps = [":bbc_ui"],
-    target_compatible_with = ["@platforms//os:macos"],
+    linkopts = select({
+        "@platforms//os:linux": [
+            "-lX11",
+            "-lpthread",
+        ],
+        "//conditions:default": [
+            "-framework",
+            "Cocoa",
+            "-framework",
+            "AudioToolbox",
+        ],
+    }),
+    deps = select({
+        "@platforms//os:linux": [
+            ":6502_lib",
+            ":bbc_session",
+        ],
+        "//conditions:default": [":bbc_ui"],
+    }),
+    target_compatible_with = select({
+        "@platforms//os:linux": [],
+        "@platforms//os:macos": [],
+        "//conditions:default": ["@platforms//os:macos"],
+    }),
 )
 
 cc_test(

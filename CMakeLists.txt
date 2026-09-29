@@ -106,6 +106,7 @@ if(APPLE)
   add_executable(bbc
     6502_interpreter/bbc_entry.c
     6502_interpreter/bbc_host.c
+    6502_interpreter/bbc_session.c
   )
   set_source_files_properties(6502_interpreter/bbc_host.c PROPERTIES LANGUAGE OBJC)
   target_compile_options(bbc PRIVATE -fobjc-arc)
@@ -114,11 +115,32 @@ if(APPLE)
     "-framework Cocoa"
     "-framework AudioToolbox"
   )
+elseif(UNIX)
+  # libX11 is already installed on a desktop Ubuntu or Debian system. The
+  # compiler also needs the headers from libx11-dev. ALSA is optional.
+  find_package(X11)
+  find_path(ALSA_INCLUDE_DIR alsa/asoundlib.h)
+  find_library(ALSA_LIBRARY asound)
+  if(X11_FOUND)
+    add_executable(bbc
+      6502_interpreter/bbc_linux.c
+      6502_interpreter/bbc_session.c
+    )
+    target_include_directories(bbc PRIVATE ${BBC_INCLUDES} ${X11_INCLUDE_DIR})
+    target_link_libraries(bbc PRIVATE 6502_lib ${X11_LIBRARIES} Threads::Threads)
+    if(ALSA_INCLUDE_DIR AND ALSA_LIBRARY)
+      target_compile_definitions(bbc PRIVATE BBC_HAVE_ALSA=1)
+      target_include_directories(bbc PRIVATE ${ALSA_INCLUDE_DIR})
+      target_link_libraries(bbc PRIVATE ${ALSA_LIBRARY})
+    endif()
+  else()
+    message(STATUS "libX11 not found; the bbc window is not being built. Install libx11-dev.")
+  endif()
 endif()
 
 enable_testing()
 add_test(NAME bbc_hardware_test COMMAND bbc_hardware_test)
 add_test(NAME 6502_nmos_test COMMAND 6502_nmos_test)
-if(APPLE)
+if(TARGET bbc)
   add_test(NAME bbc_selftest COMMAND bbc -selftest)
 endif()

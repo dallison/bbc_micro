@@ -145,6 +145,7 @@ struct BbcMachine {
   int16_t audio_ring[BBC_AUDIO_RING];
   int audio_r;
   int audio_w;
+  int volume;
   pthread_mutex_t audio_mu;
   bool audio_ready;
   uint8_t adc_status;
@@ -1003,7 +1004,8 @@ static void DrawCursorBar(BbcMachine* bbc, uint16_t ma, int x, int y, int w, int
   if (end >= scanlines) {
     end = scanlines - 1;
   }
-  InvertRect(bbc, x, y + start, w, end - start + 1);
+  // Two framebuffer lines per character row, so the underline covers both.
+  InvertRect(bbc, x, y + start * 2, w, (end - start + 1) * 2);
 }
 
 static void FillCell(BbcMachine* bbc, int x, int y, int w, int h, const uint8_t rgb[3]) {
@@ -1068,6 +1070,96 @@ static void TeletextApply(BbcMachine* bbc, uint8_t byte) {
   }
 }
 
+// One SAA5050 row is five dots, each shown as two half-dots, plus a blank
+// dot of spacing on the left. Bit 11 of the result is the leftmost half-dot.
+static uint16_t TeletextExpand(uint8_t bits) {
+  bits = (uint8_t)(bits & 0x1f);
+  return (uint16_t)(((bits & 0x01) * 0x03) + ((bits & 0x02) * 0x06) + ((bits & 0x04) * 0x0c) +
+                    ((bits & 0x08) * 0x18) + ((bits & 0x10) * 0x30));
+}
+
+static uint8_t TeletextMatrix(uint8_t glyph, int row) {
+  if (glyph < 0x20 || glyph > 0x7f || row < 0 || row > 8) {
+    return 0;
+  }
+  return kSaa5050Uk[glyph - 0x20][row];
+}
+
+// A diagonal in the matrix inserts a half-dot beside the current row's dot.
+static uint16_t TeletextRound(uint16_t current, uint16_t neighbor) {
+  return (uint16_t)(current | ((current >> 1) & neighbor & ~(neighbor >> 1)) |
+                    ((current << 1) & neighbor & ~(neighbor << 1)));
+}
+
+static int TeletextLineIndex(int line, int span) {
+  int index;
+  if (span < 1) {
+    span = 1;
+  }
+  if (line < 0) {
+    line = 0;
+  }
+  index = line * 10 / span;
+  if (index > 9) {
+    return 9;
+  }
+  return index;
+}
+
+// ra is the 0..19 rounding line. Out of range is a blank row.
+static int TeletextRa(int row, int lower, bool doubled, bool bottom) {
+  int ra;
+  if (row < 0 || row > 9) {
+    return -1;
+  }
+  ra = row * 2 + (lower ? 1 : 0);
+  if (doubled) {
+    ra /= 2;
+    if (bottom) {
+      ra += 10;
+    }
+  }
+  return ra;
+}
+
+static uint16_t TeletextRaw(uint8_t glyph, int ra) {
+  int neighbor;
+  if (ra < 0 || ra > 19) {
+    return 0;
+  }
+  neighbor = ra + ((ra & 1) ? 1 : -1);
+  if (neighbor < 0) {
+    neighbor = -1;
+  } else {
+    neighbor >>= 1;
+  }
+  return TeletextRound(TeletextExpand(TeletextMatrix(glyph, ra >> 1)),
+                       TeletextExpand(TeletextMatrix(glyph, neighbor)));
+}
+
+// Each of the ten character rows is two framebuffer lines. The top line rounds
+// against the row above and the bottom line against the row below.
+static uint16_t TeletextPattern(uint8_t glyph, int row, int lower, bool doubled, bool bottom) {
+  return TeletextRaw(glyph, TeletextRa(row, lower, doubled, bottom));
+}
+
+// The chip's rounded glyph is 12 half-dots wide. Drawing those one-to-one,
+// centered in the cell, keeps the curves. Stretching them to fill all 16
+// pixels makes some columns wider than others and turns a 0 into a spike.
+static bool TeletextPixel(uint16_t pattern, int pix, int ppc) {
+  int origin;
+  int half;
+  if (ppc < 1 || pix < 0) {
+    return false;
+  }
+  origin = (ppc - 12) / 2;
+  half = pix - origin;
+  if (half < 0 || half > 11) {
+    return false;
+  }
+  return (pattern & (uint16_t)(1u << (11 - half))) != 0;
+}
+
 static void DrawTeletext(BbcMachine* bbc, int cols, int rows, int scanlines, int ppc) {
   int row;
   bool bottom = false;
@@ -1080,10 +1172,11 @@ static void DrawTeletext(BbcMachine* bbc, int cols, int rows, int scanlines, int
     for (col = 0; col < cols; col++) {
       uint8_t byte = VideoByte(bbc, ma, 0) & 0x7f;
       int x = col * ppc;
-      int y = row * scanlines;
+      int y = row * scanlines * 2;
       bool control = byte < 0x20;
       uint8_t glyph = byte;
-      bool graphic = bbc->tt_graphics && !control;
+      // Codes 0x40-0x5F stay letters in graphics mode. Only bit 5 selects a mosaic.
+      bool graphic = bbc->tt_graphics && !control && (glyph & 0x20) != 0;
       bool hidden = bbc->tt_conceal || (bbc->tt_flash && !FlashOn(bbc));
       int fg = bbc->tt_fg & 7;
       int bg = bbc->tt_bg & 7;
@@ -1093,7 +1186,7 @@ static void DrawTeletext(BbcMachine* bbc, int cols, int rows, int scanlines, int
         control = false;
       }
       if (control || hidden || glyph < 0x20) {
-        FillCell(bbc, x, y, ppc, scanlines, kRgb[bg]);
+        FillCell(bbc, x, y, ppc, scanlines * 2, kRgb[bg]);
       } else if (graphic) {
         static const uint8_t kBit[6] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x40};
         int sy;
@@ -1101,56 +1194,49 @@ static void DrawTeletext(BbcMachine* bbc, int cols, int rows, int scanlines, int
         int origin = bbc->tt_double && bbc->tt_bottom ? scanlines : 0;
         for (sy = 0; sy < scanlines; sy++) {
           int band = ((origin + sy) * 3) / (vspan > 0 ? vspan : 1);
-          int s;
+          int half;
           if (band > 2) {
             band = 2;
           }
-          for (s = 0; s < 2; s++) {
-            int which = band * 2 + s;
-            const uint8_t* colour = (glyph & kBit[which]) ? kRgb[fg] : kRgb[bg];
-            int x0 = x + s * (ppc / 2);
-            int w = ppc / 2;
-            if (bbc->tt_separated) {
-              FillCell(bbc, x0, y + sy, w, 1, kRgb[bg]);
-              if (w > 2) {
-                FillCell(bbc, x0 + 1, y + sy, w - 2, 1, colour);
+          for (half = 0; half < 2; half++) {
+            int yy = y + sy * 2 + half;
+            int s;
+            for (s = 0; s < 2; s++) {
+              int which = band * 2 + s;
+              const uint8_t* colour = (glyph & kBit[which]) ? kRgb[fg] : kRgb[bg];
+              int x0 = x + s * (ppc / 2);
+              int w = ppc / 2;
+              if (bbc->tt_separated) {
+                FillCell(bbc, x0, yy, w, 1, kRgb[bg]);
+                if (w > 2) {
+                  FillCell(bbc, x0 + 1, yy, w - 2, 1, colour);
+                }
+              } else {
+                FillCell(bbc, x0, yy, w, 1, colour);
               }
-            } else {
-              FillCell(bbc, x0, y + sy, w, 1, colour);
             }
           }
         }
       } else {
-        int rows_used = bbc->tt_double ? 4 : 8;
-        int src = bbc->tt_double && bbc->tt_bottom ? 4 : 0;
-        int fy;
-        FillCell(bbc, x, y, ppc, scanlines, kRgb[bg]);
-        for (fy = 0; fy < rows_used; fy++) {
-          int y0 = y + fy * scanlines / rows_used;
-          int y1 = y + (fy + 1) * scanlines / rows_used;
-          uint8_t bits = kBbcFont8x8[glyph][src + fy];
-          int fx;
-          for (fx = 0; fx < 8; fx++) {
-            int x0;
-            int x1;
-            int yy;
-            int xx;
-            if ((bits & (1 << fx)) == 0) {
-              continue;
-            }
-            x0 = x + fx * ppc / 8;
-            x1 = x + (fx + 1) * ppc / 8;
-            for (yy = y0; yy < y1; yy++) {
-              for (xx = x0; xx < x1; xx++) {
-                PutPixel(bbc, xx, yy, kRgb[fg]);
-              }
+        int sy;
+        for (sy = 0; sy < scanlines; sy++) {
+          int index = TeletextLineIndex(sy, scanlines);
+          int half;
+          for (half = 0; half < 2; half++) {
+            uint16_t pattern =
+                TeletextPattern(glyph, index, half, bbc->tt_double, bbc->tt_bottom);
+            int yy = y + sy * 2 + half;
+            int pix;
+            for (pix = 0; pix < ppc; pix++) {
+              const uint8_t* colour = TeletextPixel(pattern, pix, ppc) ? kRgb[fg] : kRgb[bg];
+              PutPixel(bbc, x + pix, yy, colour);
             }
           }
         }
       }
       if (byte < 0x20) {
         TeletextApply(bbc, byte);
-      } else if (bbc->tt_graphics) {
+      } else if (bbc->tt_graphics && (byte & 0x20) != 0) {
         bbc->tt_held = byte;
         bbc->tt_held_valid = true;
       }
@@ -1234,11 +1320,16 @@ void BbcMachineRender(BbcMachine* bbc) {
   if (cols * ppc > BBC_FB_WIDTH) {
     cols = BBC_FB_WIDTH / ppc;
   }
-  if (rows * scanlines > BBC_FB_HEIGHT) {
-    rows = BBC_FB_HEIGHT / scanlines;
+  // MODE 7 stores both rounding halves, so a character row is twice as many
+  // lines as the CRTC scan. Bitmap modes stay one line per scan.
+  {
+    int scale = Teletext(bbc) ? 2 : 1;
+    if (rows * scanlines * scale > BBC_FB_HEIGHT) {
+      rows = BBC_FB_HEIGHT / (scanlines * scale);
+    }
+    bbc->frame_width = cols * ppc;
+    bbc->frame_height = rows * scanlines * scale;
   }
-  bbc->frame_width = cols * ppc;
-  bbc->frame_height = rows * scanlines;
   if (Teletext(bbc)) {
     DrawTeletext(bbc, cols, rows, scanlines, ppc);
   } else {
@@ -3103,7 +3194,7 @@ static void DrawBeamTeletext(BbcMachine* bbc, int x, int y, uint8_t byte, int ra
   int span = max_ra + 1;
   bool control = byte < 0x20;
   uint8_t glyph = byte;
-  bool graphic = bbc->tt_graphics && !control;
+  bool graphic = bbc->tt_graphics && !control && (glyph & 0x20) != 0;
   bool hidden = bbc->tt_conceal || (bbc->tt_flash && !FlashOn(bbc));
   int pix;
   if (control && bbc->tt_hold && bbc->tt_graphics && bbc->tt_held_valid) {
@@ -3114,68 +3205,56 @@ static void DrawBeamTeletext(BbcMachine* bbc, int x, int y, uint8_t byte, int ra
   if (span < 1) {
     span = 1;
   }
-  if (control || hidden || glyph < 0x20) {
-    for (pix = 0; pix < ppc; pix++) {
-      PutBeam(bbc, x + pix, y, kRgb[bbc->tt_bg & 7]);
-    }
-  } else if (graphic) {
-    static const uint8_t kBit[6] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x40};
-    int vspan = bbc->tt_double ? span * 2 : span;
-    int virtual_ra = bbc->tt_double && bbc->tt_bottom ? ra + span : ra;
-    int band = (virtual_ra * 3) / vspan;
-    int s;
-    if (band > 2) {
-      band = 2;
-    }
-    for (s = 0; s < 2; s++) {
-      int which = band * 2 + s;
-      const uint8_t* colour = (glyph & kBit[which]) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
-      int x0 = x + s * (ppc / 2);
-      int w = ppc / 2;
-      int i;
-      if (bbc->tt_separated) {
-        for (i = 0; i < w; i++) {
-          PutBeam(bbc, x0 + i, y, kRgb[bbc->tt_bg & 7]);
+  {
+    int half;
+    int row = TeletextLineIndex(ra, span);
+    for (half = 0; half < 2; half++) {
+      int yy = y + half;
+      if (control || hidden || glyph < 0x20) {
+        for (pix = 0; pix < ppc; pix++) {
+          PutBeam(bbc, x + pix, yy, kRgb[bbc->tt_bg & 7]);
         }
-        for (i = 1; i < w - 1; i++) {
-          PutBeam(bbc, x0 + i, y, colour);
+      } else if (graphic) {
+        static const uint8_t kBit[6] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x40};
+        int vspan = bbc->tt_double ? span * 2 : span;
+        int virtual_ra = bbc->tt_double && bbc->tt_bottom ? ra + span : ra;
+        int band = (virtual_ra * 3) / vspan;
+        int s;
+        if (band > 2) {
+          band = 2;
+        }
+        for (s = 0; s < 2; s++) {
+          int which = band * 2 + s;
+          const uint8_t* colour = (glyph & kBit[which]) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
+          int x0 = x + s * (ppc / 2);
+          int w = ppc / 2;
+          int i;
+          if (bbc->tt_separated) {
+            for (i = 0; i < w; i++) {
+              PutBeam(bbc, x0 + i, yy, kRgb[bbc->tt_bg & 7]);
+            }
+            for (i = 1; i < w - 1; i++) {
+              PutBeam(bbc, x0 + i, yy, colour);
+            }
+          } else {
+            for (i = 0; i < w; i++) {
+              PutBeam(bbc, x0 + i, yy, colour);
+            }
+          }
         }
       } else {
-        for (i = 0; i < w; i++) {
-          PutBeam(bbc, x0 + i, y, colour);
+        uint16_t pattern = TeletextPattern(glyph, row, half, bbc->tt_double, bbc->tt_bottom);
+        for (pix = 0; pix < ppc; pix++) {
+          const uint8_t* colour =
+              TeletextPixel(pattern, pix, ppc) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
+          PutBeam(bbc, x + pix, yy, colour);
         }
-      }
-    }
-  } else {
-    int rows_used = bbc->tt_double ? 4 : 8;
-    int src = bbc->tt_double && bbc->tt_bottom ? 4 : 0;
-    int fy = (ra * rows_used) / span;
-    uint8_t bits;
-    int fx;
-    if (fy >= rows_used) {
-      fy = rows_used - 1;
-    }
-    bits = kBbcFont8x8[glyph][src + fy];
-    for (pix = 0; pix < ppc; pix++) {
-      PutBeam(bbc, x + pix, y, kRgb[bbc->tt_bg & 7]);
-    }
-    for (fx = 0; fx < 8; fx++) {
-      int x0;
-      int x1;
-      int xx;
-      if ((bits & (1 << fx)) == 0) {
-        continue;
-      }
-      x0 = x + fx * ppc / 8;
-      x1 = x + (fx + 1) * ppc / 8;
-      for (xx = x0; xx < x1; xx++) {
-        PutBeam(bbc, xx, y, kRgb[bbc->tt_fg & 7]);
       }
     }
   }
   if (byte < 0x20) {
     TeletextApply(bbc, byte);
-  } else if (bbc->tt_graphics) {
+  } else if (bbc->tt_graphics && (byte & 0x20) != 0) {
     bbc->tt_held = byte;
     bbc->tt_held_valid = true;
   }
@@ -3312,7 +3391,10 @@ static void VideoEndScanline(BbcMachine* bbc) {
   }
   bbc->vpulse = (bbc->vpulse + 1) & 0x0f;
   if (bbc->line_drawn && bbc->beam_y < BBC_FB_HEIGHT) {
-    bbc->beam_y++;
+    bbc->beam_y += Teletext(bbc) ? 2 : 1;
+    if (bbc->beam_y > BBC_FB_HEIGHT) {
+      bbc->beam_y = BBC_FB_HEIGHT;
+    }
   }
   if (bbc->disp_x > bbc->beam_width) {
     bbc->beam_width = bbc->disp_x;
@@ -3408,11 +3490,13 @@ static void VideoClock(BbcMachine* bbc) {
     if (teletext && (bbc->ula_control & 0x10)) {
       for (pix = 0; pix < width; pix++) {
         PutBeam(bbc, bbc->disp_x + pix, bbc->beam_y, kBlack);
+        PutBeam(bbc, bbc->disp_x + pix, bbc->beam_y + 1, kBlack);
       }
     } else if (teletext) {
       uint8_t byte = VideoByte(bbc, ma, 0) & 0x7f;
       DrawBeamTeletext(bbc, bbc->disp_x, bbc->beam_y, byte, bbc->scanline);
       MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y, width, ma, bbc->scanline);
+      MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y + 1, width, ma, bbc->scanline);
     } else {
       DrawBeamBitmap(bbc, bbc->disp_x, bbc->beam_y, ma, bbc->scanline);
     }
@@ -5079,6 +5163,7 @@ BbcMachine* BbcMachineCreate(void) {
   if (pthread_mutex_init(&bbc->audio_mu, NULL) == 0) {
     bbc->audio_ready = true;
   }
+  bbc->volume = 7;
   bbc->disc_listen_fd = -1;
   bbc->disc_handshake_fd = -1;
   bbc->tape_fd = -1;
@@ -5699,15 +5784,36 @@ void BbcMachineSetKey(BbcMachine* bbc, int column, int row, bool down) {
   UpdateKeyboard(bbc);
 }
 
+void BbcMachineSetVolume(BbcMachine* bbc, int volume) {
+  if (bbc == NULL) {
+    return;
+  }
+  if (volume < 0) {
+    volume = 0;
+  }
+  if (volume > 11) {
+    volume = 11;
+  }
+  bbc->volume = volume;
+}
+
 int BbcMachineReadAudio(BbcMachine* bbc, int16_t* dst, int max_samples) {
   int count = 0;
+  int volume;
   if (bbc == NULL || dst == NULL || max_samples <= 0 || !bbc->audio_ready) {
     return 0;
   }
+  volume = bbc->volume;
   pthread_mutex_lock(&bbc->audio_mu);
   while (count < max_samples && bbc->audio_r != bbc->audio_w) {
-    dst[count++] = bbc->audio_ring[bbc->audio_r];
+    int32_t sample = bbc->audio_ring[bbc->audio_r];
     bbc->audio_r = (bbc->audio_r + 1) % BBC_AUDIO_RING;
+    if (volume <= 0) {
+      sample = 0;
+    } else if (volume < 11) {
+      sample = sample * volume / 11;
+    }
+    dst[count++] = (int16_t)sample;
   }
   pthread_mutex_unlock(&bbc->audio_mu);
   return count;

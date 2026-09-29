@@ -97,7 +97,7 @@ static void TestSheila(BbcMachine* bbc, uint8_t* ram) {
   ram[0x7c00] = 'A';
   BbcMachineRender(bbc);
   EXPECT(BbcFrameWidth(bbc) == 640);
-  EXPECT(BbcFrameHeight(bbc) == 250);
+  EXPECT(BbcFrameHeight(bbc) == 500);
   for (y = 0; y < 10 && !found; y++) {
     for (x = 0; x < 16; x++) {
       BbcPixel(bbc, x, y, rgb);
@@ -110,8 +110,9 @@ static void TestSheila(BbcMachine* bbc, uint8_t* ram) {
   EXPECT(found);
 
   // MODE 7 boots with a flashing underline. R10 mode 0 keeps it on, on the
-  // bottom scanline of the cell at the cursor address.
-  BbcPixel(bbc, 0, 9, rgb);
+  // bottom scanline of the cell at the cursor address. Each character row
+  // is two framebuffer lines, so that underline is the last pair.
+  BbcPixel(bbc, 0, 18, rgb);
   EXPECT(RgbEq(rgb, 0, 0, 0));
   BbcMachineWrite(bbc, 0xfe00, 14);
   BbcMachineWrite(bbc, 0xfe01, 0x7c);
@@ -120,7 +121,7 @@ static void TestSheila(BbcMachine* bbc, uint8_t* ram) {
   BbcMachineWrite(bbc, 0xfe00, 10);
   BbcMachineWrite(bbc, 0xfe01, 0x12);
   BbcMachineRender(bbc);
-  BbcPixel(bbc, 0, 9, rgb);
+  BbcPixel(bbc, 0, 18, rgb);
   EXPECT(RgbEq(rgb, 255, 255, 255));
 
   memset(rom, 0x11, sizeof(rom));
@@ -324,8 +325,8 @@ static void TestTeletextBeam(void) {
   AdvanceUntilFrame(bbc);
   EXPECT(BbcMachineCompletedFrames(bbc) == 1);
   EXPECT(BbcFrameWidth(bbc) == 640);
-  EXPECT(BbcFrameHeight(bbc) > 200);
-  EXPECT(BbcFrameHeight(bbc) < 320);
+  EXPECT(BbcFrameHeight(bbc) > 400);
+  EXPECT(BbcFrameHeight(bbc) < 520);
   for (y = 0; y < 24 && !found; y++) {
     for (x = 0; x < 32; x++) {
       BbcPixel(bbc, x, y, rgb);
@@ -727,7 +728,7 @@ static void TestTeletextControls(void) {
   AdvanceUntilFrame(bbc);
   BbcPixel(bbc, 16, 2, rgb);
   EXPECT(RgbEq(rgb, 255, 255, 255));
-  BbcPixel(bbc, 16, 4, rgb);
+  BbcPixel(bbc, 16, 8, rgb);
   EXPECT(RgbEq(rgb, 0, 0, 0));
 
   ram[0x7c00] = 0x0d;

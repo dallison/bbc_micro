@@ -21,7 +21,13 @@ cmake --build build
 ctest --test-dir build
 ```
 
-`bbc` is the Mac window (Cocoa and AudioToolbox). `6502` is the headless interpreter and is the program davecc uses to run a 65C02 executable. On the command line it is still named `6502`.
+`bbc` is the machine window. On a Mac it uses Cocoa and AudioToolbox. On Linux it uses X11, which a desktop Ubuntu or Debian install already has, and ALSA when those headers were present at build time. Compiling the Linux window needs the X11 headers:
+
+```
+sudo apt install build-essential cmake libx11-dev libasound2-dev
+```
+
+`libasound2-dev` is only for sound. Step-by-step Ubuntu and Debian instructions are in [LINUX.md](LINUX.md). `6502` is the headless interpreter and is the program davecc uses to run a 65C02 executable. On the command line it is still named `6502`.
 
 ## ROMs
 

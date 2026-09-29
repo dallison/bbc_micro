@@ -178,6 +178,8 @@ void BbcMachineSetPrinter(BbcMachine* bbc, const char* path);
 size_t BbcMachinePrinterLength(const BbcMachine* bbc);
 uint8_t BbcMachinePrinterByte(const BbcMachine* bbc, size_t index);
 // Pull synthesized SN76489 samples (48 kHz, mono int16). Returns the count.
+// volume is 0 (silent) through 11 (full). The machine starts at 7.
+void BbcMachineSetVolume(BbcMachine* bbc, int volume);
 int BbcMachineReadAudio(BbcMachine* bbc, int16_t* dst, int max_samples);
 
 void BbcMachineRender(BbcMachine* bbc);
