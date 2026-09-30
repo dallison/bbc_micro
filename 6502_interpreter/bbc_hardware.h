@@ -4,10 +4,13 @@
 //
 //  FRED  (&FC00-&FCFF)  1 MHz bus page. Unwritten locations read as &FF.
 //  JIM   (&FD00-&FDFF)  1 MHz bus window into a 64 KiB RAM, paged by &FCFF.
-//  SHEILA (&FE00-&FEFF) CRTC, 6850 ACIA, serial ULA, video ULA, ROMSEL, the
-//                       two 6522 VIAs, an 8271 or WD1770 floppy controller,
-//                       and the µPD7002 ADC. Econet and the Tube read as an
-//                       empty socket.
+//  SHEILA (&FE00-&FEFF) CRTC, 6850 ACIA (the RS423 serial port), serial ULA,
+//                       video ULA, ROMSEL, the two 6522 VIAs, an 8271 or
+//                       WD1770 floppy controller, and the µPD7002 ADC. The
+//                       Tube reads as an empty socket. Econet is the 68B54
+//                       ADLC at &FEA0-&FEBF and the station links at
+//                       &FE18-&FE1F; both read as an empty socket until
+//                       BbcMachineOpenEconet fits the interface.
 //
 //  The video ULA serialises screen RAM (read through the CRTC address
 //  translation) into a 24-bit framebuffer. MODE 7 uses a teletext cell
@@ -117,6 +120,13 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port);
 // the bound port, or -1 when the socket cannot be opened. One tape is
 // inserted at a time. Closing the connection ejects it.
 int BbcMachineListenTapes(BbcMachine* bbc, int port);
+// Fit the Econet interface as station 1-254 and join the virtual wire on
+// this UDP port. Every emulator using the same port shares one network.
+// The default port is BBC_ECONET_PORT. Returns that port, or -1 when the
+// station number is invalid or the socket cannot be opened. A socket
+// failure still fits the interface, so stations in this process can talk.
+#define BBC_ECONET_PORT 8179
+int BbcMachineOpenEconet(BbcMachine* bbc, int station, int port);
 void BbcMachineSetFdc(BbcMachine* bbc, int kind);
 void BbcMachineResetFdc(BbcMachine* bbc);
 // Latched by a falling edge on the FDC interrupt. The CPU consumes it.

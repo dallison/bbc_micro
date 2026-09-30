@@ -48,4 +48,8 @@ bbc_b_rom_sockets/14-dfs.rom
 
 F1 to F9 are the BBC keys f1 to f9, and F10 is f0. F12 is Break. End is COPY. The arrow keys, Escape, Tab, Return, and Backspace map to the same BBC keys. The numeric keypad maps to the Master keypad. The left mouse button is joystick fire 0, and the right button is fire 1.
 
+## Econet
+
+Econet is a separate network from the RS423 serial port. Two processes on the same machine share a wire. The steps are in [ECONET.md](ECONET.md).
+
 Discs, tapes, and the other flags are in [README.md](README.md).

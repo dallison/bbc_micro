@@ -83,6 +83,10 @@ cassette -ro hello.uef
 
 `-tape-port 0` closes the socket. `-tape` still loads a tape before the machine starts, and a guest `*SAVE` is written back into that file when the cassette motor stops. Inside the emulator, `*TAPE` then `*SAVE` records onto whichever tape is inserted.
 
+## Econet
+
+Econet is the 68B54 at `&FEA0`, not the RS423 serial port. How to run two stations is in [ECONET.md](ECONET.md).
+
 ## davecc
 
 A davecc 65C02 program runs under `6502`. The interpreter looks for the davecc runtime ROM at `DAVECC_6502_ROM`, under `DAVECC_ROOT`, or beside the `6502` binary as `6502rom.exe`. Pass `-rom file` to name it yourself.

@@ -1626,6 +1626,113 @@ static void TestCassette(void) {
   }
 }
 
+static void EconetSend(BbcMachine* bbc, const uint8_t* data, int length) {
+  int sent = 0;
+  int spins = 0;
+  while (sent < length && spins < 1000) {
+    if ((BbcMachineRead(bbc, 0xfea0) & 0x40) != 0) {
+      BbcMachineWrite(bbc, sent + 1 == length ? 0xfea3 : 0xfea2, data[sent]);
+      sent++;
+    } else {
+      BbcMachineAdvance(bbc, 80);
+      spins++;
+    }
+  }
+  EXPECT(sent == length);
+}
+
+static void TestEconet(void) {
+  BbcMachine* a;
+  BbcMachine* b;
+  BbcMachine* master;
+  uint8_t frame[5] = {0x02, 0x00, 0x01, 0x00, 0x81};
+  uint8_t got[5];
+  uint8_t ack[4] = {0x01, 0x00, 0x02, 0x00};
+  int n = 0;
+  int i;
+  bool saw_nmi = false;
+  a = BbcMachineCreate();
+  b = BbcMachineCreate();
+  EXPECT(a != NULL && b != NULL);
+  EXPECT(BbcMachineRead(a, 0xfea0) == 0xfe);
+  EXPECT(BbcMachineOpenEconet(a, 0, 28179) == -1);
+  EXPECT(BbcMachineRead(a, 0xfe18) == 0xfe);
+  EXPECT(BbcMachineOpenEconet(a, 1, 28179) != 0);
+  EXPECT(BbcMachineOpenEconet(b, 2, 28179) != 0);
+  EXPECT(BbcMachineRead(a, 0xfe18) == 1);
+  EXPECT(BbcMachineRead(a, 0xfe1f) == 1);
+  EXPECT(BbcMachineRead(b, 0xfe18) == 2);
+  BbcMachineWrite(a, 0xfe18, 0x5a);
+  EXPECT(BbcMachineRead(a, 0xfe18) == 1);
+  EXPECT(BbcMachineRead(a, 0xfea4) == BbcMachineRead(a, 0xfea0));
+  EXPECT((BbcMachineRead(a, 0xfea0) & 0x40) == 0);
+  BbcMachineWrite(a, 0xfea0, 0x00);
+  BbcMachineWrite(b, 0xfea0, 0x00);
+  EXPECT((BbcMachineRead(a, 0xfea0) & 0x40) != 0);
+
+  BbcMachineWrite(a, 0xfea2, 0x11);
+  BbcMachineAdvance(a, 80);
+  BbcMachineAdvance(a, 80);
+  EXPECT((BbcMachineRead(a, 0xfea0) & 0x20) != 0);
+  BbcMachineWrite(a, 0xfea1, 0x40);
+  EXPECT((BbcMachineRead(a, 0xfea0) & 0x20) == 0);
+
+  BbcMachineWrite(b, 0xfea0, 0x01);
+  BbcMachineWrite(b, 0xfea1, 0x10);
+  BbcMachineWrite(b, 0xfea0, 0x00);
+  BbcMachineAdvance(b, 200);
+  EXPECT((BbcMachineRead(b, 0xfea0) & 0x08) != 0);
+  BbcMachineWrite(b, 0xfea1, 0x20);
+  EXPECT((BbcMachineRead(b, 0xfea0) & 0x08) == 0);
+  BbcMachineWrite(b, 0xfea0, 0x01);
+  BbcMachineWrite(b, 0xfea1, 0x00);
+  BbcMachineWrite(b, 0xfea0, 0x02);
+  BbcMachineWrite(b, 0xfe20, 0x00);
+  EconetSend(a, frame, 5);
+  for (i = 0; i < 40 && n < 5; i++) {
+    BbcMachineAdvance(a, 80);
+    BbcMachineAdvance(b, 80);
+    if (BbcMachineNmiPending(b)) {
+      saw_nmi = true;
+    }
+    while (n < 5 && (BbcMachineRead(b, 0xfea0) & 0x01) != 0) {
+      got[n++] = BbcMachineRead(b, 0xfea2);
+    }
+  }
+  EXPECT(saw_nmi);
+  EXPECT(n == 5);
+  EXPECT(got[0] == 0x02 && got[1] == 0x00 && got[2] == 0x01 && got[3] == 0x00 && got[4] == 0x81);
+  EXPECT((BbcMachineRead(b, 0xfea1) & 0x02) != 0);
+  BbcMachineClearNmi(b);
+  BbcMachineWrite(b, 0xfe18, 0x00);
+  BbcMachineWrite(b, 0xfea1, 0x20);
+  EconetSend(a, ack, 1);
+  for (i = 0; i < 20; i++) {
+    BbcMachineAdvance(a, 80);
+    BbcMachineAdvance(b, 80);
+  }
+  EXPECT(!BbcMachineNmiPending(b));
+  EXPECT((BbcMachineRead(b, 0xfea0) & 0x01) != 0);
+  EXPECT(BbcMachineRead(b, 0xfea2) == 0x01);
+  EXPECT((BbcMachineRead(b, 0xfea1) & 0x10) != 0);
+
+  master = BbcMachineCreate();
+  EXPECT(BbcMachineSetModel(master, BBC_MACHINE_MASTER));
+  EXPECT(BbcMachineOpenEconet(master, 240, 28180) != 0);
+  EXPECT(BbcMachineRead(master, 0xfe18) == 240);
+  BbcMachineWrite(master, 0xfe3c, 0x00);
+  BbcMachineWrite(master, 0xfea0, 0x06);
+  EXPECT(BbcMachineNmiPending(master));
+  BbcMachineClearNmi(master);
+  BbcMachineWrite(master, 0xfe38, 0x00);
+  BbcMachineAdvance(master, 80);
+  EXPECT(!BbcMachineNmiPending(master));
+
+  BbcMachineDestroy(master);
+  BbcMachineDestroy(a);
+  BbcMachineDestroy(b);
+}
+
 int main(void) {
   uint8_t* ram = calloc(65536, 1);
   BbcMachine* bbc = BbcMachineCreate();
@@ -1646,6 +1753,7 @@ int main(void) {
     TestTeletextControls();
     TestRomDirectory();
     TestMaster();
+    TestEconet();
   }
   BbcMachineDestroy(bbc);
   free(ram);

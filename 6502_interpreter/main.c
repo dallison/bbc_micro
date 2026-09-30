@@ -31,6 +31,7 @@ static void Usage() {
           "           [-bbc-fs dfs|adfs]\n"
           "           [-bbc-65c02] [-bbc-tape file] [-bbc-tape-port n]\n"
           "           [-bbc-printer file] [-bbc-2mhz] [-bbc-mhz n]\n"
+          "           [-bbc-econet station] [-bbc-econet-port n]\n"
           "           [-bbc-shift] [-bbc-steps n] [-bbc-ram file] filename\n"
           "       With -bbc, Model B ROMs are read from bbc_b_rom_sockets and\n"
           "       Master ROMs from bbc_master_rom_sockets. os.rom or\n"
@@ -49,6 +50,9 @@ static void Usage() {
           "       cassette inserts a tape. It connects to 127.0.0.1:8178.\n"
           "       -bbc-tape-port 0 closes that socket. -bbc-tape still loads a\n"
           "       tape before the machine starts.\n"
+          "       -bbc-econet n fits the Econet interface as station n (1-254).\n"
+          "       Stations on the same -bbc-econet-port share a wire. The\n"
+          "       default port is 8179.\n"
           "       A busy program runs ahead of the wall clock. -bbc-2mhz holds\n"
           "       the CPU at 2 MHz. -bbc-mhz n holds it at n MHz, from 1 to\n"
           "       16, with the timers and the video still in step.\n");
@@ -218,6 +222,8 @@ int main(int argc, char *argv[]) {
   bool bbc_sram_set = false;
   bool bbc_sram[16];
   const char* bbc_tape = NULL;
+  int bbc_econet = 0;
+  int bbc_econet_port = BBC_ECONET_PORT;
   const char* bbc_printer = NULL;
   bool bbc_shift = false;
   uint64_t bbc_step_limit = 0;
@@ -349,6 +355,30 @@ int main(int argc, char *argv[]) {
         } else {
           tape_port = (int)value;
         }
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-econet") == 0) {
+        char* end = NULL;
+        long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value < 1 || value > 254) {
+          Usage();
+        }
+        bbc_econet = (int)value;
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-econet-port") == 0) {
+        char* end = NULL;
+        long value;
+        if (i == argc - 1) {
+          Usage();
+        }
+        value = strtol(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || value < 1 || value > 65535) {
+          Usage();
+        }
+        bbc_econet_port = (int)value;
         bbc = true;
       } else if (strcmp(argv[i], "-bbc-fs") == 0) {
         if (i == argc - 1) {
@@ -530,6 +560,13 @@ int main(int argc, char *argv[]) {
       if (disc_paths[r] != NULL &&
           !W65C02InterpreterBbcLoadDisc(&interpreter, r, disc_paths[r])) {
         exit(1);
+      }
+    }
+    if (bbc_econet != 0) {
+      int bound = BbcMachineOpenEconet(interpreter.bbc, bbc_econet, bbc_econet_port);
+      fprintf(stderr, "Econet station %d\n", bbc_econet);
+      if (bound < 0) {
+        fprintf(stderr, "Econet socket is not available\n");
       }
     }
     if (disc_socket) {

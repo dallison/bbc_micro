@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -181,7 +182,6 @@ struct BbcMachine {
     uint8_t sector_reg;
     bool intrq;
     bool nmi_line;
-    bool nmi_edge;
     bool writing;
     uint8_t buffer[1024];
     uint8_t track_image[8192];
@@ -293,6 +293,53 @@ struct BbcMachine {
   struct TapePending* tape_pending;
   int tape_attention;
   int tape_watch_acc;
+  // Combined disc and Econet NMI. The 6502 latches one edge.
+  bool nmi_line;
+  bool nmi_edge;
+  struct {
+    bool fitted;
+    int station;
+    int port;
+    int fd;
+    uint32_t instance;
+    bool nmi_enable;
+    bool irq;
+    uint8_t cr1;
+    uint8_t cr2;
+    uint8_t cr3;
+    uint8_t cr4;
+    uint8_t last_sr1;
+    uint8_t last_sr2;
+    bool fd_latched;
+    bool ap;
+    bool fv_latched;
+    bool err_latched;
+    bool ovrn;
+    bool rx_abt;
+    bool rx_idle;
+    bool txu;
+    bool fc_latched;
+    bool rx_short;
+    uint8_t tx_fifo[3];
+    uint8_t tx_last[3];
+    int tx_count;
+    uint8_t tx_frame[2048];
+    int tx_len;
+    bool tx_in_frame;
+    uint8_t rx_fifo[3];
+    uint8_t rx_last[3];
+    uint8_t rx_first[3];
+    int rx_count;
+    uint8_t rx_frame[2048];
+    int rx_len;
+    int rx_pos;
+    bool rx_active;
+    uint8_t inbox[4][2048];
+    int inbox_len[4];
+    int inbox_n;
+    int bit_acc;
+    int poll_acc;
+  } econet;
 };
 
 struct TapePending {
@@ -1850,11 +1897,17 @@ static bool Fdc1770(const BbcMachine* bbc) {
   return bbc->fdc.kind == BBC_FDC_1770;
 }
 
-static void FdcSetLine(BbcMachine* bbc, bool on) {
-  if (on && !bbc->fdc.nmi_line) {
-    bbc->fdc.nmi_edge = true;
+static void UpdateNmiLine(BbcMachine* bbc) {
+  bool on = bbc->fdc.nmi_line || (bbc->econet.fitted && bbc->econet.nmi_enable && bbc->econet.irq);
+  if (on && !bbc->nmi_line) {
+    bbc->nmi_edge = true;
   }
+  bbc->nmi_line = on;
+}
+
+static void FdcSetLine(BbcMachine* bbc, bool on) {
   bbc->fdc.nmi_line = on;
+  UpdateNmiLine(bbc);
 }
 
 static void FdcUpdateNmi(BbcMachine* bbc) {
@@ -2237,8 +2290,9 @@ static void FdcResetChip(BbcMachine* bbc) {
     bbc->fdc.track[0] = 0;
     bbc->fdc.track[1] = 0;
   }
-  bbc->fdc.nmi_edge = false;
+  bbc->nmi_edge = false;
   bbc->fdc.nmi_line = false;
+  UpdateNmiLine(bbc);
   FdcUpdateNmi(bbc);
 }
 
@@ -2951,6 +3005,620 @@ static void TapeFlush(BbcMachine* bbc);
 static void TapeClose(BbcMachine* bbc);
 static void TapeStop(BbcMachine* bbc);
 
+// The 68B54 ADLC. Econet is this chip, not the RS423 6850 at &FE08.
+// A byte on a 200 kHz network clock is 80 CPU cycles at 2 MHz.
+#define ECONET_MAX_FRAME 2048
+#define ECONET_GROUP "239.255.19.82"
+#define CR1_AC 0x01
+#define CR1_RIE 0x02
+#define CR1_TIE 0x04
+#define CR1_RDSR 0x08
+#define CR1_TDSR 0x10
+#define CR1_RDIS 0x20
+#define CR1_RXRS 0x40
+#define CR1_TXRS 0x80
+#define CR2_TWO 0x02
+#define CR2_FC 0x08
+#define CR2_TXLAST 0x10
+#define CR2_CLRRX 0x20
+#define CR2_CLRTX 0x40
+#define CR3_FDSE 0x10
+#define CR4_ABT 0x20
+
+static pthread_mutex_t g_econet_mu = PTHREAD_MUTEX_INITIALIZER;
+static BbcMachine* g_econet_peers[16];
+static int g_econet_peers_n = 0;
+static uint32_t g_econet_next_instance = 1;
+
+static void EconetRefreshIrq(BbcMachine* bbc);
+
+static bool EconetTdra(const BbcMachine* bbc) {
+  int room = (bbc->econet.cr2 & CR2_TWO) != 0 ? 2 : 3;
+  return (bbc->econet.cr1 & CR1_TXRS) == 0 && bbc->econet.tx_count < room;
+}
+
+static bool EconetRda(const BbcMachine* bbc) {
+  if ((bbc->econet.cr1 & CR1_RXRS) != 0) {
+    return false;
+  }
+  if ((bbc->econet.cr2 & CR2_TWO) != 0) {
+    return bbc->econet.rx_count >= 2;
+  }
+  return bbc->econet.rx_count > 0;
+}
+
+static bool EconetFrameEnd(const BbcMachine* bbc) {
+  return bbc->econet.rx_count > 0 && bbc->econet.rx_last[0] != 0;
+}
+
+static uint8_t EconetSr2(BbcMachine* bbc) {
+  bool fv = bbc->econet.fv_latched || (EconetFrameEnd(bbc) && !bbc->econet.rx_short);
+  bool err = bbc->econet.err_latched || (EconetFrameEnd(bbc) && bbc->econet.rx_short);
+  bool ap = bbc->econet.ap;
+  bool idle = bbc->econet.rx_idle;
+  bool abt = bbc->econet.rx_abt;
+  bool ovrn = bbc->econet.ovrn;
+  bool rda = EconetRda(bbc);
+  bool pse = (bbc->econet.cr2 & 0x01) != 0;
+  uint8_t sr2 = 0;
+  if (pse && (err || fv || abt || ovrn)) {
+    ap = false;
+    idle = false;
+    rda = false;
+  } else if (pse && idle) {
+    ap = false;
+    rda = false;
+  } else if (pse && ap) {
+    rda = false;
+  }
+  if (ap) {
+    sr2 |= 0x01;
+  }
+  if (fv) {
+    sr2 |= 0x02;
+  }
+  if (idle) {
+    sr2 |= 0x04;
+  }
+  if (abt) {
+    sr2 |= 0x08;
+  }
+  if (err) {
+    sr2 |= 0x10;
+  }
+  if (ovrn) {
+    sr2 |= 0x40;
+  }
+  if (rda) {
+    sr2 |= 0x80;
+  }
+  return sr2;
+}
+
+static uint8_t EconetSr1(BbcMachine* bbc) {
+  bool tdra = EconetTdra(bbc);
+  bool fc = bbc->econet.fc_latched;
+  bool tx_bit = (bbc->econet.cr2 & CR2_FC) != 0 ? fc : tdra;
+  bool fd = bbc->econet.fd_latched && (bbc->econet.cr3 & CR3_FDSE) != 0;
+  bool s2 = (EconetSr2(bbc) & (uint8_t)~0x80) != 0;
+  bool rda = EconetRda(bbc);
+  bool pse = (bbc->econet.cr2 & 0x01) != 0;
+  bool txu = bbc->econet.txu;
+  bool rda_service = rda && (bbc->econet.cr1 & CR1_RDSR) == 0;
+  bool tx_service = tx_bit && (bbc->econet.cr1 & CR1_TDSR) == 0;
+  uint8_t sr1 = 0;
+  if (txu) {
+    sr1 |= 0x20;
+  }
+  if (tx_bit) {
+    sr1 |= 0x40;
+  }
+  if (pse && fd) {
+    sr1 |= 0x08;
+  } else if (pse && s2) {
+    sr1 |= 0x02;
+  } else if (pse && rda) {
+    sr1 |= 0x01;
+  } else if (!pse) {
+    if (fd) {
+      sr1 |= 0x08;
+    }
+    if (s2) {
+      sr1 |= 0x02;
+    }
+    if (rda) {
+      sr1 |= 0x01;
+    }
+  }
+  if ((bbc->econet.cr1 & CR1_RDSR) != 0) {
+    sr1 = (uint8_t)(sr1 & (uint8_t)~0x01);
+  }
+  if (((bbc->econet.cr1 & CR1_RIE) != 0 && (rda_service || fd || s2 || bbc->econet.ap)) ||
+      ((bbc->econet.cr1 & CR1_TIE) != 0 && (tx_service || txu))) {
+    sr1 |= 0x80;
+  }
+  return sr1;
+}
+
+static bool EconetIrqActive(BbcMachine* bbc) {
+  return (EconetSr1(bbc) & 0x80) != 0;
+}
+
+static void EconetRefreshIrq(BbcMachine* bbc) {
+  if (!bbc->econet.fitted) {
+    bbc->econet.irq = false;
+    UpdateNmiLine(bbc);
+    return;
+  }
+  bbc->econet.irq = EconetIrqActive(bbc);
+  UpdateNmiLine(bbc);
+}
+
+static void EconetResetRx(BbcMachine* bbc) {
+  bbc->econet.rx_count = 0;
+  bbc->econet.rx_active = false;
+  bbc->econet.rx_pos = 0;
+  bbc->econet.rx_len = 0;
+  bbc->econet.ap = false;
+  bbc->econet.fv_latched = false;
+  bbc->econet.err_latched = false;
+  bbc->econet.ovrn = false;
+  bbc->econet.rx_abt = false;
+  bbc->econet.rx_idle = false;
+  bbc->econet.fd_latched = false;
+  bbc->econet.rx_short = false;
+}
+
+static void EconetResetTx(BbcMachine* bbc) {
+  bbc->econet.tx_count = 0;
+  bbc->econet.tx_len = 0;
+  bbc->econet.tx_in_frame = false;
+  bbc->econet.txu = false;
+  bbc->econet.fc_latched = false;
+}
+
+static bool EconetLocalInstance(uint32_t instance) {
+  int i;
+  for (i = 0; i < g_econet_peers_n; i++) {
+    if (g_econet_peers[i]->econet.instance == instance) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void EconetInbox(BbcMachine* bbc, const uint8_t* data, int len) {
+  if (len <= 0 || len > ECONET_MAX_FRAME) {
+    return;
+  }
+  if (bbc->econet.tx_in_frame) {
+    bbc->econet.txu = true;
+    bbc->econet.rx_abt = true;
+    bbc->econet.tx_in_frame = false;
+    bbc->econet.tx_len = 0;
+    bbc->econet.tx_count = 0;
+    return;
+  }
+  if (bbc->econet.inbox_n >= 4) {
+    return;
+  }
+  memcpy(bbc->econet.inbox[bbc->econet.inbox_n], data, (size_t)len);
+  bbc->econet.inbox_len[bbc->econet.inbox_n] = len;
+  bbc->econet.inbox_n++;
+}
+
+static void EconetPublish(BbcMachine* bbc, const uint8_t* data, int len) {
+  uint8_t packet[14 + ECONET_MAX_FRAME];
+  struct sockaddr_in dest;
+  int i;
+  if (len <= 0 || len > ECONET_MAX_FRAME) {
+    return;
+  }
+  pthread_mutex_lock(&g_econet_mu);
+  for (i = 0; i < g_econet_peers_n; i++) {
+    BbcMachine* peer = g_econet_peers[i];
+    if (peer != bbc && peer->econet.port == bbc->econet.port) {
+      EconetInbox(peer, data, len);
+    }
+  }
+  pthread_mutex_unlock(&g_econet_mu);
+  if (bbc->econet.fd < 0) {
+    return;
+  }
+  memcpy(packet, "ECONET01", 8);
+  packet[8] = (uint8_t)(bbc->econet.instance >> 24);
+  packet[9] = (uint8_t)(bbc->econet.instance >> 16);
+  packet[10] = (uint8_t)(bbc->econet.instance >> 8);
+  packet[11] = (uint8_t)bbc->econet.instance;
+  packet[12] = (uint8_t)(len >> 8);
+  packet[13] = (uint8_t)len;
+  memcpy(packet + 14, data, (size_t)len);
+  memset(&dest, 0, sizeof(dest));
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons((uint16_t)bbc->econet.port);
+  inet_pton(AF_INET, ECONET_GROUP, &dest.sin_addr);
+  sendto(bbc->econet.fd, packet, (size_t)(14 + len), 0, (struct sockaddr*)&dest, sizeof(dest));
+}
+
+static void EconetPoll(BbcMachine* bbc) {
+  if (bbc->econet.fd < 0) {
+    return;
+  }
+  for (;;) {
+    uint8_t buf[14 + ECONET_MAX_FRAME];
+    ssize_t n = recvfrom(bbc->econet.fd, buf, sizeof(buf), 0, NULL, NULL);
+    uint32_t instance;
+    int len;
+    if (n < 0) {
+      return;
+    }
+    if (n < 14 || memcmp(buf, "ECONET01", 8) != 0) {
+      continue;
+    }
+    instance = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 8) |
+               (uint32_t)buf[11];
+    len = ((int)buf[12] << 8) | buf[13];
+    if (len <= 0 || len > ECONET_MAX_FRAME || 14 + len > (int)n) {
+      continue;
+    }
+    pthread_mutex_lock(&g_econet_mu);
+    if (instance != bbc->econet.instance && !EconetLocalInstance(instance)) {
+      EconetInbox(bbc, buf + 14, len);
+    }
+    pthread_mutex_unlock(&g_econet_mu);
+  }
+}
+
+static void EconetTxTick(BbcMachine* bbc) {
+  uint8_t byte;
+  bool last;
+  int i;
+  if ((bbc->econet.cr1 & CR1_TXRS) != 0) {
+    return;
+  }
+  if (!bbc->econet.tx_in_frame) {
+    if (bbc->econet.tx_count == 0) {
+      return;
+    }
+    bbc->econet.tx_in_frame = true;
+    bbc->econet.tx_len = 0;
+  }
+  if (bbc->econet.tx_count == 0) {
+    bbc->econet.txu = true;
+    bbc->econet.tx_in_frame = false;
+    bbc->econet.tx_len = 0;
+    return;
+  }
+  byte = bbc->econet.tx_fifo[0];
+  last = bbc->econet.tx_last[0] != 0;
+  for (i = 1; i < bbc->econet.tx_count; i++) {
+    bbc->econet.tx_fifo[i - 1] = bbc->econet.tx_fifo[i];
+    bbc->econet.tx_last[i - 1] = bbc->econet.tx_last[i];
+  }
+  bbc->econet.tx_count--;
+  if (bbc->econet.tx_len < ECONET_MAX_FRAME) {
+    bbc->econet.tx_frame[bbc->econet.tx_len++] = byte;
+  }
+  if (last || bbc->econet.tx_len == ECONET_MAX_FRAME) {
+    EconetPublish(bbc, bbc->econet.tx_frame, bbc->econet.tx_len);
+    bbc->econet.fc_latched = true;
+    bbc->econet.tx_in_frame = false;
+    bbc->econet.tx_len = 0;
+  }
+}
+
+static bool EconetTakeInbox(BbcMachine* bbc) {
+  int i;
+  int len;
+  bool took = false;
+  pthread_mutex_lock(&g_econet_mu);
+  if (bbc->econet.inbox_n > 0) {
+    len = bbc->econet.inbox_len[0];
+    memcpy(bbc->econet.rx_frame, bbc->econet.inbox[0], (size_t)len);
+    bbc->econet.rx_len = len;
+    bbc->econet.rx_short = len < 4;
+    for (i = 1; i < bbc->econet.inbox_n; i++) {
+      memcpy(bbc->econet.inbox[i - 1], bbc->econet.inbox[i], (size_t)bbc->econet.inbox_len[i]);
+      bbc->econet.inbox_len[i - 1] = bbc->econet.inbox_len[i];
+    }
+    bbc->econet.inbox_n--;
+    took = true;
+  }
+  pthread_mutex_unlock(&g_econet_mu);
+  return took;
+}
+
+static void EconetRxTick(BbcMachine* bbc) {
+  int pos;
+  if ((bbc->econet.cr1 & CR1_RXRS) != 0) {
+    return;
+  }
+  if ((bbc->econet.cr1 & CR1_RDIS) != 0) {
+    bbc->econet.rx_count = 0;
+    bbc->econet.rx_active = false;
+    bbc->econet.rx_pos = 0;
+    bbc->econet.cr1 = (uint8_t)(bbc->econet.cr1 & (uint8_t)~CR1_RDIS);
+    return;
+  }
+  if (bbc->econet.fv_latched || bbc->econet.err_latched) {
+    return;
+  }
+  if (bbc->econet.rx_count >= 3) {
+    if (bbc->econet.rx_active && bbc->econet.rx_pos < bbc->econet.rx_len) {
+      bbc->econet.ovrn = true;
+    }
+    return;
+  }
+  if (!bbc->econet.rx_active) {
+    if (!EconetTakeInbox(bbc)) {
+      return;
+    }
+    bbc->econet.rx_active = true;
+    bbc->econet.rx_pos = 0;
+  }
+  pos = bbc->econet.rx_count;
+  bbc->econet.rx_fifo[pos] = bbc->econet.rx_frame[bbc->econet.rx_pos];
+  bbc->econet.rx_first[pos] = bbc->econet.rx_pos == 0 ? 1 : 0;
+  bbc->econet.rx_last[pos] =
+      bbc->econet.rx_pos + 1 == bbc->econet.rx_len ? 1 : 0;
+  bbc->econet.rx_count++;
+  bbc->econet.rx_pos++;
+  if (bbc->econet.rx_pos >= bbc->econet.rx_len) {
+    bbc->econet.rx_active = false;
+  }
+  if (bbc->econet.rx_first[pos] != 0 && pos == 0) {
+    bbc->econet.ap = true;
+  } else if (bbc->econet.rx_first[0] != 0) {
+    bbc->econet.ap = true;
+  }
+}
+
+static void EconetAdvance(BbcMachine* bbc, int cycles) {
+  if (!bbc->econet.fitted || cycles <= 0) {
+    return;
+  }
+  bbc->econet.poll_acc += cycles;
+  if (bbc->econet.poll_acc >= 400) {
+    bbc->econet.poll_acc = 0;
+    EconetPoll(bbc);
+  }
+  bbc->econet.bit_acc += cycles;
+  while (bbc->econet.bit_acc >= 80) {
+    bbc->econet.bit_acc -= 80;
+    if ((bbc->econet.cr1 & CR1_RXRS) == 0 && (bbc->econet.cr3 & CR3_FDSE) != 0) {
+      bbc->econet.fd_latched = true;
+    }
+    EconetTxTick(bbc);
+    EconetRxTick(bbc);
+  }
+  EconetRefreshIrq(bbc);
+}
+
+static void EconetWriteCr1(BbcMachine* bbc, uint8_t value) {
+  bbc->econet.cr1 = value;
+  if ((value & CR1_RXRS) != 0) {
+    EconetResetRx(bbc);
+  }
+  if ((value & CR1_TXRS) != 0) {
+    EconetResetTx(bbc);
+  }
+  EconetRefreshIrq(bbc);
+}
+
+static void EconetWriteCr2(BbcMachine* bbc, uint8_t value) {
+  if ((value & CR2_CLRRX) != 0) {
+    if ((bbc->econet.last_sr1 & 0x08) != 0) {
+      bbc->econet.fd_latched = false;
+    }
+    if ((bbc->econet.last_sr2 & 0x02) != 0) {
+      bbc->econet.fv_latched = false;
+    }
+    if ((bbc->econet.last_sr2 & 0x04) != 0) {
+      bbc->econet.rx_idle = false;
+    }
+    if ((bbc->econet.last_sr2 & 0x08) != 0) {
+      bbc->econet.rx_abt = false;
+    }
+    if ((bbc->econet.last_sr2 & 0x10) != 0) {
+      bbc->econet.err_latched = false;
+    }
+    if ((bbc->econet.last_sr2 & 0x40) != 0) {
+      bbc->econet.ovrn = false;
+    }
+  }
+  if ((value & CR2_CLRTX) != 0 && (bbc->econet.last_sr1 & 0x20) != 0) {
+    bbc->econet.txu = false;
+  }
+  if ((value & CR2_TXLAST) != 0 && bbc->econet.tx_count > 0) {
+    bbc->econet.tx_last[bbc->econet.tx_count - 1] = 1;
+  }
+  if ((value & CR2_FC) == 0) {
+    bbc->econet.fc_latched = false;
+  }
+  bbc->econet.cr2 = (uint8_t)(value & (uint8_t)~(CR2_TXLAST | CR2_CLRRX | CR2_CLRTX));
+  EconetRefreshIrq(bbc);
+}
+
+static void EconetPushTx(BbcMachine* bbc, uint8_t value, bool last) {
+  if ((bbc->econet.cr1 & CR1_TXRS) != 0 || bbc->econet.tx_count >= 3) {
+    return;
+  }
+  bbc->econet.tx_fifo[bbc->econet.tx_count] = value;
+  bbc->econet.tx_last[bbc->econet.tx_count] = last ? 1 : 0;
+  bbc->econet.tx_count++;
+  EconetRefreshIrq(bbc);
+}
+
+static void EconetWrite(BbcMachine* bbc, int rs, uint8_t value) {
+  if (!bbc->econet.fitted) {
+    return;
+  }
+  if (rs == 0) {
+    EconetWriteCr1(bbc, value);
+    return;
+  }
+  if (rs == 1) {
+    if ((bbc->econet.cr1 & CR1_AC) != 0) {
+      bbc->econet.cr3 = value;
+      EconetRefreshIrq(bbc);
+    } else {
+      EconetWriteCr2(bbc, value);
+    }
+    return;
+  }
+  if (rs == 2 || (bbc->econet.cr1 & CR1_AC) == 0) {
+    EconetPushTx(bbc, value, rs == 3);
+    return;
+  }
+  bbc->econet.cr4 = (uint8_t)(value & (uint8_t)~CR4_ABT);
+  if ((value & CR4_ABT) != 0) {
+    bbc->econet.tx_count = 0;
+    bbc->econet.tx_in_frame = false;
+    bbc->econet.tx_len = 0;
+    EconetRefreshIrq(bbc);
+  }
+}
+
+static uint8_t EconetReadData(BbcMachine* bbc) {
+  uint8_t byte = 0;
+  bool last;
+  int i;
+  if (bbc->econet.rx_count <= 0) {
+    return 0;
+  }
+  byte = bbc->econet.rx_fifo[0];
+  last = bbc->econet.rx_last[0] != 0;
+  if (bbc->econet.rx_first[0] != 0) {
+    bbc->econet.ap = false;
+  }
+  for (i = 1; i < bbc->econet.rx_count; i++) {
+    bbc->econet.rx_fifo[i - 1] = bbc->econet.rx_fifo[i];
+    bbc->econet.rx_last[i - 1] = bbc->econet.rx_last[i];
+    bbc->econet.rx_first[i - 1] = bbc->econet.rx_first[i];
+  }
+  bbc->econet.rx_count--;
+  if (bbc->econet.rx_count > 0 && bbc->econet.rx_first[0] != 0) {
+    bbc->econet.ap = true;
+  }
+  if (last) {
+    if (bbc->econet.rx_short) {
+      bbc->econet.err_latched = true;
+    } else {
+      bbc->econet.fv_latched = true;
+    }
+  }
+  EconetRefreshIrq(bbc);
+  return byte;
+}
+
+static uint8_t EconetRead(BbcMachine* bbc, int rs) {
+  uint8_t value;
+  if (!bbc->econet.fitted) {
+    return 0xfe;
+  }
+  if (rs == 0) {
+    value = EconetSr1(bbc);
+    bbc->econet.last_sr1 = value;
+    return value;
+  }
+  if (rs == 1) {
+    value = EconetSr2(bbc);
+    bbc->econet.last_sr2 = value;
+    return value;
+  }
+  return EconetReadData(bbc);
+}
+
+static void EconetLeave(BbcMachine* bbc) {
+  int i;
+  pthread_mutex_lock(&g_econet_mu);
+  for (i = 0; i < g_econet_peers_n; i++) {
+    if (g_econet_peers[i] == bbc) {
+      g_econet_peers[i] = g_econet_peers[g_econet_peers_n - 1];
+      g_econet_peers_n--;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_econet_mu);
+}
+
+static void EconetClose(BbcMachine* bbc) {
+  if (!bbc->econet.fitted && bbc->econet.fd < 0) {
+    return;
+  }
+  EconetLeave(bbc);
+  if (bbc->econet.fd >= 0) {
+    close(bbc->econet.fd);
+    bbc->econet.fd = -1;
+  }
+  bbc->econet.fitted = false;
+}
+
+static int EconetBind(BbcMachine* bbc, int port) {
+  int fd;
+  int on = 1;
+  int flags;
+  unsigned char loop = 0;
+  struct sockaddr_in addr;
+  struct ip_mreq mreq;
+  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+#ifdef SO_REUSEPORT
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#endif
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)port);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+  memset(&mreq, 0, sizeof(mreq));
+  inet_pton(AF_INET, ECONET_GROUP, &mreq.imr_multiaddr);
+  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) != 0) {
+    close(fd);
+    return -1;
+  }
+  setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+  flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+  bbc->econet.fd = fd;
+  return 0;
+}
+
+int BbcMachineOpenEconet(BbcMachine* bbc, int station, int port) {
+  if (bbc == NULL || station < 1 || station > 254 || port < 1 || port > 65535) {
+    return -1;
+  }
+  EconetClose(bbc);
+  memset(&bbc->econet, 0, sizeof(bbc->econet));
+  bbc->econet.fd = -1;
+  bbc->econet.fitted = true;
+  bbc->econet.station = station;
+  bbc->econet.port = port;
+  bbc->econet.cr1 = (uint8_t)(CR1_RXRS | CR1_TXRS);
+  if (bbc->master) {
+    bbc->cmos[14] = (uint8_t)station;
+  }
+  pthread_mutex_lock(&g_econet_mu);
+  bbc->econet.instance = g_econet_next_instance++;
+  if (g_econet_peers_n < 16) {
+    g_econet_peers[g_econet_peers_n++] = bbc;
+  }
+  pthread_mutex_unlock(&g_econet_mu);
+  if (EconetBind(bbc, port) != 0) {
+    return -1;
+  }
+  return port;
+}
+
 static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
   if (page < 0x08) {
     if ((page & 1) == 0) {
@@ -2978,10 +3646,19 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
     return;
   }
   if (page < 0x20) {
-    // &FE18-&FE1F is the Econet ADLC. Nothing is fitted.
+    // A write to &FE18-&FE1F disables Econet NMIs. The station links are read-only.
+    if (bbc->econet.fitted) {
+      bbc->econet.nmi_enable = false;
+      UpdateNmiLine(bbc);
+    }
     return;
   }
   if (page < 0x30) {
+    // On the Model B a write to &FE20 enables Econet NMIs as well as the video ULA.
+    if (page == 0x20 && bbc->econet.fitted && !bbc->master) {
+      bbc->econet.nmi_enable = true;
+      UpdateNmiLine(bbc);
+    }
     // The Master's WD1770 sits at &FE24-&FE2B. &FE20-&FE23 stay the video ULA.
     if (bbc->master && page >= 0x24) {
       int reg = MasterFdcReg(page);
@@ -3005,6 +3682,12 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
       WriteAcccon(bbc, value);
       return;
     }
+    // The Master gates Econet NMIs at &FE38 (disable) and &FE3C (enable).
+    if (bbc->master && bbc->econet.fitted && (page == 0x38 || page == 0x3c)) {
+      bbc->econet.nmi_enable = page == 0x3c;
+      UpdateNmiLine(bbc);
+      return;
+    }
     bbc->romsel = value;
     MapRomsel(bbc);
     return;
@@ -3025,6 +3708,7 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
     return;
   }
   if (page < 0xc0) {
+    EconetWrite(bbc, page & 3, value);
     return;
   }
   if (page < 0xe0) {
@@ -3060,6 +3744,9 @@ static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
     return bbc->serial_ula;
   }
   if (page < 0x20) {
+    if (bbc->econet.fitted) {
+      return (uint8_t)bbc->econet.station;
+    }
     return 0xfe;
   }
   if (page < 0x30) {
@@ -3091,7 +3778,7 @@ static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
     return FdcRead(bbc, page);
   }
   if (page < 0xc0) {
-    return 0xfe;
+    return EconetRead(bbc, page & 3);
   }
   if (page < 0xe0) {
     return AdcRead(bbc, page & 3);
@@ -3662,6 +4349,7 @@ void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles) {
   AcaiAdvance(bbc, cpu_cycles);
   AdcAdvance(bbc, cpu_cycles);
   FdcAdvance(bbc, cpu_cycles);
+  EconetAdvance(bbc, cpu_cycles);
   if (!bbc->fast_clock) {
     bbc->audio_acc += (int64_t)cpu_cycles * BBC_AUDIO_RATE;
     while (bbc->audio_acc >= BBC_CPU_HZ) {
@@ -4403,12 +5091,12 @@ void BbcMachineResetFdc(BbcMachine* bbc) {
 }
 
 bool BbcMachineNmiPending(const BbcMachine* bbc) {
-  return bbc != NULL && bbc->fdc.nmi_edge;
+  return bbc != NULL && bbc->nmi_edge;
 }
 
 void BbcMachineClearNmi(BbcMachine* bbc) {
   if (bbc != NULL) {
-    bbc->fdc.nmi_edge = false;
+    bbc->nmi_edge = false;
   }
 }
 
@@ -5166,6 +5854,7 @@ BbcMachine* BbcMachineCreate(void) {
   bbc->volume = 7;
   bbc->disc_listen_fd = -1;
   bbc->disc_handshake_fd = -1;
+  bbc->econet.fd = -1;
   bbc->tape_fd = -1;
   bbc->tape_listen_fd = -1;
   bbc->tape_handshake_fd = -1;
@@ -5187,6 +5876,7 @@ void BbcMachineDestroy(BbcMachine* bbc) {
   TapeFlush(bbc);
   TapeClose(bbc);
   TapeStop(bbc);
+  EconetClose(bbc);
   DiscStop(bbc);
   for (i = 0; i < 2; i++) {
     DiscRelease(&bbc->fdc.disc[i]);

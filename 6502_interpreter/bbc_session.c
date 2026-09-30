@@ -23,6 +23,7 @@ static void Usage(void) {
           "           [-fdc 8271|1770] [-fs dfs|adfs] [-65c02]\n"
           "           [-tape file] [-tape-port n]\n"
           "           [-printer file] [-mhz n] [-turbo] [-volume n]\n"
+          "           [-econet station] [-econet-port n]\n"
           "       The default machine is the Model B. Its ROMs come from\n"
           "       bbc_b_rom_sockets. master and master128 use\n"
           "       bbc_master_rom_sockets, a 65SC12, a WD1770, and sideways RAM\n"
@@ -50,7 +51,11 @@ static void Usage(void) {
           "       -mhz n selects another fixed rate, from 1 to 16. -2mhz is\n"
           "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
           "       of the wall clock. -volume n is 0 for silence through 11\n"
-          "       for full volume. The default is 7.\n");
+          "       for full volume. The default is 7.\n"
+          "       -econet n fits the Econet interface as station n (1-254).\n"
+          "       That is the 68B54 at &FEA0, not the RS423 serial port.\n"
+          "       Stations that use the same -econet-port share a wire. The\n"
+          "       default port is 8179. The network clock is present.\n");
 }
 
 static void ReleaseRoms(void) {
@@ -88,6 +93,8 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   const char* tape_path = NULL;
   const char* printer_path = NULL;
   int volume = 7;
+  int econet_station = 0;
+  int econet_port = BBC_ECONET_PORT;
   const char* roms_arg = NULL;
   int machine = BBC_MACHINE_B;
   bool sram_set = false;
@@ -293,6 +300,36 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         return false;
       }
       volume = (int)value;
+    } else if (strcmp(argv[i], "-econet") == 0) {
+      char* end = NULL;
+      long value;
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      value = strtol(argv[++i], &end, 10);
+      if (end == argv[i] || *end != '\0' || value < 1 || value > 254) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      econet_station = (int)value;
+    } else if (strcmp(argv[i], "-econet-port") == 0) {
+      char* end = NULL;
+      long value;
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      value = strtol(argv[++i], &end, 10);
+      if (end == argv[i] || *end != '\0' || value < 1 || value > 65535) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      econet_port = (int)value;
     } else if (strcmp(argv[i], "-turbo") == 0) {
       run_ahead = true;
     } else if (strcmp(argv[i], "-mhz") == 0) {
@@ -413,6 +450,13 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     BbcMachineSetPrinter(g_cpu.bbc, printer_path);
   }
   BbcMachineSetVolume(g_cpu.bbc, volume);
+  if (econet_station != 0) {
+    int bound = BbcMachineOpenEconet(g_cpu.bbc, econet_station, econet_port);
+    fprintf(stderr, "Econet station %d\n", econet_station);
+    if (bound < 0) {
+      fprintf(stderr, "Econet socket is not available\n");
+    }
+  }
   if (!W65C02InterpreterPrepareBbc(&g_cpu)) {
     fprintf(stderr, "Unable to start the BBC Micro\n");
     goto fail;
