@@ -105,6 +105,62 @@ static void ReleaseHostKey(unsigned short key_code) {
   SyncShift();
 }
 
+// The Mac Caps Lock light toggles, and that flag changes only on the press.
+// A second flagsChanged arrives for the release with the flag left as it is.
+// Zalaga reads the key itself, so it has to be down only while held.
+static bool g_caps_flag = false;
+static bool g_caps_flag_ready = false;
+
+static void RememberCapsFlag(void) {
+  if (g_caps_flag_ready) {
+    return;
+  }
+  g_caps_flag = ([NSEvent modifierFlags] & NSEventModifierFlagCapsLock) != 0;
+  g_caps_flag_ready = true;
+}
+
+static void ApplyMomentaryModifiers(NSEventModifierFlags flags) {
+  if (!g_ready || g_cpu.bbc == NULL) {
+    return;
+  }
+  g_host_shift = (flags & NSEventModifierFlagShift) != 0;
+  BbcMachineSetKey(g_cpu.bbc, 1, 0, (flags & NSEventModifierFlagControl) != 0);
+  SyncShift();
+}
+
+static void CapsLockEvent(NSEvent* event) {
+  bool flag;
+  if (!g_ready || g_cpu.bbc == NULL) {
+    return;
+  }
+  RememberCapsFlag();
+  flag = (event.modifierFlags & NSEventModifierFlagCapsLock) != 0;
+  if (flag != g_caps_flag) {
+    g_caps_flag = flag;
+    BbcMachineSetKey(g_cpu.bbc, 0, 4, true);
+  } else {
+    BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
+  }
+}
+
+static void ReleaseStuckKeys(void) {
+  int i;
+  if (!g_ready || g_cpu.bbc == NULL) {
+    return;
+  }
+  for (i = 0; i < 16; i++) {
+    if (!g_held[i].used) {
+      continue;
+    }
+    BbcMachineSetKey(g_cpu.bbc, g_held[i].column, g_held[i].row, false);
+    g_held[i].used = false;
+  }
+  g_host_shift = false;
+  BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
+  BbcMachineSetKey(g_cpu.bbc, 1, 0, false);
+  SyncShift();
+}
+
 // Character the BBC prints for that matrix key. Shifted symbols are the MOS
 // bit-paired values (!"#$%&'() and so on), not the legends of a UK PC keyboard.
 static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
@@ -288,11 +344,10 @@ static void PressHostKey(NSEvent* event) {
   if (!g_ready) {
     return;
   }
-  NSEventModifierFlags flags = event.modifierFlags;
-  g_host_shift = (flags & NSEventModifierFlagShift) != 0;
-  BbcMachineSetKey(g_cpu.bbc, 1, 0, (flags & NSEventModifierFlagControl) != 0);
-  BbcMachineSetKey(g_cpu.bbc, 0, 4, (flags & NSEventModifierFlagCapsLock) != 0);
-  SyncShift();
+  if (event.keyCode == 57) {
+    CapsLockEvent(event);
+  }
+  ApplyMomentaryModifiers(event.modifierFlags);
 }
 
 @end
@@ -367,6 +422,9 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   (void)timer;
   if (!g_ready || !g_cpu.running) {
     return;
+  }
+  if ([NSApp isActive]) {
+    ApplyMomentaryModifiers([NSEvent modifierFlags]);
   }
   if (g_cpu.bbc != NULL && self.view != nil && self.window != nil) {
     NSPoint loc = [self.view convertPoint:[self.window mouseLocationOutsideOfEventStream]
@@ -585,7 +643,10 @@ static void UseHostFunctionKeys(bool enable) {
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
   (void)notification;
   // 800x640 is a 5:4 monitor at a size that sits on the desktop.
-  NSRect content = NSMakeRect(0, 0, 800, 640);
+  // -scale multiplies that. The view draws the bitmap into the whole
+  // content area, so the pixels grow by the same amount.
+  double scale = BbcSessionScreenScale();
+  NSRect content = NSMakeRect(0, 0, 800.0 * scale, 640.0 * scale);
   self.window = [[NSWindow alloc]
       initWithContentRect:content
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -594,7 +655,13 @@ static void UseHostFunctionKeys(bool enable) {
                     defer:NO];
   self.window.title = @"BBC Micro";
   [self.window setContentAspectRatio:NSMakeSize(5, 4)];
-  [self.window setContentMinSize:NSMakeSize(400, 320)];
+  // 400x320 is the usual smallest size. A scale below 0.5 asks for less
+  // than that, so the minimum follows the requested picture.
+  if (content.size.width < 400.0) {
+    [self.window setContentMinSize:content.size];
+  } else {
+    [self.window setContentMinSize:NSMakeSize(400, 320)];
+  }
   self.view = [[BbcView alloc] initWithFrame:content];
   self.window.contentView = self.view;
   [self.window center];
@@ -607,6 +674,7 @@ static void UseHostFunctionKeys(bool enable) {
                                               userInfo:nil
                                                repeats:YES];
   [NSApp activateIgnoringOtherApps:YES];
+  RememberCapsFlag();
   UseHostFunctionKeys(true);
 }
 
@@ -617,6 +685,7 @@ static void UseHostFunctionKeys(bool enable) {
 
 - (void)applicationDidResignActive:(NSNotification*)notification {
   (void)notification;
+  ReleaseStuckKeys();
   UseHostFunctionKeys(false);
 }
 

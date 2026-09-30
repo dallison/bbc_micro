@@ -12,6 +12,7 @@ W65C02Interpreter g_cpu;
 bool g_ready = false;
 
 static char* g_rom_dir = NULL;
+static double g_screen_scale = 1.0;
 static BbcRomFile g_rom_files[BBC_ROM_IMAGE_MAX];
 static int g_rom_file_count = 0;
 
@@ -52,6 +53,17 @@ static void Usage(void) {
           "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
           "       of the wall clock. -volume n is 0 for silence through 11\n"
           "       for full volume. The default is 7.\n"
+#if defined(__APPLE__)
+          "       -scale n sets the window size. 1 is 800 by 640. n is greater\n"
+          "       than 0 and at most 4, so 1.5 is one and a half times that\n"
+          "       size. The picture keeps its shape and the pixels grow with\n"
+          "       the window.\n"
+#elif defined(__linux__)
+          "       -scale n sets the window size. 1 is the picture's own size.\n"
+          "       n is greater than 0 and at most 4, so 1.5 is one and a half\n"
+          "       times that size. The picture keeps its shape and the pixels\n"
+          "       grow with the window.\n"
+#endif
           "       -econet n fits the Econet interface as station n (1-254).\n"
           "       That is the 68B54 at &FEA0, not the RS423 serial port.\n"
           "       Stations that use the same -econet-port share a wire. The\n"
@@ -64,6 +76,8 @@ static void ReleaseRoms(void) {
   free(g_rom_dir);
   g_rom_dir = NULL;
 }
+
+double BbcSessionScreenScale(void) { return g_screen_scale; }
 
 void BbcSessionFinish(void) {
   g_ready = false;
@@ -300,6 +314,21 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         return false;
       }
       volume = (int)value;
+    } else if (strcmp(argv[i], "-scale") == 0) {
+      char* end = NULL;
+      double value;
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      value = strtod(argv[++i], &end);
+      if (end == argv[i] || *end != '\0' || !(value > 0.0 && value <= 4.0)) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      g_screen_scale = value;
     } else if (strcmp(argv[i], "-econet") == 0) {
       char* end = NULL;
       long value;

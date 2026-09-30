@@ -507,8 +507,28 @@ static void UpdateTitle(void) {
   shown = stamp;
 }
 
+// -scale multiplies the picture. 1 leaves each displayed pixel one window
+// pixel across, after the bitmap modes have been stretched to look square.
+static int ScaledLength(int size) {
+  double px;
+  int n;
+  if (size < 1) {
+    return 1;
+  }
+  px = (double)size * BbcSessionScreenScale();
+  n = (int)(px + 0.5);
+  if (n < 1) {
+    n = 1;
+  }
+  return n;
+}
+
 static void FitWindow(int width, int height) {
   int want_h;
+  int win_w;
+  int win_h;
+  int min_w;
+  int min_h;
   XSizeHints hints;
   if (width <= 0 || height <= 0) {
     return;
@@ -524,15 +544,28 @@ static void FitWindow(int width, int height) {
   if (want_h < 1) {
     want_h = 1;
   }
+  win_w = ScaledLength(width);
+  win_h = ScaledLength(want_h);
+  // 400x320 is the usual smallest size. A scale that asks for less than
+  // that follows the requested picture, as on the Mac window.
+  min_w = 400;
+  min_h = 320;
+  if (win_w < min_w || win_h < min_h) {
+    min_w = win_w;
+    min_h = win_h;
+  }
   memset(&hints, 0, sizeof(hints));
   hints.flags = PMinSize | PAspect;
-  hints.min_width = 400;
-  hints.min_height = 320;
+  hints.min_width = min_w;
+  hints.min_height = min_h;
   hints.min_aspect.x = width;
   hints.min_aspect.y = want_h;
   hints.max_aspect = hints.min_aspect;
   XSetWMNormalHints(g_dpy, g_win, &hints);
-  XResizeWindow(g_dpy, g_win, (unsigned)width, (unsigned)want_h);
+  if (win_w != g_win_w || win_h != g_win_h) {
+    XResizeWindow(g_dpy, g_win, (unsigned)win_w, (unsigned)win_h);
+    CreateImage(win_w, win_h);
+  }
 }
 
 static void ReadPointer(void) {
@@ -771,7 +804,8 @@ static bool OpenWindow(void) {
   attr.event_mask = KeyPressMask | KeyReleaseMask | ExposureMask | StructureNotifyMask |
                     ButtonPressMask | ButtonReleaseMask | FocusChangeMask | PointerMotionMask;
   mask = CWBackPixel | CWEventMask;
-  g_win = XCreateWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0, 640, 512, 0,
+  g_win = XCreateWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0,
+                        (unsigned)ScaledLength(640), (unsigned)ScaledLength(512), 0,
                         DefaultDepth(g_dpy, screen), InputOutput, visual, mask, &attr);
   if (g_win == 0) {
     return false;
@@ -780,7 +814,7 @@ static bool OpenWindow(void) {
   XSetWMProtocols(g_dpy, g_win, &g_wm_delete, 1);
   XStoreName(g_dpy, g_win, "BBC Micro");
   g_gc = XCreateGC(g_dpy, g_win, 0, NULL);
-  if (!CreateImage(640, 512)) {
+  if (!CreateImage(ScaledLength(640), ScaledLength(512))) {
     return false;
   }
   XMapWindow(g_dpy, g_win);

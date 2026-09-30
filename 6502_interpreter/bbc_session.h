@@ -15,4 +15,9 @@ extern bool g_ready;
 bool BbcSessionStart(int argc, char** argv, int* status);
 void BbcSessionFinish(void);
 
+// Window size relative to the usual picture. 1 is that size. Greater
+// than 0 and at most 4. The Mac and Linux windows use this. The Windows
+// window does not yet.
+double BbcSessionScreenScale(void);
+
 #endif

@@ -533,6 +533,55 @@ static void TestDisc(void) {
   EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
   EXPECT(BbcMachineRead(bbc, 0xfe81) == 0x10);
 
+  // A file that ends mid-track still has that track. The missing bytes read
+  // as zero, and the next track is absent.
+  {
+    char partial_buf[512];
+    const char* partial = TempPath(partial_buf, sizeof(partial_buf), "bbc-disc-partial.ssd");
+    uint8_t partial_image[2560 + 100];
+    memset(partial_image, 0, sizeof(partial_image));
+    partial_image[2560] = 0x11;
+    partial_image[2560 + 99] = 0x22;
+    WriteImage(partial, partial_image, sizeof(partial_image));
+    EXPECT(BbcMachineLoadDisc(bbc, 0, partial));
+    BbcMachineWrite(bbc, 0xfe80, 0x53);
+    BbcMachineWrite(bbc, 0xfe81, 1);
+    BbcMachineWrite(bbc, 0xfe81, 0);
+    BbcMachineWrite(bbc, 0xfe81, 0x21);
+    EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe84) == 0x11);
+    for (i = 1; i < 99; i++) {
+      EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+      EXPECT(BbcMachineRead(bbc, 0xfe84) == 0);
+    }
+    EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe84) == 0x22);
+    for (i = 100; i < 256; i++) {
+      EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+      EXPECT(BbcMachineRead(bbc, 0xfe84) == 0);
+    }
+    EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe81) == 0);
+    BbcMachineWrite(bbc, 0xfe80, 0x53);
+    BbcMachineWrite(bbc, 0xfe81, 1);
+    BbcMachineWrite(bbc, 0xfe81, 1);
+    BbcMachineWrite(bbc, 0xfe81, 0x21);
+    for (i = 0; i < 256; i++) {
+      EXPECT(WaitBits(bbc, 0xfe80, 0x04, 80));
+      EXPECT(BbcMachineRead(bbc, 0xfe84) == 0);
+    }
+    EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe81) == 0);
+    BbcMachineWrite(bbc, 0xfe80, 0x53);
+    BbcMachineWrite(bbc, 0xfe81, 2);
+    BbcMachineWrite(bbc, 0xfe81, 0);
+    BbcMachineWrite(bbc, 0xfe81, 0x21);
+    EXPECT(WaitBits(bbc, 0xfe80, 0x10, 80));
+    EXPECT(BbcMachineRead(bbc, 0xfe81) == 0x18);
+    remove(partial);
+    EXPECT(BbcMachineLoadDisc(bbc, 0, ssd));
+  }
+
   BbcMachineSetFdc(bbc, BBC_FDC_1770);
   EXPECT(BbcMachineRead(bbc, 0xfe80) == 0xfe);
   BbcMachineWrite(bbc, 0xfe80, 0x21);
@@ -685,6 +734,17 @@ static void TestPeripherals(void) {
   BbcMachineWrite(bbc, 0xfe6a, 0xa5);
   BbcMachineAdvance(bbc, 16);
   EXPECT((BbcMachineRead(bbc, 0xfe6d) & 0x04) != 0);
+  // Planetoid: IC 69 is this user VIA. Free-run mode must make T1 count
+  // even though the latches were never written.
+  {
+    uint8_t first;
+    uint8_t second;
+    BbcMachineWrite(bbc, 0xfe6b, 0xc0);
+    first = BbcMachineRead(bbc, 0xfe64);
+    BbcMachineAdvance(bbc, 4000);
+    second = BbcMachineRead(bbc, 0xfe64);
+    EXPECT(first != second);
+  }
   BbcMachineDestroy(bbc);
 
   WriteImage(tape_path, &sync, 1);

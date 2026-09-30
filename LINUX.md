@@ -44,6 +44,12 @@ bbc_b_rom_sockets/14-dfs.rom
 
 `-volume` is 0 for silence through 11 for full volume. The default is 7. Sound goes to the ALSA device named `default`.
 
+`-scale` multiplies the window. `1` is the picture's own size, and the value can be any number greater than 0 up to `4`, so `1.5` is one and a half times as wide and tall. The picture keeps its shape, and the pixels grow with the window.
+
+```
+./build/bbc -scale 1.5
+```
+
 ## Keys
 
 F1 to F9 are the BBC keys f1 to f9, and F10 is f0. F12 is Break. End is COPY. The arrow keys, Escape, Tab, Return, and Backspace map to the same BBC keys. The numeric keypad maps to the Master keypad. The left mouse button is joystick fire 0, and the right button is fire 1.

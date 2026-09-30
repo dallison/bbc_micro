@@ -847,6 +847,16 @@ static void ViaWrite(BbcMachine* bbc, BbcVia* via, bool system, int reg, uint8_t
       break;
     case 11:
       via->acr = value;
+      // Free-run (ACR bit 6). Planetoid calls the user 6522 IC 69 and
+      // does ?&FE6B=&C0:IF ?&FE64=?&FE64. A chip that has never had T1
+      // loaded still counts once free-run is selected. Empty latches
+      // would reload as a one-tick period, so the first span is a full
+      // 16-bit count and the low byte changes between the two peeks.
+      if ((value & 0x40) != 0 && !via->t1_running) {
+        int period = ((via->t1l_h << 8) | via->t1l_l) + 1;
+        via->t1_counter = period > 1 ? period : 0xffff;
+        via->t1_running = true;
+      }
       break;
     case 12: {
       int previous = (via->pcr >> 1) & 7;
@@ -2022,10 +2032,17 @@ static int FdcSectorOff(const BbcMachine* bbc, int size) {
   off = (((size_t)track * (size_t)image->sides + (size_t)side) * (size_t)image->spt +
          (size_t)bbc->fdc.sector) *
         256;
-  if (off + (size_t)size > image->length) {
-    return -1;
-  }
+  (void)size;
   return (int)off;
+}
+
+// A short image can end in the middle of a track. Bytes past the file are
+// empty rather than a missing sector.
+static uint8_t DiscByte(const BbcDiscImage* image, int off) {
+  if (image == NULL || image->data == NULL || off < 0 || (size_t)off >= image->length) {
+    return 0;
+  }
+  return image->data[off];
 }
 
 static void DiscFlushImage(BbcDiscImage* image) {
@@ -2163,12 +2180,11 @@ static void FdcService(BbcMachine* bbc) {
       FdcAsk(bbc, true, bbc->fdc.buffer[bbc->fdc.sector_off]);
     } else {
       BbcDiscImage* image = FdcImage(bbc, NULL);
-      if (image == NULL || bbc->fdc.sector_off < 0 ||
-          (size_t)bbc->fdc.sector_off >= image->length) {
+      if (image == NULL || bbc->fdc.sector_off < 0) {
         FdcFinish(bbc, FdcMissing(bbc));
         return;
       }
-      FdcAsk(bbc, true, image->data[bbc->fdc.sector_off]);
+      FdcAsk(bbc, true, DiscByte(image, bbc->fdc.sector_off));
     }
     bbc->fdc.sector_off++;
     bbc->fdc.bytes_left--;
@@ -2245,8 +2261,12 @@ static void FdcDataSupplied(BbcMachine* bbc, uint8_t value) {
   {
     BbcDiscImage* image = FdcImage(bbc, NULL);
     if (image != NULL && bbc->fdc.sector_off >= 0 && n > 0 &&
-        (size_t)bbc->fdc.sector_off + (size_t)n <= image->length) {
-      memcpy(image->data + bbc->fdc.sector_off, bbc->fdc.buffer, (size_t)n);
+        (size_t)bbc->fdc.sector_off < image->length) {
+      size_t room = image->length - (size_t)bbc->fdc.sector_off;
+      if ((size_t)n < room) {
+        room = (size_t)n;
+      }
+      memcpy(image->data + bbc->fdc.sector_off, bbc->fdc.buffer, room);
       DiscFlushImage(image);
     }
   }
@@ -2586,8 +2606,12 @@ static void FdcCommitTrack(BbcMachine* bbc) {
       off = FdcSectorOff(bbc, size);
       if (off >= 0) {
         BbcDiscImage* image = FdcImage(bbc, NULL);
-        if (image != NULL) {
-          memcpy(image->data + off, bytes + j + 1, (size_t)size);
+        if (image != NULL && (size_t)off < image->length) {
+          size_t room = image->length - (size_t)off;
+          if ((size_t)size < room) {
+            room = (size_t)size;
+          }
+          memcpy(image->data + off, bytes + j + 1, room);
           wrote = true;
         }
       }
@@ -2649,7 +2673,7 @@ static int FdcBuildTrack(BbcMachine* bbc) {
     bbc->fdc.sector = sector;
     off = FdcSectorOff(bbc, 256);
     for (k = 0; k < 256; k++) {
-      out[n++] = off >= 0 && image != NULL ? image->data[off + k] : 0xe5;
+      out[n++] = off >= 0 ? DiscByte(image, off + k) : 0xe5;
     }
     out[n++] = 0xf7;
   }
@@ -4574,7 +4598,15 @@ static void DiscShape(const char* path, size_t length, int* spt, int* sides, int
     *sides = 1;
   }
   unit = (*spt) * (*sides) * 256;
-  *tracks = unit > 0 ? (int)(length / (size_t)unit) : 0;
+  *tracks = 0;
+  if (unit > 0) {
+    *tracks = (int)(length / (size_t)unit);
+    // Keep a final track that the file only partly fills. Reads past the
+    // file return zero.
+    if (length % (size_t)unit != 0 && *tracks < 80) {
+      (*tracks)++;
+    }
+  }
   if (*tracks > 80) {
     *tracks = 80;
   }
