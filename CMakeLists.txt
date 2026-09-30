@@ -136,6 +136,7 @@ if(APPLE)
   target_link_libraries(bbc PRIVATE
     6502_lib
     "-framework Cocoa"
+    "-framework Carbon"
     "-framework AudioToolbox"
   )
 elseif(WIN32)

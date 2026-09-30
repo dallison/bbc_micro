@@ -671,6 +671,13 @@ bool W65C02InterpreterBbcLoadDisc(W65C02Interpreter* interpreter, int drive,
   return BbcMachineLoadDisc(interpreter->bbc, drive, path);
 }
 
+bool W65C02InterpreterBbcLoadHardDisc(W65C02Interpreter* interpreter, const char* path) {
+  if (interpreter->bbc == NULL || path == NULL) {
+    return false;
+  }
+  return BbcMachineLoadHardDisc(interpreter->bbc, path);
+}
+
 void W65C02InterpreterBbcSetFdc(W65C02Interpreter* interpreter, int kind) {
   if (interpreter->bbc != NULL) {
     BbcMachineSetFdc(interpreter->bbc, kind);

@@ -20,4 +20,13 @@ void BbcSessionFinish(void);
 // window does not yet.
 double BbcSessionScreenScale(void);
 
+// Each Caps Lock press toggles the BBC lock. With this set, the key
+// stays down only while it is held. Games that read the key, such as
+// Zalaga, need that.
+bool BbcSessionGameCaps(void);
+
+// Host layout detected before the arguments are read. An explicit
+// -keyboard on the command line keeps its choice.
+void BbcSessionPreferKeyboard(int kind);
+
 #endif

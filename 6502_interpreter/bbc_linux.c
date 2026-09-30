@@ -8,6 +8,7 @@
 // typedef for this file; none of the calls below use an X region.
 #define Region X11Region
 #include <X11/Xlib.h>
+#include <X11/XKBlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #undef Region
@@ -40,6 +41,11 @@ typedef struct {
 
 static bool g_host_shift = false;
 static HeldKey g_held[16];
+// Typing presses stay down for two frames, then come up. The MOS toggles
+// Caps Lock on the scan after it first sees the key, so the click has to
+// outlast that scan. Holding the key for the whole time the light is on
+// toggles only on the way on.
+static int g_caps_pulse = 0;
 
 static Display* g_dpy = NULL;
 static Window g_win = 0;
@@ -110,6 +116,7 @@ static void ReleaseAllKeys(void) {
   g_host_shift = false;
   g_fire0 = 0;
   g_fire1 = 0;
+  g_caps_pulse = 0;
   if (g_ready && g_cpu.bbc != NULL) {
     BbcMachineSetKey(g_cpu.bbc, 0, 0, false);
     BbcMachineSetKey(g_cpu.bbc, 1, 0, false);
@@ -145,6 +152,28 @@ static bool GlyphToBbc(unsigned ch, int* column, int* row, bool* need_shift) {
     *row = kDigit[ch - '0'][1];
     *need_shift = false;
     return true;
+  }
+  // Shift-3 is 0x5F and the pound key's shift is 0x23. UK MODE 7 draws those
+  // as # and the pound sign. US typing follows the ASCII code.
+  if (g_cpu.bbc != NULL && BbcMachineKeyboard(g_cpu.bbc) == BBC_KEYBOARD_US) {
+    if (ch == '#') {
+      *column = 8;
+      *row = 2;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '_') {
+      *column = 1;
+      *row = 1;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '`') {
+      *column = 8;
+      *row = 2;
+      *need_shift = false;
+      return true;
+    }
   }
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     if (keys[i].ch == ch) {
@@ -585,7 +614,6 @@ static void ReadPointer(void) {
   g_host_shift = (mask & ShiftMask) != 0;
   SyncShift();
   BbcMachineSetKey(g_cpu.bbc, 1, 0, (mask & ControlMask) != 0);
-  BbcMachineSetKey(g_cpu.bbc, 0, 4, (mask & LockMask) != 0);
   if (x >= 0 && y >= 0 && x < g_win_w && y < g_win_h && g_win_w > 1 && g_win_h > 1) {
     BbcMachineSetAnalogue(g_cpu.bbc, 0, x * 65535 / (g_win_w - 1));
     BbcMachineSetAnalogue(g_cpu.bbc, 1, y * 65535 / (g_win_h - 1));
@@ -628,6 +656,12 @@ static void Tick(void) {
       break;
     }
   }
+  if (g_caps_pulse > 0 && g_cpu.bbc != NULL && !BbcSessionGameCaps()) {
+    g_caps_pulse--;
+    if (g_caps_pulse == 0) {
+      BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
+    }
+  }
   if (g_cpu.bbc == NULL) {
     return;
   }
@@ -640,6 +674,7 @@ static void Tick(void) {
 }
 
 static void OnKey(XKeyEvent* event, bool down) {
+  bool caps = XLookupKeysym(event, 0) == XK_Caps_Lock;
   if (!down) {
     XEvent next;
     if (XEventsQueued(g_dpy, QueuedAfterReading) > 0) {
@@ -650,7 +685,23 @@ static void OnKey(XKeyEvent* event, bool down) {
         return;
       }
     }
+    if (caps) {
+      if (BbcSessionGameCaps() && g_cpu.bbc != NULL) {
+        BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
+      }
+      return;
+    }
     ReleaseHostKey(event->keycode);
+    return;
+  }
+  if (caps) {
+    if (g_cpu.bbc == NULL) {
+      return;
+    }
+    BbcMachineSetKey(g_cpu.bbc, 0, 4, true);
+    if (!BbcSessionGameCaps()) {
+      g_caps_pulse = 2;
+    }
     return;
   }
   {
@@ -822,6 +873,64 @@ static bool OpenWindow(void) {
   return true;
 }
 
+static int HostKeyboard(Display* display) {
+  XkbDescPtr desc;
+  XkbStateRec state;
+  char* symbols;
+  const char* mark;
+  int group;
+  int seen;
+  if (display == NULL || XkbGetState(display, XkbUseCoreKbd, &state) != Success) {
+    return BBC_KEYBOARD_UK;
+  }
+  desc = XkbGetKeyboard(display, XkbSymbolsNameMask, XkbUseCoreKbd);
+  if (desc == NULL || desc->names == NULL || desc->names->symbols == None) {
+    if (desc != NULL) {
+      XkbFreeKeyboard(desc, 0, True);
+    }
+    return BBC_KEYBOARD_UK;
+  }
+  symbols = XGetAtomName(display, desc->names->symbols);
+  XkbFreeKeyboard(desc, 0, True);
+  if (symbols == NULL) {
+    return BBC_KEYBOARD_UK;
+  }
+  group = 0;
+  seen = 0;
+  mark = symbols;
+  while (*mark != '\0') {
+    const char* start;
+    size_t n;
+    while (*mark == '+' || *mark == '_') {
+      mark++;
+    }
+    start = mark;
+    while (*mark != '\0' && *mark != '+' && *mark != '_') {
+      mark++;
+    }
+    n = (size_t)(mark - start);
+    if ((n == 2 && start[0] == 'p' && start[1] == 'c') ||
+        (n >= 3 && strncmp(start, "pc(", 3) == 0)) {
+      continue;
+    }
+    if (n >= 4 && strncmp(start, "inet", 4) == 0) {
+      continue;
+    }
+    if (n >= 5 && strncmp(start, "evdev", 5) == 0) {
+      continue;
+    }
+    if (seen == (int)state.group) {
+      group = (n >= 2 && (strncmp(start, "gb", 2) == 0 || strncmp(start, "uk", 2) == 0))
+                  ? BBC_KEYBOARD_UK
+                  : (n >= 2 && strncmp(start, "us", 2) == 0) ? BBC_KEYBOARD_US : BBC_KEYBOARD_UK;
+      break;
+    }
+    seen++;
+  }
+  XFree(symbols);
+  return group;
+}
+
 int main(int argc, char** argv) {
   int status = 1;
   int xfd;
@@ -835,6 +944,7 @@ int main(int argc, char** argv) {
     BbcSessionFinish();
     return 1;
   }
+  BbcSessionPreferKeyboard(HostKeyboard(g_dpy));
   if (!OpenWindow()) {
     fprintf(stderr, "bbc: unable to open the window\n");
     if (g_dpy != NULL) {

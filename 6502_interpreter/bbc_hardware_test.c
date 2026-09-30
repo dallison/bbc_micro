@@ -1886,6 +1886,292 @@ static void TestEconetOtherProcess(void) {
   SocketClose(fd);
 }
 
+static uint8_t HdPins(BbcMachine* bbc) { return BbcMachineRead(bbc, 0xfc41); }
+
+static void HdSelect(BbcMachine* bbc) {
+  BbcMachineWrite(bbc, 0xfc40, 0x01);
+  BbcMachineWrite(bbc, 0xfc42, 0x01);
+  EXPECT((HdPins(bbc) & 0x02) != 0);
+  EXPECT((HdPins(bbc) & 0x80) != 0);
+  EXPECT((HdPins(bbc) & 0x40) == 0);
+}
+
+static void HdCommand(BbcMachine* bbc, const uint8_t cdb[6]) {
+  int i;
+  for (i = 0; i < 6; i++) {
+    BbcMachineWrite(bbc, 0xfc40, cdb[i]);
+  }
+}
+
+static uint8_t HdFinish(BbcMachine* bbc) {
+  uint8_t status;
+  uint8_t pins = HdPins(bbc);
+  EXPECT((pins & 0x80) != 0);
+  EXPECT((pins & 0x40) != 0);
+  status = BbcMachineRead(bbc, 0xfc40);
+  EXPECT((HdPins(bbc) & 0x01) != 0);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0);
+  EXPECT((HdPins(bbc) & 0x02) == 0);
+  return status;
+}
+
+static void TestHardDisc(void) {
+  char path_buf[512];
+  char locked_buf[512];
+  const char* path = TempPath(path_buf, sizeof(path_buf), "bbc-hd-test.hd");
+  const char* locked = TempPath(locked_buf, sizeof(locked_buf), "bbc-hd-locked.hd");
+  uint8_t image[8 * 256];
+  uint8_t back[8 * 256];
+  uint8_t cdb[6];
+  BbcMachine* bbc;
+  FILE* fp;
+  int i;
+  int same;
+
+  memset(image, 0, sizeof(image));
+  for (i = 0; i < 256; i++) {
+    image[2 * 256 + i] = 0x3c;
+    image[3 * 256 + i] = 0x11;
+    image[4 * 256 + i] = 0x22;
+  }
+  WriteImage(path, image, sizeof(image));
+  WriteImage(locked, image, sizeof(image));
+  EXPECT(chmod(locked, 0444) == 0);
+
+  bbc = BbcMachineCreate();
+  EXPECT(bbc != NULL);
+  if (bbc == NULL) {
+    return;
+  }
+  BbcMachineWrite(bbc, 0xfc40, 0xa5);
+  BbcMachineWrite(bbc, 0xfc43, 0);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0xff);
+  EXPECT(BbcMachineRead(bbc, 0xfc10) == 0xff);
+  BbcMachineDestroy(bbc);
+
+  bbc = BbcMachineCreate();
+  EXPECT(BbcMachineLoadHardDisc(bbc, path));
+  EXPECT(BbcMachineRead(bbc, 0xfc10) == 0xff);
+  EXPECT(HdPins(bbc) == 0);
+  BbcMachineWrite(bbc, 0xfc40, 0x5a);
+  BbcMachineWrite(bbc, 0xfc43, 0);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0x5a);
+  BbcMachineWrite(bbc, 0xfc40, 0xa5);
+  BbcMachineWrite(bbc, 0xfc43, 0);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0xa5);
+
+  BbcMachineWrite(bbc, 0xfc40, 0x02);
+  BbcMachineWrite(bbc, 0xfc42, 0x02);
+  EXPECT((HdPins(bbc) & 0x02) == 0);
+
+  HdSelect(bbc);
+  cdb[0] = 0x08;
+  cdb[1] = 0x00;
+  cdb[2] = 0x00;
+  cdb[3] = 0x02;
+  cdb[4] = 0x01;
+  cdb[5] = 0x00;
+  HdCommand(bbc, cdb);
+  EXPECT((HdPins(bbc) & 0x80) == 0);
+  EXPECT((HdPins(bbc) & 0x40) != 0);
+  same = 1;
+  for (i = 0; i < 256; i++) {
+    if (BbcMachineRead(bbc, 0xfc40) != 0x3c) {
+      same = 0;
+    }
+  }
+  EXPECT(same);
+  EXPECT(HdFinish(bbc) == 0x00);
+
+  HdSelect(bbc);
+  cdb[3] = 0x03;
+  cdb[4] = 0x02;
+  HdCommand(bbc, cdb);
+  same = 1;
+  for (i = 0; i < 256; i++) {
+    if (BbcMachineRead(bbc, 0xfc40) != 0x11) {
+      same = 0;
+    }
+  }
+  for (i = 0; i < 256; i++) {
+    if (BbcMachineRead(bbc, 0xfc40) != 0x22) {
+      same = 0;
+    }
+  }
+  EXPECT(same);
+  EXPECT(HdFinish(bbc) == 0x00);
+
+  HdSelect(bbc);
+  cdb[0] = 0x08;
+  cdb[3] = 0x00;
+  cdb[4] = 0x00;
+  HdCommand(bbc, cdb);
+  EXPECT(HdFinish(bbc) == 0x02);
+
+  HdSelect(bbc);
+  cdb[0] = 0x0a;
+  cdb[3] = 0x01;
+  cdb[4] = 0x01;
+  HdCommand(bbc, cdb);
+  EXPECT((HdPins(bbc) & 0x80) == 0);
+  EXPECT((HdPins(bbc) & 0x40) == 0);
+  for (i = 0; i < 256; i++) {
+    BbcMachineWrite(bbc, 0xfc40, 0x5a);
+  }
+  EXPECT(HdFinish(bbc) == 0x00);
+  BbcMachineDestroy(bbc);
+
+  fp = fopen(path, "rb");
+  EXPECT(fp != NULL);
+  if (fp != NULL) {
+    EXPECT(fread(back, 1, sizeof(back), fp) == sizeof(back));
+    fclose(fp);
+  }
+  same = 1;
+  for (i = 0; i < 256; i++) {
+    if (back[256 + i] != 0x5a) {
+      same = 0;
+    }
+  }
+  EXPECT(same);
+
+  bbc = BbcMachineCreate();
+  EXPECT(BbcMachineLoadHardDisc(bbc, locked));
+  HdSelect(bbc);
+  cdb[0] = 0x0a;
+  cdb[1] = 0x00;
+  cdb[2] = 0x00;
+  cdb[3] = 0x01;
+  cdb[4] = 0x01;
+  cdb[5] = 0x00;
+  HdCommand(bbc, cdb);
+  EXPECT(HdFinish(bbc) == 0x02);
+  HdSelect(bbc);
+  cdb[0] = 0x03;
+  cdb[3] = 0x00;
+  cdb[4] = 0x00;
+  HdCommand(bbc, cdb);
+  EXPECT((HdPins(bbc) & 0x40) != 0);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0x44);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0x00);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0x00);
+  EXPECT(BbcMachineRead(bbc, 0xfc40) == 0x00);
+  EXPECT(HdFinish(bbc) == 0x00);
+  BbcMachineDestroy(bbc);
+
+  remove(path);
+  chmod(locked, 0644);
+  remove(locked);
+}
+
+static int TeletextWhites(int keyboard, uint8_t glyph) {
+  uint8_t* ram = calloc(65536, 1);
+  BbcMachine* bbc = BbcMachineCreate();
+  int n = 0;
+  int x;
+  int y;
+  uint8_t rgb[3];
+  if (ram == NULL || bbc == NULL) {
+    BbcMachineDestroy(bbc);
+    free(ram);
+    return -1;
+  }
+  BbcMachineSetRam(bbc, ram);
+  BbcMachineSetKeyboard(bbc, keyboard);
+  BbcMachineSelectMode(bbc, 7);
+  ram[0x7c00] = glyph;
+  AdvanceUntilFrame(bbc);
+  for (y = 0; y < 20; y++) {
+    for (x = 0; x < 16; x++) {
+      BbcPixel(bbc, x, y, rgb);
+      if (rgb[0] == 255 && rgb[1] == 255 && rgb[2] == 255) {
+        n++;
+      }
+    }
+  }
+  BbcMachineDestroy(bbc);
+  free(ram);
+  return n;
+}
+
+static void TestKeyboardGlyphs(void) {
+  int uk;
+  int us;
+  EXPECT(BbcMachineParseKeyboard("uk") == BBC_KEYBOARD_UK);
+  EXPECT(BbcMachineParseKeyboard("us") == BBC_KEYBOARD_US);
+  EXPECT(BbcMachineParseKeyboard("de") < 0);
+  uk = TeletextWhites(BBC_KEYBOARD_UK, 0x7b);
+  us = TeletextWhites(BBC_KEYBOARD_US, 0x7b);
+  EXPECT(uk > 0);
+  EXPECT(us > 0);
+  EXPECT(uk != us);
+}
+
+static int PagedByte(BbcMachine* bbc, int slot, int offset) {
+  BbcMachineWrite(bbc, 0xfe30, (uint8_t)slot);
+  return BbcMachineRead(bbc, (uint16_t)(0x8000 + offset));
+}
+
+static void TestHardDiscPrefersAdfs(void) {
+  char path_buf[512];
+  const char* path = TempPath(path_buf, sizeof(path_buf), "bbc-hd-fs.hd");
+  uint8_t sector[256];
+  uint8_t adfs[16];
+  uint8_t dfs[16];
+  uint8_t* ram;
+  BbcMachine* bbc;
+
+  memset(sector, 0, sizeof(sector));
+  WriteImage(path, sector, sizeof(sector));
+  memset(adfs, 0xff, sizeof(adfs));
+  memset(dfs, 0xff, sizeof(dfs));
+  memcpy(adfs, "ADFS", 4);
+  adfs[8] = 0x11;
+  memcpy(dfs, "DFS", 3);
+  dfs[8] = 0x14;
+
+  ram = calloc(65536, 1);
+  bbc = BbcMachineCreate();
+  EXPECT(ram != NULL && bbc != NULL);
+  if (ram == NULL || bbc == NULL) {
+    free(ram);
+    BbcMachineDestroy(bbc);
+    remove(path);
+    return;
+  }
+  BbcMachineSetRam(bbc, ram);
+  EXPECT(BbcMachineLoadSidewaysBytes(bbc, 11, adfs, sizeof(adfs)));
+  EXPECT(BbcMachineLoadSidewaysBytes(bbc, 14, dfs, sizeof(dfs)));
+  EXPECT(BbcMachineLoadHardDisc(bbc, path));
+  EXPECT(PagedByte(bbc, 14, 0) == 'A');
+  EXPECT(PagedByte(bbc, 14, 8) == 0x11);
+  EXPECT(PagedByte(bbc, 11, 0) == 'D');
+  EXPECT(PagedByte(bbc, 11, 8) == 0x14);
+  BbcMachineDestroy(bbc);
+  free(ram);
+
+  ram = calloc(65536, 1);
+  bbc = BbcMachineCreate();
+  EXPECT(ram != NULL && bbc != NULL);
+  if (ram == NULL || bbc == NULL) {
+    free(ram);
+    BbcMachineDestroy(bbc);
+    remove(path);
+    return;
+  }
+  BbcMachineSetRam(bbc, ram);
+  adfs[8] = 0x15;
+  dfs[8] = 0x0a;
+  EXPECT(BbcMachineLoadSidewaysBytes(bbc, 15, adfs, sizeof(adfs)));
+  EXPECT(BbcMachineLoadSidewaysBytes(bbc, 10, dfs, sizeof(dfs)));
+  EXPECT(BbcMachineLoadHardDisc(bbc, path));
+  EXPECT(PagedByte(bbc, 15, 8) == 0x15);
+  EXPECT(PagedByte(bbc, 10, 8) == 0x0a);
+  BbcMachineDestroy(bbc);
+  free(ram);
+  remove(path);
+}
+
 int main(void) {
   uint8_t* ram = calloc(65536, 1);
   BbcMachine* bbc = BbcMachineCreate();
@@ -1899,7 +2185,10 @@ int main(void) {
     TestUlaSplit();
     TestAddressRupture();
     TestTeletextBeam();
+    TestKeyboardGlyphs();
     TestDisc();
+    TestHardDisc();
+    TestHardDiscPrefersAdfs();
     TestCumana();
     TestCassette();
     TestPeripherals();

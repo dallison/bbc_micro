@@ -188,6 +188,28 @@ struct BbcMachine {
     BbcDiscImage disc[2];
     BbcDiscImage extra[2];
   } fdc;
+  // Acorn Winchester host adapter at &FC40. ADFS drive 0. The image is a
+  // raw file of 256-byte sectors. phase 0 is bus free.
+  struct {
+    uint8_t* data;
+    size_t length;
+    uint32_t sectors;
+    bool protect;
+    bool dirty;
+    char* path;
+    uint8_t latch;
+    int phase;
+    int cdb_i;
+    int cdb_n;
+    uint8_t cdb[16];
+    bool image_io;
+    size_t pos;
+    size_t remaining;
+    uint8_t scratch[4];
+    int scratch_i;
+    uint8_t status_byte;
+    uint8_t sense[4];
+  } hd;
   BbcVia sys;
   BbcVia user;
   int cycle_acc;
@@ -243,6 +265,7 @@ struct BbcMachine {
   uint8_t rom_fdc[16];
   bool any_sideways;
   int model;
+  int keyboard;
   bool master;
   int mapped_slot;
   bool andy_mapped;
@@ -1131,9 +1154,37 @@ static uint16_t TeletextExpand(uint8_t bits) {
                     ((bits & 0x08) * 0x18) + ((bits & 0x10) * 0x30));
 }
 
-static uint8_t TeletextMatrix(uint8_t glyph, int row) {
+// US national option for the codes the UK chip draws as fractions and arrows.
+// Five dots, bit 4 on the left, same as kSaa5050Uk.
+static uint8_t UsTeletext(uint8_t glyph, int row) {
+  static const unsigned char rows[][10] = {
+      {0x23, 012, 012, 037, 012, 037, 012, 012, 000, 000},
+      {0x5b, 016, 010, 010, 010, 010, 010, 016, 000, 000},
+      {0x5c, 020, 010, 010, 004, 004, 002, 001, 000, 000},
+      {0x5d, 016, 002, 002, 002, 002, 002, 016, 000, 000},
+      {0x5e, 004, 012, 021, 000, 000, 000, 000, 000, 000},
+      {0x5f, 000, 000, 000, 000, 000, 000, 037, 000, 000},
+      {0x60, 010, 004, 000, 000, 000, 000, 000, 000, 000},
+      {0x7b, 006, 010, 004, 014, 004, 010, 006, 000, 000},
+      {0x7c, 004, 004, 004, 004, 004, 004, 004, 000, 000},
+      {0x7d, 014, 002, 004, 006, 004, 002, 014, 000, 000},
+      {0x7e, 000, 000, 010, 025, 002, 000, 000, 000, 000},
+  };
+  size_t i;
+  for (i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+    if (rows[i][0] == glyph) {
+      return rows[i][1 + row];
+    }
+  }
+  return kSaa5050Uk[glyph - 0x20][row];
+}
+
+static uint8_t TeletextMatrix(uint8_t glyph, int row, int keyboard) {
   if (glyph < 0x20 || glyph > 0x7f || row < 0 || row > 8) {
     return 0;
+  }
+  if (keyboard == BBC_KEYBOARD_US) {
+    return UsTeletext(glyph, row);
   }
   return kSaa5050Uk[glyph - 0x20][row];
 }
@@ -1175,7 +1226,7 @@ static int TeletextRa(int row, int lower, bool doubled, bool bottom) {
   return ra;
 }
 
-static uint16_t TeletextRaw(uint8_t glyph, int ra) {
+static uint16_t TeletextRaw(uint8_t glyph, int ra, int keyboard) {
   int neighbor;
   if (ra < 0 || ra > 19) {
     return 0;
@@ -1186,14 +1237,15 @@ static uint16_t TeletextRaw(uint8_t glyph, int ra) {
   } else {
     neighbor >>= 1;
   }
-  return TeletextRound(TeletextExpand(TeletextMatrix(glyph, ra >> 1)),
-                       TeletextExpand(TeletextMatrix(glyph, neighbor)));
+  return TeletextRound(TeletextExpand(TeletextMatrix(glyph, ra >> 1, keyboard)),
+                       TeletextExpand(TeletextMatrix(glyph, neighbor, keyboard)));
 }
 
 // Each of the ten character rows is two framebuffer lines. The top line rounds
 // against the row above and the bottom line against the row below.
-static uint16_t TeletextPattern(uint8_t glyph, int row, int lower, bool doubled, bool bottom) {
-  return TeletextRaw(glyph, TeletextRa(row, lower, doubled, bottom));
+static uint16_t TeletextPattern(uint8_t glyph, int row, int lower, bool doubled, bool bottom,
+                                int keyboard) {
+  return TeletextRaw(glyph, TeletextRa(row, lower, doubled, bottom), keyboard);
 }
 
 // The chip's rounded glyph is 12 half-dots wide. Drawing those one-to-one,
@@ -1277,7 +1329,8 @@ static void DrawTeletext(BbcMachine* bbc, int cols, int rows, int scanlines, int
           int half;
           for (half = 0; half < 2; half++) {
             uint16_t pattern =
-                TeletextPattern(glyph, index, half, bbc->tt_double, bbc->tt_bottom);
+                TeletextPattern(glyph, index, half, bbc->tt_double, bbc->tt_bottom,
+                                bbc->keyboard);
             int yy = y + sy * 2 + half;
             int pix;
             for (pix = 0; pix < ppc; pix++) {
@@ -1859,6 +1912,7 @@ void BbcMachineBreak(BbcMachine* bbc) {
     WriteAcccon(bbc, 0);
   }
   bbc->romsel = 0;
+  bbc->hd.phase = 0;
   MapRomsel(bbc);
 }
 
@@ -3805,14 +3859,381 @@ static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
   return 0xfe;
 }
 
+// Winchester status at &FC41, as ADFS 1.30 samples it. Bit 0 is request,
+// bit 1 is busy, bit 5 is set while a phase is valid, bit 6 is input to
+// the host, and bit 7 is command or status rather than data.
+#define HD_FREE 0
+#define HD_COMMAND 1
+#define HD_DATA_IN 2
+#define HD_DATA_OUT 3
+#define HD_STATUS 4
+#define HD_MESSAGE 5
+#define HD_REQ 0x01
+#define HD_BSY 0x02
+#define HD_VALID 0x20
+#define HD_IO 0x40
+#define HD_CD 0x80
+
+static void HdFlush(BbcMachine* bbc) {
+  FILE* fp;
+  if (bbc == NULL || !bbc->hd.dirty || bbc->hd.protect || bbc->hd.path == NULL ||
+      bbc->hd.data == NULL) {
+    return;
+  }
+  fp = fopen(bbc->hd.path, "r+b");
+  if (fp == NULL) {
+    return;
+  }
+  if (fwrite(bbc->hd.data, 1, bbc->hd.length, fp) == bbc->hd.length) {
+    bbc->hd.dirty = false;
+  }
+  fclose(fp);
+}
+
+static void HdRelease(BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return;
+  }
+  HdFlush(bbc);
+  free(bbc->hd.data);
+  free(bbc->hd.path);
+  memset(&bbc->hd, 0, sizeof(bbc->hd));
+}
+
+static void HdBeginStatus(BbcMachine* bbc, uint8_t status) {
+  bbc->hd.phase = HD_STATUS;
+  bbc->hd.status_byte = status;
+  if (status == 0) {
+    memset(bbc->hd.sense, 0, sizeof(bbc->hd.sense));
+  }
+}
+
+static void HdFail(BbcMachine* bbc, uint8_t code) {
+  memset(bbc->hd.sense, 0, sizeof(bbc->hd.sense));
+  bbc->hd.sense[0] = code;
+  HdBeginStatus(bbc, 0x02);
+}
+
+static int HdCdbLen(uint8_t op) {
+  switch (op >> 5) {
+    case 0:
+      return 6;
+    case 1:
+    case 2:
+      return 10;
+    case 5:
+      return 12;
+    default:
+      return 6;
+  }
+}
+
+static uint32_t HdLba6(const uint8_t* cdb) {
+  return ((uint32_t)(cdb[1] & 0x1f) << 16) | ((uint32_t)cdb[2] << 8) | (uint32_t)cdb[3];
+}
+
+static uint32_t HdCount6(const uint8_t* cdb) {
+  return cdb[4] == 0 ? 256u : (uint32_t)cdb[4];
+}
+
+static bool HdRange(const BbcMachine* bbc, uint32_t lba, uint32_t sectors) {
+  return sectors == 0 || (lba < bbc->hd.sectors && sectors <= bbc->hd.sectors - lba);
+}
+
+static void HdStartTransfer(BbcMachine* bbc, bool writing, uint32_t lba, uint32_t sectors) {
+  if (!HdRange(bbc, lba, sectors)) {
+    HdFail(bbc, 0x01);
+    return;
+  }
+  if (writing && bbc->hd.protect) {
+    HdFail(bbc, 0x44);
+    return;
+  }
+  if (sectors == 0) {
+    HdBeginStatus(bbc, 0x00);
+    return;
+  }
+  bbc->hd.image_io = true;
+  bbc->hd.pos = (size_t)lba * 256u;
+  bbc->hd.remaining = (size_t)sectors * 256u;
+  bbc->hd.phase = writing ? HD_DATA_OUT : HD_DATA_IN;
+}
+
+static void HdRun(BbcMachine* bbc) {
+  const uint8_t* cdb = bbc->hd.cdb;
+  uint8_t op = cdb[0];
+  uint32_t lba;
+  uint32_t count;
+  if (bbc->hd.cdb_n >= 10) {
+    lba = ((uint32_t)cdb[2] << 24) | ((uint32_t)cdb[3] << 16) | ((uint32_t)cdb[4] << 8) |
+          (uint32_t)cdb[5];
+    count = ((uint32_t)cdb[7] << 8) | (uint32_t)cdb[8];
+  } else {
+    lba = HdLba6(cdb);
+    count = HdCount6(cdb);
+  }
+  switch (op) {
+    case 0x00:
+    case 0x01:
+      HdBeginStatus(bbc, 0x00);
+      break;
+    case 0x03:
+      memcpy(bbc->hd.scratch, bbc->hd.sense, 4);
+      bbc->hd.image_io = false;
+      bbc->hd.scratch_i = 0;
+      bbc->hd.remaining = 4;
+      bbc->hd.phase = HD_DATA_IN;
+      break;
+    case 0x08:
+    case 0x28:
+      HdStartTransfer(bbc, false, lba, count);
+      break;
+    case 0x0a:
+    case 0x2a:
+      HdStartTransfer(bbc, true, lba, count);
+      break;
+    case 0x0b:
+    case 0x2f:
+      if (!HdRange(bbc, lba, op == 0x0b ? 1u : count)) {
+        HdFail(bbc, 0x01);
+      } else {
+        HdBeginStatus(bbc, 0x00);
+      }
+      break;
+    default:
+      HdFail(bbc, 0x01);
+      break;
+  }
+}
+
+static void HdSelect(BbcMachine* bbc) {
+  int i;
+  if (bbc->hd.phase != HD_FREE || (bbc->hd.latch & 0x01) == 0) {
+    return;
+  }
+  bbc->hd.phase = HD_COMMAND;
+  bbc->hd.cdb_i = 0;
+  bbc->hd.cdb_n = 6;
+  for (i = 0; i < 16; i++) {
+    bbc->hd.cdb[i] = 0;
+  }
+}
+
+static uint8_t HdTake(BbcMachine* bbc) {
+  uint8_t byte = 0;
+  bool writing = bbc->hd.phase == HD_DATA_OUT;
+  if (bbc->hd.image_io) {
+    if (bbc->hd.pos < bbc->hd.length) {
+      byte = bbc->hd.data[bbc->hd.pos];
+    }
+    bbc->hd.pos++;
+  } else if (bbc->hd.scratch_i < 4) {
+    byte = bbc->hd.scratch[bbc->hd.scratch_i++];
+  }
+  if (bbc->hd.remaining > 0) {
+    bbc->hd.remaining--;
+  }
+  if (bbc->hd.remaining == 0) {
+    if (writing) {
+      HdFlush(bbc);
+    }
+    HdBeginStatus(bbc, 0x00);
+  }
+  return byte;
+}
+
+static void HdPut(BbcMachine* bbc, uint8_t value) {
+  if (bbc->hd.image_io && bbc->hd.pos < bbc->hd.length) {
+    bbc->hd.data[bbc->hd.pos] = value;
+    bbc->hd.dirty = true;
+  }
+  bbc->hd.pos++;
+  if (bbc->hd.remaining > 0) {
+    bbc->hd.remaining--;
+  }
+  if (bbc->hd.remaining == 0) {
+    HdFlush(bbc);
+    HdBeginStatus(bbc, 0x00);
+  }
+}
+
+static uint8_t HdStatusBits(const BbcMachine* bbc) {
+  uint8_t pins = HD_BSY | HD_VALID | HD_REQ;
+  if (bbc->hd.phase == HD_COMMAND || bbc->hd.phase == HD_STATUS || bbc->hd.phase == HD_MESSAGE) {
+    pins |= HD_CD;
+  }
+  if (bbc->hd.phase == HD_DATA_IN || bbc->hd.phase == HD_STATUS || bbc->hd.phase == HD_MESSAGE) {
+    pins |= HD_IO;
+  }
+  return pins;
+}
+
+static uint8_t HdReadReg(BbcMachine* bbc, int reg) {
+  if (reg == 1) {
+    return bbc->hd.phase == HD_FREE ? 0 : HdStatusBits(bbc);
+  }
+  if (reg != 0) {
+    return 0xff;
+  }
+  if (bbc->hd.phase == HD_DATA_IN) {
+    return HdTake(bbc);
+  }
+  if (bbc->hd.phase == HD_STATUS) {
+    bbc->hd.phase = HD_MESSAGE;
+    return bbc->hd.status_byte;
+  }
+  if (bbc->hd.phase == HD_MESSAGE) {
+    uint8_t message = 0;
+    HdFlush(bbc);
+    bbc->hd.phase = HD_FREE;
+    return message;
+  }
+  return bbc->hd.latch;
+}
+
+static void HdWriteReg(BbcMachine* bbc, int reg, uint8_t value) {
+  if (reg == 2) {
+    HdSelect(bbc);
+    return;
+  }
+  if (reg != 0) {
+    return;
+  }
+  bbc->hd.latch = value;
+  if (bbc->hd.phase == HD_DATA_OUT) {
+    HdPut(bbc, value);
+    return;
+  }
+  if (bbc->hd.phase != HD_COMMAND) {
+    return;
+  }
+  if (bbc->hd.cdb_i < 16) {
+    bbc->hd.cdb[bbc->hd.cdb_i++] = value;
+  }
+  if (bbc->hd.cdb_i == 1) {
+    bbc->hd.cdb_n = HdCdbLen(value);
+  }
+  if (bbc->hd.cdb_i >= bbc->hd.cdb_n) {
+    HdRun(bbc);
+  }
+}
+
+static bool ReadWholeFile(const char* path, uint8_t** out, size_t* length);
+
+// The OS offers the filing system to sideways ROMs from socket 15 downwards,
+// and the first one to claim it is the one that starts. DFS is fitted above
+// ADFS, so a hard disc would sit behind *ADFS. Move ADFS into that higher
+// socket. The socket's RAM flag stays put; only the image moves.
+static void PreferAdfsFilingSystem(BbcMachine* bbc) {
+  int adfs = -1;
+  int dfs = -1;
+  int slot;
+  uint8_t* image;
+  bool loaded;
+  uint8_t fs;
+  uint8_t fdc;
+  for (slot = 15; slot >= 0; slot--) {
+    if (adfs < 0 && bbc->rom_fs[slot] == BBC_FS_ADFS) {
+      adfs = slot;
+    }
+    if (dfs < 0 && bbc->rom_fs[slot] == BBC_FS_DFS) {
+      dfs = slot;
+    }
+  }
+  if (adfs < 0) {
+    if (bbc->any_sideways) {
+      fprintf(stderr, "Hard disc needs an ADFS ROM\n");
+    }
+    return;
+  }
+  if (dfs < 0 || adfs > dfs) {
+    return;
+  }
+  if (bbc->mapped_slot == adfs || bbc->mapped_slot == dfs) {
+    CommitSideways(bbc);
+    bbc->mapped_slot = -1;
+  }
+  image = bbc->sideways[adfs];
+  loaded = bbc->sideways_loaded[adfs];
+  fs = bbc->rom_fs[adfs];
+  fdc = bbc->rom_fdc[adfs];
+  bbc->sideways[adfs] = bbc->sideways[dfs];
+  bbc->sideways_loaded[adfs] = bbc->sideways_loaded[dfs];
+  bbc->rom_fs[adfs] = bbc->rom_fs[dfs];
+  bbc->rom_fdc[adfs] = bbc->rom_fdc[dfs];
+  bbc->sideways[dfs] = image;
+  bbc->sideways_loaded[dfs] = loaded;
+  bbc->rom_fs[dfs] = fs;
+  bbc->rom_fdc[dfs] = fdc;
+  MapRomsel(bbc);
+  fprintf(stderr, "ADFS is the filing system (socket %d)\n", dfs);
+}
+
+bool BbcMachineLoadHardDisc(BbcMachine* bbc, const char* path) {
+  char expanded[PATH_MAX];
+  const char* stored_path;
+  uint8_t* buf = NULL;
+  size_t length = 0;
+  size_t sectors;
+  char* stored;
+  if (bbc == NULL || path == NULL) {
+    return false;
+  }
+  stored_path = path;
+  if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
+    const char* home = HostHomeDirectory();
+    int written;
+    if (home != NULL && home[0] != '\0') {
+      written = snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
+      if (written > 0 && (size_t)written < sizeof(expanded)) {
+        stored_path = expanded;
+      }
+    }
+  }
+  if (!ReadWholeFile(stored_path, &buf, &length)) {
+    fprintf(stderr, "Unable to read hard disc image '%s'\n", path);
+    return false;
+  }
+  if ((length % 256u) != 0) {
+    free(buf);
+    fprintf(stderr, "Hard disc image '%s' is not a whole number of sectors\n", path);
+    return false;
+  }
+  sectors = length / 256u;
+  if (sectors == 0 || sectors > 0xffffffffu) {
+    free(buf);
+    fprintf(stderr, "Hard disc image '%s' has no sectors\n", path);
+    return false;
+  }
+  stored = strdup(stored_path);
+  if (stored == NULL) {
+    free(buf);
+    return false;
+  }
+  HdRelease(bbc);
+  bbc->hd.data = buf;
+  bbc->hd.length = length;
+  bbc->hd.sectors = (uint32_t)sectors;
+  bbc->hd.protect = access(stored, W_OK) != 0;
+  bbc->hd.path = stored;
+  fprintf(stderr, "Hard disc: %s (%lu sectors)\n", stored, (unsigned long)sectors);
+  PreferAdfsFilingSystem(bbc);
+  return true;
+}
+
 void BbcMachineWrite(BbcMachine* bbc, uint16_t addr, uint8_t value) {
   // ACCCON bit IFJ sends &FC00-&FDFF to the cartridge port. Nothing is fitted.
   if (bbc->master && (bbc->acccon & 0x20) != 0 && addr >= 0xfc00 && addr <= 0xfdff) {
     return;
   }
   if (addr >= 0xfc00 && addr <= 0xfcff) {
-    // &FCFF pages JIM. The rest of FRED is an empty 1 MHz bus: a write does
-    // not stick, so a probe cannot mistake it for a Winchester board.
+    // &FC40 is the Winchester adapter when a hard disc image is loaded.
+    // Everywhere else, including that page with no image, a write does not
+    // stick, so the ADFS probe does not see a board that is not there.
+    if (bbc->hd.data != NULL && addr >= 0xfc40 && addr <= 0xfc43) {
+      HdWriteReg(bbc, (int)(addr & 3), value);
+      return;
+    }
     if (addr == 0xfcff) {
       bbc->jim_page = value;
       bbc->fred[0xff] = value;
@@ -3837,6 +4258,9 @@ uint8_t BbcMachineRead(BbcMachine* bbc, uint16_t addr) {
     return 0xff;
   }
   if (addr >= 0xfc00 && addr <= 0xfcff) {
+    if (bbc->hd.data != NULL && addr >= 0xfc40 && addr <= 0xfc43) {
+      return HdReadReg(bbc, (int)(addr & 3));
+    }
     if ((addr & 0xff) == 0xff) {
       return bbc->fred[0xff];
     }
@@ -3949,7 +4373,8 @@ static void DrawBeamTeletext(BbcMachine* bbc, int x, int y, uint8_t byte, int ra
           }
         }
       } else {
-        uint16_t pattern = TeletextPattern(glyph, row, half, bbc->tt_double, bbc->tt_bottom);
+        uint16_t pattern =
+            TeletextPattern(glyph, row, half, bbc->tt_double, bbc->tt_bottom, bbc->keyboard);
         for (pix = 0; pix < ppc; pix++) {
           const uint8_t* colour =
               TeletextPixel(pattern, pix, ppc) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
@@ -5926,6 +6351,7 @@ void BbcMachineDestroy(BbcMachine* bbc) {
   TapeStop(bbc);
   EconetClose(bbc);
   DiscStop(bbc);
+  HdRelease(bbc);
   for (i = 0; i < 2; i++) {
     DiscRelease(&bbc->fdc.disc[i]);
     DiscRelease(&bbc->fdc.extra[i]);
@@ -5966,6 +6392,27 @@ void BbcMachineSetFire(BbcMachine* bbc, int button, bool down) {
     return;
   }
   bbc->fire[button] = down;
+}
+
+int BbcMachineParseKeyboard(const char* text) {
+  if (text != NULL && strcmp(text, "uk") == 0) {
+    return BBC_KEYBOARD_UK;
+  }
+  if (text != NULL && strcmp(text, "us") == 0) {
+    return BBC_KEYBOARD_US;
+  }
+  return -1;
+}
+
+void BbcMachineSetKeyboard(BbcMachine* bbc, int kind) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->keyboard = kind == BBC_KEYBOARD_US ? BBC_KEYBOARD_US : BBC_KEYBOARD_UK;
+}
+
+int BbcMachineKeyboard(const BbcMachine* bbc) {
+  return bbc == NULL ? BBC_KEYBOARD_UK : bbc->keyboard;
 }
 
 bool BbcMachineCapsLed(const BbcMachine* bbc) {

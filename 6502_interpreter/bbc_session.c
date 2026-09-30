@@ -13,6 +13,9 @@ bool g_ready = false;
 
 static char* g_rom_dir = NULL;
 static double g_screen_scale = 1.0;
+static bool g_game_caps = false;
+static int g_keyboard = BBC_KEYBOARD_UK;
+static bool g_keyboard_explicit = false;
 static BbcRomFile g_rom_files[BBC_ROM_IMAGE_MAX];
 static int g_rom_file_count = 0;
 
@@ -21,9 +24,11 @@ static void Usage(void) {
           "usage: bbc [-machine b|master|master128|master256] [-sram spec]\n"
           "           [-os file] [-rom slot,file] [-roms dir] [-mode 0-7]\n"
           "           [-disc file] [-disc0 file] [-disc1 file] [-disc-port n]\n"
+          "           [-hd file]\n"
           "           [-fdc 8271|1770] [-fs dfs|adfs] [-65c02]\n"
           "           [-tape file] [-tape-port n]\n"
-          "           [-printer file] [-mhz n] [-turbo] [-volume n]\n"
+          "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
+          "           [-keyboard uk|us]\n"
           "           [-econet station] [-econet-port n]\n"
           "       The default machine is the Model B. Its ROMs come from\n"
           "       bbc_b_rom_sockets. master and master128 use\n"
@@ -45,6 +50,10 @@ static void Usage(void) {
           "       connects to 127.0.0.1:8177. -disc-port chooses another port,\n"
           "       and -disc-port 0 closes the socket. -disc still mounts an\n"
           "       image before startup.\n"
+          "       -hd file mounts an ADFS hard disc, a file of 256-byte\n"
+          "       sectors. It is drive 0, and ADFS is the filing system that\n"
+          "       starts. *CAT or *MOUNT 0 selects it. Drives 4 and 5 stay\n"
+          "       the floppies.\n"
           "       cassette inserts a tape and records guest saves back into\n"
           "       the file. It connects to 127.0.0.1:8178. -tape-port 0 closes\n"
           "       that socket. -tape still loads a tape before startup.\n"
@@ -53,6 +62,13 @@ static void Usage(void) {
           "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
           "       of the wall clock. -volume n is 0 for silence through 11\n"
           "       for full volume. The default is 7.\n"
+          "       Each Caps Lock press toggles the BBC lock. -game-caps keeps\n"
+          "       the key down only while it is held, which games such as\n"
+          "       Zalaga read directly.\n"
+          "       -keyboard uk draws the BBC MODE 7 punctuation. { and } are\n"
+          "       the fraction signs there. -keyboard us draws the braces and\n"
+          "       brackets labelled on a US keyboard. With no flag, the choice\n"
+          "       follows the host keyboard.\n"
 #if defined(__APPLE__)
           "       -scale n sets the window size. 1 is 800 by 640. n is greater\n"
           "       than 0 and at most 4, so 1.5 is one and a half times that\n"
@@ -79,6 +95,18 @@ static void ReleaseRoms(void) {
 
 double BbcSessionScreenScale(void) { return g_screen_scale; }
 
+bool BbcSessionGameCaps(void) { return g_game_caps; }
+
+void BbcSessionPreferKeyboard(int kind) {
+  if (g_keyboard_explicit) {
+    return;
+  }
+  g_keyboard = kind == BBC_KEYBOARD_US ? BBC_KEYBOARD_US : BBC_KEYBOARD_UK;
+  if (g_cpu.bbc != NULL) {
+    BbcMachineSetKeyboard(g_cpu.bbc, g_keyboard);
+  }
+}
+
 void BbcSessionFinish(void) {
   g_ready = false;
   g_cpu.running = false;
@@ -94,6 +122,7 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   const char* rom_paths[16];
   int rom_count = 0;
   const char* disc_paths[2] = {NULL, NULL};
+  const char* hd_path = NULL;
   int disc_next = 0;
   int disc_port = CUMANA_PORT;
   bool disc_socket = true;
@@ -187,6 +216,13 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
       if (drive >= disc_next && disc_next < 2) {
         disc_next = drive + 1;
       }
+    } else if (strcmp(argv[i], "-hd") == 0 || strcmp(argv[i], "-bbc-hd") == 0) {
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      hd_path = argv[++i];
     } else if (strcmp(argv[i], "-disc-port") == 0) {
       char* end = NULL;
       long value;
@@ -359,6 +395,23 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         return false;
       }
       econet_port = (int)value;
+    } else if (strcmp(argv[i], "-game-caps") == 0 || strcmp(argv[i], "-bbc-game-caps") == 0) {
+      g_game_caps = true;
+    } else if (strcmp(argv[i], "-keyboard") == 0 || strcmp(argv[i], "-bbc-keyboard") == 0) {
+      int kind;
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      kind = BbcMachineParseKeyboard(argv[++i]);
+      if (kind < 0) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      g_keyboard = kind;
+      g_keyboard_explicit = true;
     } else if (strcmp(argv[i], "-turbo") == 0) {
       run_ahead = true;
     } else if (strcmp(argv[i], "-mhz") == 0) {
@@ -427,6 +480,7 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     fprintf(stderr, "Unable to select the BBC machine\n");
     goto fail;
   }
+  BbcMachineSetKeyboard(g_cpu.bbc, g_keyboard);
   if (sram_set && !BbcMachineSetSidewaysRam(g_cpu.bbc, sram)) {
     fprintf(stderr, "Unable to allocate sideways RAM\n");
     goto fail;
@@ -444,6 +498,9 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     if (disc_paths[i] != NULL && !W65C02InterpreterBbcLoadDisc(&g_cpu, i, disc_paths[i])) {
       goto fail;
     }
+  }
+  if (hd_path != NULL && !W65C02InterpreterBbcLoadHardDisc(&g_cpu, hd_path)) {
+    goto fail;
   }
   if (disc_socket) {
     int bound = BbcMachineListenDiscs(g_cpu.bbc, disc_port);

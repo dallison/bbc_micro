@@ -5,6 +5,7 @@
 //
 
 #import <AudioToolbox/AudioToolbox.h>
+#import <Carbon/Carbon.h>
 #import <Cocoa/Cocoa.h>
 
 #include "6502_interpreter.h"
@@ -107,9 +108,14 @@ static void ReleaseHostKey(unsigned short key_code) {
 
 // The Mac Caps Lock light toggles, and that flag changes only on the press.
 // A second flagsChanged arrives for the release with the flag left as it is.
-// Zalaga reads the key itself, so it has to be down only while held.
+// The MOS toggles its lock on the scan after it first sees the key, and only
+// while that key is still down. A typing press therefore stays down for two
+// frames and then comes up, so each press toggles once. Holding it for the
+// whole time the light is on toggles on the way on and misses the way off.
+// -game-caps leaves the key down for the whole hold, which Zalaga reads.
 static bool g_caps_flag = false;
 static bool g_caps_flag_ready = false;
+static int g_caps_pulse = 0;
 
 static void RememberCapsFlag(void) {
   if (g_caps_flag_ready) {
@@ -130,15 +136,32 @@ static void ApplyMomentaryModifiers(NSEventModifierFlags flags) {
 
 static void CapsLockEvent(NSEvent* event) {
   bool flag;
+  bool pressed;
   if (!g_ready || g_cpu.bbc == NULL) {
     return;
   }
   RememberCapsFlag();
   flag = (event.modifierFlags & NSEventModifierFlagCapsLock) != 0;
-  if (flag != g_caps_flag) {
-    g_caps_flag = flag;
-    BbcMachineSetKey(g_cpu.bbc, 0, 4, true);
-  } else {
+  pressed = flag != g_caps_flag;
+  if (!pressed) {
+    if (BbcSessionGameCaps()) {
+      BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
+    }
+    return;
+  }
+  g_caps_flag = flag;
+  BbcMachineSetKey(g_cpu.bbc, 0, 4, true);
+  if (!BbcSessionGameCaps()) {
+    g_caps_pulse = 2;
+  }
+}
+
+static void EndCapsPulse(void) {
+  if (g_caps_pulse <= 0 || g_cpu.bbc == NULL || BbcSessionGameCaps()) {
+    return;
+  }
+  g_caps_pulse--;
+  if (g_caps_pulse == 0) {
     BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
   }
 }
@@ -156,13 +179,16 @@ static void ReleaseStuckKeys(void) {
     g_held[i].used = false;
   }
   g_host_shift = false;
+  g_caps_pulse = 0;
   BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
   BbcMachineSetKey(g_cpu.bbc, 1, 0, false);
   SyncShift();
 }
 
-// Character the BBC prints for that matrix key. Shifted symbols are the MOS
-// bit-paired values (!"#$%&'() and so on), not the legends of a UK PC keyboard.
+// Matrix key for this character. Most shifted symbols are the MOS bit-paired
+// values. 3 and the pound key are the exception: shift-3 is 0x5F and shift of
+// the pound key is 0x23. The UK MODE 7 set draws those as # and the pound
+// sign, and the table follows that. A US keyboard asks for the ASCII code.
 static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
   static const int kDigit[10][2] = {
       {7, 2}, {0, 3}, {1, 3}, {1, 1}, {2, 1}, {3, 1}, {4, 3}, {4, 2}, {5, 1}, {6, 2},
@@ -189,6 +215,26 @@ static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
     *row = kDigit[ch - '0'][1];
     *need_shift = false;
     return true;
+  }
+  if (g_cpu.bbc != NULL && BbcMachineKeyboard(g_cpu.bbc) == BBC_KEYBOARD_US) {
+    if (ch == '#') {
+      *column = 8;
+      *row = 2;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '_') {
+      *column = 1;
+      *row = 1;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '`') {
+      *column = 8;
+      *row = 2;
+      *need_shift = false;
+      return true;
+    }
   }
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     if (keys[i].ch == ch) {
@@ -488,6 +534,7 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
       break;
     }
   }
+  EndCapsPulse();
   if (g_cpu.bbc == NULL) {
     return;
   }
@@ -708,9 +755,30 @@ static void UseHostFunctionKeys(bool enable) {
 
 @end
 
+static int HostKeyboard(void) {
+  TISInputSourceRef source = TISCopyCurrentKeyboardInputSource();
+  CFStringRef ident;
+  int kind = BBC_KEYBOARD_UK;
+  if (source == NULL) {
+    return kind;
+  }
+  ident = (CFStringRef)TISGetInputSourceProperty(source, kTISPropertyInputSourceID);
+  if (ident != NULL) {
+    if (CFStringFind(ident, CFSTR("British"), 0).location != kCFNotFound) {
+      kind = BBC_KEYBOARD_UK;
+    } else if (CFStringFind(ident, CFSTR("keylayout.US"), 0).location != kCFNotFound ||
+               CFStringCompare(ident, CFSTR("com.apple.keylayout.ABC"), 0) == kCFCompareEqualTo) {
+      kind = BBC_KEYBOARD_US;
+    }
+  }
+  CFRelease(source);
+  return kind;
+}
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     int status = 1;
+    BbcSessionPreferKeyboard(HostKeyboard());
     if (!BbcSessionStart(argc, argv, &status)) {
       return status;
     }

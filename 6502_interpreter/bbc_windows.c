@@ -27,6 +27,11 @@ typedef struct {
 
 static bool g_host_shift = false;
 static HeldKey g_held[16];
+// Typing presses stay down for two frames, then come up. The MOS toggles
+// Caps Lock on the scan after it first sees the key, so the click has to
+// outlast that scan. Holding the key for the whole time the light is on
+// toggles only on the way on.
+static int g_caps_pulse = 0;
 
 static HWND g_win = NULL;
 static bool g_running = true;
@@ -101,6 +106,7 @@ static void ReleaseAllKeys(void) {
   g_host_shift = false;
   g_fire0 = 0;
   g_fire1 = 0;
+  g_caps_pulse = 0;
   if (g_ready && g_cpu.bbc != NULL) {
     BbcMachineSetKey(g_cpu.bbc, 0, 0, false);
     BbcMachineSetKey(g_cpu.bbc, 1, 0, false);
@@ -136,6 +142,28 @@ static bool GlyphToBbc(unsigned ch, int* column, int* row, bool* need_shift) {
     *row = kDigit[ch - '0'][1];
     *need_shift = false;
     return true;
+  }
+  // Shift-3 is 0x5F and the pound key's shift is 0x23. UK MODE 7 draws those
+  // as # and the pound sign. US typing follows the ASCII code.
+  if (g_cpu.bbc != NULL && BbcMachineKeyboard(g_cpu.bbc) == BBC_KEYBOARD_US) {
+    if (ch == '#') {
+      *column = 8;
+      *row = 2;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '_') {
+      *column = 1;
+      *row = 1;
+      *need_shift = true;
+      return true;
+    }
+    if (ch == '`') {
+      *column = 8;
+      *row = 2;
+      *need_shift = false;
+      return true;
+    }
   }
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     if (keys[i].ch == ch) {
@@ -324,6 +352,21 @@ static void OnKey(UINT vk, LPARAM lparam, bool down) {
   if (g_cpu.bbc == NULL) {
     return;
   }
+  if (vk == VK_CAPITAL) {
+    if (down && (lparam & (1 << 30)) != 0) {
+      return;
+    }
+    if (BbcSessionGameCaps()) {
+      BbcMachineSetKey(g_cpu.bbc, 0, 4, down);
+      return;
+    }
+    if (!down) {
+      return;
+    }
+    BbcMachineSetKey(g_cpu.bbc, 0, 4, true);
+    g_caps_pulse = 2;
+    return;
+  }
   if (!down) {
     ReleaseHostKey(code);
     return;
@@ -489,7 +532,6 @@ static void ReadHostInput(void) {
     g_host_shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     SyncShift();
     BbcMachineSetKey(g_cpu.bbc, 1, 0, ControlHeld());
-    BbcMachineSetKey(g_cpu.bbc, 0, 4, (GetKeyState(VK_CAPITAL) & 1) != 0);
   }
   if (GetCursorPos(&p) && ScreenToClient(g_win, &p) && p.x >= 0 && p.y >= 0 &&
       p.x < g_client_w && p.y < g_client_h && g_client_w > 1 && g_client_h > 1) {
@@ -532,6 +574,12 @@ static void Tick(void) {
     }
     if (g_cpu.turbo && cycles > kFrameCycles && MonoNs() - started > 8000000ull) {
       break;
+    }
+  }
+  if (g_caps_pulse > 0 && g_cpu.bbc != NULL && !BbcSessionGameCaps()) {
+    g_caps_pulse--;
+    if (g_caps_pulse == 0) {
+      BbcMachineSetKey(g_cpu.bbc, 0, 4, false);
     }
   }
   if (g_cpu.bbc == NULL) {
@@ -758,6 +806,14 @@ int main(int argc, char** argv) {
   AttachParentConsole();
   if (!BbcSessionStart(argc, argv, &status)) {
     return status;
+  }
+  {
+    WORD lang = LOWORD(GetKeyboardLayout(0));
+    if (lang == 0x0409) {
+      BbcSessionPreferKeyboard(BBC_KEYBOARD_US);
+    } else if (lang == 0x0809) {
+      BbcSessionPreferKeyboard(BBC_KEYBOARD_UK);
+    }
   }
   if (!OpenWindow()) {
     fprintf(stderr, "bbc: unable to open the window\n");

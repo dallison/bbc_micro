@@ -131,6 +131,7 @@ bool W65C02InterpreterBbcLoadRom(W65C02Interpreter* interpreter, int slot,
                                  const char* path);
 bool W65C02InterpreterBbcLoadDisc(W65C02Interpreter* interpreter, int drive,
                                   const char* path);
+bool W65C02InterpreterBbcLoadHardDisc(W65C02Interpreter* interpreter, const char* path);
 void W65C02InterpreterBbcSetFdc(W65C02Interpreter* interpreter, int kind);
 // Keep the 65C02 when enable is true. The Model B default is the NMOS 6502.
 void W65C02InterpreterBbcUse65C02(W65C02Interpreter* interpreter, bool enable);

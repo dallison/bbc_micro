@@ -197,6 +197,8 @@ cc_binary(
             "-framework",
             "Cocoa",
             "-framework",
+            "Carbon",
+            "-framework",
             "AudioToolbox",
         ],
     }),

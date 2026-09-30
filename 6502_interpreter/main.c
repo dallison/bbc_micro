@@ -27,8 +27,8 @@ static void Usage() {
           "           [-bbc] [-bbc-machine b|master|master128|master256]\n"
           "           [-bbc-sram spec] [-bbc-mode 0-7] [-bbc-screen file.ppm]\n"
           "           [-bbc-os file] [-bbc-rom slot,file] [-bbc-roms dir]\n"
-          "           [-bbc-disc file] [-bbc-disc-port n] [-bbc-fdc 8271|1770]\n"
-          "           [-bbc-fs dfs|adfs]\n"
+          "           [-bbc-disc file] [-bbc-disc-port n] [-bbc-hd file] [-bbc-fdc 8271|1770]\n"
+          "           [-bbc-fs dfs|adfs] [-bbc-keyboard uk|us]\n"
           "           [-bbc-65c02] [-bbc-tape file] [-bbc-tape-port n]\n"
           "           [-bbc-printer file] [-bbc-2mhz] [-bbc-mhz n]\n"
           "           [-bbc-econet station] [-bbc-econet-port n]\n"
@@ -45,8 +45,13 @@ static void Usage() {
           "       DFS and ADFS ROMs are both fitted. The drive follows the one\n"
           "       the OS calls. -bbc-fs dfs or -bbc-fs adfs loads only that\n"
           "       filing system.\n"
+          "       -bbc-keyboard uk is the BBC MODE 7 punctuation, where { and }\n"
+          "       are the fraction signs. us draws the braces and brackets.\n"
           "       cumana inserts a disc while -bbc is running. It connects to\n"
           "       127.0.0.1:8177. -bbc-disc-port 0 closes that socket.\n"
+          "       -bbc-hd file mounts an ADFS hard disc, a file of 256-byte\n"
+          "       sectors. It is drive 0, and ADFS is the filing system that\n"
+          "       starts. *CAT or *MOUNT 0 selects it.\n"
           "       cassette inserts a tape. It connects to 127.0.0.1:8178.\n"
           "       -bbc-tape-port 0 closes that socket. -bbc-tape still loads a\n"
           "       tape before the machine starts.\n"
@@ -209,6 +214,7 @@ int main(int argc, char *argv[]) {
   const char* rom_paths[16];
   int rom_count = 0;
   const char* disc_paths[2] = {NULL, NULL};
+  const char* hd_path = NULL;
   int disc_next = 0;
   int disc_port = CUMANA_PORT;
   bool disc_socket = true;
@@ -216,6 +222,7 @@ int main(int argc, char *argv[]) {
   bool tape_socket = true;
   int fdc_kind = 0;
   int filing = BBC_FS_ANY;
+  int bbc_keyboard = BBC_KEYBOARD_UK;
   bool bbc_65c02 = false;
   int bbc_mhz = 0;
   int bbc_model = BBC_MACHINE_B;
@@ -324,6 +331,12 @@ int main(int argc, char *argv[]) {
           disc_next = drive + 1;
         }
         bbc = true;
+      } else if (strcmp(argv[i], "-bbc-hd") == 0 || strcmp(argv[i], "-hd") == 0) {
+        if (i == argc - 1) {
+          Usage();
+        }
+        hd_path = argv[++i];
+        bbc = true;
       } else if (strcmp(argv[i], "-bbc-disc-port") == 0) {
         char* end = NULL;
         long value;
@@ -386,6 +399,15 @@ int main(int argc, char *argv[]) {
         }
         filing = BbcMachineParseFilingSystem(argv[++i]);
         if (filing < 0) {
+          Usage();
+        }
+        bbc = true;
+      } else if (strcmp(argv[i], "-bbc-keyboard") == 0) {
+        if (i == argc - 1) {
+          Usage();
+        }
+        bbc_keyboard = BbcMachineParseKeyboard(argv[++i]);
+        if (bbc_keyboard < 0) {
           Usage();
         }
         bbc = true;
@@ -543,6 +565,7 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Unable to select the BBC machine\n");
       exit(1);
     }
+    BbcMachineSetKeyboard(interpreter.bbc, bbc_keyboard);
     if (bbc_sram_set && !BbcMachineSetSidewaysRam(interpreter.bbc, bbc_sram)) {
       fprintf(stderr, "Unable to allocate sideways RAM\n");
       exit(1);
@@ -561,6 +584,9 @@ int main(int argc, char *argv[]) {
           !W65C02InterpreterBbcLoadDisc(&interpreter, r, disc_paths[r])) {
         exit(1);
       }
+    }
+    if (hd_path != NULL && !W65C02InterpreterBbcLoadHardDisc(&interpreter, hd_path)) {
+      exit(1);
     }
     if (bbc_econet != 0) {
       int bound = BbcMachineOpenEconet(interpreter.bbc, bbc_econet, bbc_econet_port);

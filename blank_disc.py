@@ -8,6 +8,7 @@ The filename extension selects the format:
   .adf  ADFS, one side (40 tracks is S, 80 tracks is M)
   .adm  ADFS, one side, same layout as .adf
   .adl  ADFS, two sides (80 tracks is L)
+  .hd   ADFS hard disc, 256-byte sectors (default 10 MiB)
 
 Examples:
 
@@ -15,6 +16,7 @@ Examples:
   python3 blank_disc.py --tracks 40 blank.ssd
   python3 blank_disc.py blank.adf
   python3 blank_disc.py blank.adl
+  python3 blank_disc.py --sectors 1024 blank.hd
 """
 
 import argparse
@@ -75,18 +77,30 @@ def geometry(path, tracks):
         return "ADFS", 1, tracks * 16
     if name.endswith(".adl"):
         return "ADFS", 2, tracks * 32
+    if name.endswith(".hd"):
+        return "ADFS hard disc", 0, 0
     return None, 0, 0
 
 
 def main(argv):
     parser = argparse.ArgumentParser(description="Create a blank BBC DFS or ADFS disc image.")
-    parser.add_argument("image", help="output file, named .ssd, .dsd, .adf, .adm, or .adl")
+    parser.add_argument("image", help="output file, named .ssd, .dsd, .adf, .adm, .adl, or .hd")
     parser.add_argument("--tracks", type=int, default=80, choices=(40, 80),
                         help="40 or 80 tracks (default 80)")
+    parser.add_argument("--sectors", type=int, default=40960,
+                        help="hard disc size in 256-byte sectors (.hd, default 40960)")
     args = parser.parse_args(argv)
     kind, sides, sectors = geometry(args.image, args.tracks)
     if kind is None:
-        parser.error("filename must end in .ssd, .dsd, .adf, .adm, or .adl")
+        parser.error("filename must end in .ssd, .dsd, .adf, .adm, .adl, or .hd")
+    if kind == "ADFS hard disc":
+        if args.sectors < 8 or args.sectors > 0xFFFFFF:
+            parser.error("--sectors must be from 8 to 16777215")
+        data = make_adfs(args.sectors)
+        with open(args.image, "wb") as out:
+            out.write(data)
+        print("%s: ADFS hard disc, %d sectors, %d bytes" % (args.image, args.sectors, len(data)))
+        return 0
     if kind == "DFS":
         data = make_dfs(args.tracks, sides)
     else:

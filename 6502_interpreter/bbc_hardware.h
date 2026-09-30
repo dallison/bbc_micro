@@ -112,6 +112,11 @@ bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path);
 #define BBC_FDC_8271 1
 #define BBC_FDC_1770 2
 bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path);
+// ADFS hard disc: a file of 256-byte sectors on the Acorn Winchester
+// adapter at &FC40. ADFS calls it drive 0, and loading the image puts the
+// ADFS ROM above DFS so ADFS is the filing system that starts. Writes go
+// back to the file.
+bool BbcMachineLoadHardDisc(BbcMachine* bbc, const char* path);
 // Listen on 127.0.0.1 for cumana. port 0 lets the kernel choose. Returns the
 // bound port, or -1 when the socket cannot be opened. DFS clients use drives
 // 0-3; ADFS clients use 0 and 1. Closing the connection ejects the disc.
@@ -178,6 +183,14 @@ void BbcMachineSetKey(BbcMachine* bbc, int column, int row, bool down);
 // Channel 0-3, value 0-65535. Fire buttons are active when down.
 void BbcMachineSetAnalogue(BbcMachine* bbc, int channel, int value);
 void BbcMachineSetFire(BbcMachine* bbc, int button, bool down);
+// MODE 7 punctuation. UK is the BBC's SAA5050 set, where { and } are the
+// fraction signs. US draws the braces, brackets, and the other ASCII marks.
+#define BBC_KEYBOARD_UK 0
+#define BBC_KEYBOARD_US 1
+// "uk" or "us". Returns -1 when unknown.
+int BbcMachineParseKeyboard(const char* text);
+void BbcMachineSetKeyboard(BbcMachine* bbc, int kind);
+int BbcMachineKeyboard(const BbcMachine* bbc);
 bool BbcMachineCapsLed(const BbcMachine* bbc);
 bool BbcMachineShiftLed(const BbcMachine* bbc);
 bool BbcMachineMotorOn(const BbcMachine* bbc);
