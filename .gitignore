@@ -3,7 +3,11 @@
 
 # CMake out-of-tree build directories
 /build/
+/build-win/
 /cmake-build*/
+
+# Cross compiler and Wine fetched by windows_tools.sh
+/.wintools/
 
 # Compiled object and archive artifacts
 *.o

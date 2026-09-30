@@ -13,15 +13,14 @@
 #ifndef cumana_h
 #define cumana_h
 
+#include "bbc_platform.h"
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,14 +52,10 @@ typedef int (*CumanaReadFn)(void* ctx, void* buf, size_t n);
 static inline int CumanaSendAll(int fd, const void* data, size_t length) {
   const uint8_t* bytes = (const uint8_t*)data;
   size_t off = 0;
-  int flags = 0;
-#ifdef MSG_NOSIGNAL
-  flags = MSG_NOSIGNAL;
-#endif
   while (off < length) {
-    ssize_t n = send(fd, bytes + off, length - off, flags);
+    ssize_t n = SocketWrite(fd, bytes + off, length - off);
     if (n < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;
@@ -77,9 +72,9 @@ static inline int CumanaReadAll(int fd, void* data, size_t length) {
   uint8_t* bytes = (uint8_t*)data;
   size_t off = 0;
   while (off < length) {
-    ssize_t n = read(fd, bytes + off, length - off);
+    ssize_t n = SocketRead(fd, bytes + off, length - off);
     if (n < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;

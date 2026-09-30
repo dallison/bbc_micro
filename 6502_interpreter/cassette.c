@@ -10,13 +10,7 @@
 
 #include "cassette.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <poll.h>
-#include <sys/socket.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,13 +42,19 @@ static int ParsePort(const char* text) {
 
 static const char* BaseName(const char* path) {
   const char* slash = strrchr(path, '/');
+#ifdef _WIN32
+  const char* backslash = strrchr(path, '\\');
+  if (backslash != NULL && (slash == NULL || backslash > slash)) {
+    slash = backslash;
+  }
+#endif
   if (slash != NULL && slash[1] != '\0') {
     return slash + 1;
   }
   return path;
 }
 
-static int ReadFile(const char* path, uint8_t** data, size_t* length) {
+static int ReadWholeFile(const char* path, uint8_t** data, size_t* length) {
   FILE* fp;
   long size;
   uint8_t* buf;
@@ -94,23 +94,72 @@ static int ConnectTo(const char* host, int port) {
   int fd;
   struct sockaddr_in addr;
   int one = 1;
-  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
   }
 #ifdef SO_NOSIGPIPE
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   if (inet_pton(AF_INET, host, &addr.sin_addr) != 1 ||
       connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   return fd;
+}
+
+// Waits for the emulator or a key. Returns the socket's poll events, with
+// *key set to the key or -1. Returns -1 when the wait fails or the
+// terminal closes.
+static int Wait(int fd, int tty, int* key) {
+  struct pollfd pfd[2];
+  *key = -1;
+  pfd[0].fd = fd;
+  pfd[0].events = POLLIN;
+  pfd[0].revents = 0;
+#ifdef _WIN32
+  // WSAPoll takes only sockets, so the console is read between short waits.
+  if (SocketPoll(pfd, 1, tty ? 100 : -1) < 0) {
+    return -1;
+  }
+  if (tty) {
+    uint8_t ch;
+    if (HostStdinByte(&ch)) {
+      *key = ch;
+    }
+  }
+#else
+  {
+    int nfds = 1;
+    if (tty) {
+      pfd[1].fd = 0;
+      pfd[1].events = POLLIN;
+      pfd[1].revents = 0;
+      nfds = 2;
+    }
+    while (poll(pfd, (nfds_t)nfds, -1) < 0) {
+      if (errno != EINTR) {
+        return -1;
+      }
+    }
+    if (tty && (pfd[1].revents & POLLIN) != 0) {
+      char ch = 0;
+      if (read(0, &ch, 1) <= 0) {
+        return -1;
+      }
+      *key = (unsigned char)ch;
+    }
+  }
+#endif
+  return pfd[0].revents;
 }
 
 static int WriteBack(const char* path, const uint8_t* data, size_t length) {
@@ -178,7 +227,7 @@ int main(int argc, char** argv) {
     Usage();
     return 1;
   }
-  if (ReadFile(path, &image, &length) != 0) {
+  if (ReadWholeFile(path, &image, &length) != 0) {
     if (protect) {
       fprintf(stderr, "Unable to read %s\n", path);
       return 1;
@@ -197,14 +246,14 @@ int main(int argc, char** argv) {
   if (CassetteSendInsert(fd, protect, BaseName(path), image, length) != 0 ||
       CassetteReadReply(fd, &code, reply, sizeof(reply)) != 0) {
     fprintf(stderr, "The emulator did not accept %s\n", path);
-    close(fd);
+    SocketClose(fd);
     free(image);
     return 1;
   }
   free(image);
   if (code != CASSETTE_OK) {
     fprintf(stderr, "Refused: %s\n", reply[0] != '\0' ? reply : "tape not inserted");
-    close(fd);
+    SocketClose(fd);
     return 1;
   }
   fprintf(stderr, "Tape: %s%s\n", path, protect ? " (read only)" : "");
@@ -213,41 +262,21 @@ int main(int argc, char** argv) {
     fprintf(stderr, "r rewinds, q ejects\n");
   }
   for (;;) {
-    struct pollfd pfd[2];
-    int ready;
-    int nfds = 1;
-    pfd[0].fd = fd;
-    pfd[0].events = POLLIN;
-    pfd[0].revents = 0;
-    if (tty) {
-      pfd[1].fd = 0;
-      pfd[1].events = POLLIN;
-      pfd[1].revents = 0;
-      nfds = 2;
-    }
-    ready = poll(pfd, (nfds_t)nfds, -1);
-    if (ready < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
+    int key;
+    int events = Wait(fd, tty, &key);
+    if (events < 0) {
       break;
     }
-    if (tty && (pfd[1].revents & POLLIN) != 0) {
-      char ch = 0;
-      if (read(0, &ch, 1) <= 0) {
+    if (key == 'r' || key == 'R') {
+      unsigned char rewind = CASSETTE_REWIND;
+      if (CassetteSendAll(fd, &rewind, 1) != 0) {
         break;
       }
-      if (ch == 'r' || ch == 'R') {
-        unsigned char rewind = CASSETTE_REWIND;
-        if (CassetteSendAll(fd, &rewind, 1) != 0) {
-          break;
-        }
-        fprintf(stderr, "Rewound\n");
-      } else if (ch == 'q' || ch == 'Q') {
-        break;
-      }
+      fprintf(stderr, "Rewound\n");
+    } else if (key == 'q' || key == 'Q') {
+      break;
     }
-    if ((pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+    if ((events & (POLLIN | POLLHUP | POLLERR)) == 0) {
       continue;
     }
     {
@@ -267,7 +296,7 @@ int main(int argc, char** argv) {
       }
     }
   }
-  close(fd);
+  SocketClose(fd);
   fprintf(stderr, "Tape ejected\n");
   return 0;
 }

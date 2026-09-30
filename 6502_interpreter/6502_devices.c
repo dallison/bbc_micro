@@ -7,10 +7,10 @@
 //
 
 #include "6502_devices.h"
+#include "bbc_platform.h"
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <sys/poll.h>
 
 static bool ConsoleClaim(Device* dev, uint16_t addr) {
   ACIADevice* acia = (ACIADevice*)dev;
@@ -38,8 +38,7 @@ static int ConsoleRead(Device* dev, uint16_t addr) {
   }
   if (addr == acia->csr_addr) {
     int result = 2;   // TDRE
-    struct pollfd fd = {0, POLLIN, 0};    // Poll for stdin.
-    if (poll(&fd, 1, 0) == 1) {
+    if (HostStdinReady()) {
       result |= 1;  // Can read.
     }
     return result;

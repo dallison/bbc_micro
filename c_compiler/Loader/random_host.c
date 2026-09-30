@@ -1,10 +1,35 @@
+#ifdef _WIN32
+#define _CRT_RAND_S
+#endif
+
 #include "random_host.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+int DaveHostRandomBytes(void* buffer, size_t size) {
+  uint8_t* output = buffer;
+  if (size != 0 && buffer == NULL) {
+    return -1;
+  }
+  while (size != 0) {
+    unsigned int value;
+    size_t n = size < sizeof(value) ? size : sizeof(value);
+    if (rand_s(&value) != 0) {
+      return -1;
+    }
+    memcpy(output, &value, n);
+    output += n;
+    size -= n;
+  }
+  return 0;
+}
+#else
 int DaveHostRandomBytes(void* buffer, size_t size) {
   if (size != 0 && buffer == NULL) {
     return -1;
@@ -42,3 +67,4 @@ int DaveHostRandomBytes(void* buffer, size_t size) {
   }
   return 0;
 }
+#endif

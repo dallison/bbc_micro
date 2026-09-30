@@ -883,20 +883,32 @@ static int ConvertOpenFlags(int in_flags) {
   }
   CVTFLAG(O_CREAT);
   CVTFLAG(O_EXCL);
+#if defined(O_NOCTTY)
   CVTFLAG(O_NOCTTY);
+#endif
   CVTFLAG(O_TRUNC);
   CVTFLAG(O_APPEND);
+#if defined(O_NONBLOCK)
   CVTFLAG(O_NONBLOCK)
+#endif
+#if defined(O_SYNC)
   CVTFLAG(O_SYNC);
+#endif
+#if defined(FASYNC)
   CVTFLAG(FASYNC);
+#endif
 #if defined(O_DIRECT)
   CVTFLAG(O_DIRECT);
 #endif
 #if defined(O_LARGEFILE)
   CVTFLAG(O_LARGEFILE);
 #endif
+#if defined(O_DIRECTORY)
   CVTFLAG(O_DIRECTORY);
+#endif
+#if defined(O_NOFOLLOW)
   CVTFLAG(O_NOFOLLOW);
+#endif
 #if defined(O_NOATIME)
   CVTFLAG(O_NOATIME);
 #endif

@@ -137,6 +137,7 @@ cc_binary(
 cc_binary(
     name = "cumana",
     srcs = [
+        "6502_interpreter/bbc_platform.h",
         "6502_interpreter/cumana.c",
         "6502_interpreter/cumana.h",
     ],
@@ -147,6 +148,7 @@ cc_binary(
 cc_binary(
     name = "cassette",
     srcs = [
+        "6502_interpreter/bbc_platform.h",
         "6502_interpreter/cassette.c",
         "6502_interpreter/cassette.h",
     ],

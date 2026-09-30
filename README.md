@@ -27,7 +27,11 @@ ctest --test-dir build
 sudo apt install build-essential cmake libx11-dev libasound2-dev
 ```
 
-`libasound2-dev` is only for sound. Step-by-step Ubuntu and Debian instructions are in [LINUX.md](LINUX.md). `6502` is the headless interpreter and is the program davecc uses to run a 65C02 executable. On the command line it is still named `6502`.
+`libasound2-dev` is only for sound. Step-by-step Ubuntu and Debian instructions are in [LINUX.md](LINUX.md).
+
+On Windows `bbc.exe` uses GDI and waveOut, which every install has. It builds with MinGW-w64 under MSYS2, or on Linux with a cross compiler, and runs there under Wine. Both are in [WINDOWS.md](WINDOWS.md).
+
+`6502` is the headless interpreter and is the program davecc uses to run a 65C02 executable. On the command line it is still named `6502`.
 
 ## ROMs
 

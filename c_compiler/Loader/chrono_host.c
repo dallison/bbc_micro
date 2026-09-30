@@ -13,6 +13,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+// A zoneinfo tree on Windows has no symbolic links.
+#define S_ISLNK(mode) 0
+
+static int lstat(const char* path, struct stat* value) {
+  return stat(path, value);
+}
+#endif
+
 enum { DAVE_TZIF_MAGIC_SIZE = 4 };
 enum { DAVE_TZIF_HEADER_SIZE = 44 };
 enum { DAVE_TZIF_TTINFO_SIZE = 6 };

@@ -5,23 +5,19 @@
 
 #include "bbc_hardware.h"
 #include "bbc_font.h"
+#include "bbc_platform.h"
 #include "cassette.h"
 #include "cumana.h"
 
-#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -993,7 +989,7 @@ static bool CursorBlinkOn(const BbcMachine* bbc) {
   return true;
 }
 
-static void InvertRect(BbcMachine* bbc, int x, int y, int w, int h) {
+static void InvertBlock(BbcMachine* bbc, int x, int y, int w, int h) {
   int yy, xx;
   for (yy = 0; yy < h; yy++) {
     for (xx = 0; xx < w; xx++) {
@@ -1052,7 +1048,7 @@ static void DrawCursorBar(BbcMachine* bbc, uint16_t ma, int x, int y, int w, int
     end = scanlines - 1;
   }
   // Two framebuffer lines per character row, so the underline covers both.
-  InvertRect(bbc, x, y + start * 2, w, (end - start + 1) * 2);
+  InvertBlock(bbc, x, y + start * 2, w, (end - start + 1) * 2);
 }
 
 static void FillCell(BbcMachine* bbc, int x, int y, int w, int h, const uint8_t rgb[3]) {
@@ -1517,7 +1513,6 @@ static void AcaiWriteData(BbcMachine* bbc, uint8_t value) {
 }
 
 static void AcaiAdvance(BbcMachine* bbc, int cycles) {
-  struct pollfd fd;
   uint8_t ch;
   if ((bbc->acia_control & 0x03) == 0x03) {
     return;
@@ -1575,10 +1570,7 @@ static void AcaiAdvance(BbcMachine* bbc, int cycles) {
     bbc->acia_dcd = false;
     return;
   }
-  fd.fd = 0;
-  fd.events = POLLIN;
-  fd.revents = 0;
-  if (poll(&fd, 1, 0) != 1 || read(0, &ch, 1) != 1) {
+  if (!HostStdinByte(&ch)) {
     return;
   }
   bbc->acia_rx = ch;
@@ -2043,7 +2035,7 @@ static void DiscFlushImage(BbcDiscImage* image) {
   }
   if (image->fd >= 0) {
     if (CumanaSendImage(image->fd, image->data, image->length) != 0) {
-      close(image->fd);
+      SocketClose(image->fd);
       image->fd = -1;
     }
     return;
@@ -3028,7 +3020,7 @@ static void TapeStop(BbcMachine* bbc);
 static pthread_mutex_t g_econet_mu = PTHREAD_MUTEX_INITIALIZER;
 static BbcMachine* g_econet_peers[16];
 static int g_econet_peers_n = 0;
-static uint32_t g_econet_next_instance = 1;
+static uint32_t g_econet_next_instance = 0;
 
 static void EconetRefreshIrq(BbcMachine* bbc);
 
@@ -3237,7 +3229,7 @@ static void EconetPublish(BbcMachine* bbc, const uint8_t* data, int len) {
   dest.sin_family = AF_INET;
   dest.sin_port = htons((uint16_t)bbc->econet.port);
   inet_pton(AF_INET, ECONET_GROUP, &dest.sin_addr);
-  sendto(bbc->econet.fd, packet, (size_t)(14 + len), 0, (struct sockaddr*)&dest, sizeof(dest));
+  sendto(bbc->econet.fd, (const char*)packet, 14 + len, 0, (struct sockaddr*)&dest, sizeof(dest));
 }
 
 static void EconetPoll(BbcMachine* bbc) {
@@ -3246,7 +3238,7 @@ static void EconetPoll(BbcMachine* bbc) {
   }
   for (;;) {
     uint8_t buf[14 + ECONET_MAX_FRAME];
-    ssize_t n = recvfrom(bbc->econet.fd, buf, sizeof(buf), 0, NULL, NULL);
+    ssize_t n = recvfrom(bbc->econet.fd, (char*)buf, (int)sizeof(buf), 0, NULL, NULL);
     uint32_t instance;
     int len;
     if (n < 0) {
@@ -3548,7 +3540,7 @@ static void EconetClose(BbcMachine* bbc) {
   }
   EconetLeave(bbc);
   if (bbc->econet.fd >= 0) {
-    close(bbc->econet.fd);
+    SocketClose(bbc->econet.fd);
     bbc->econet.fd = -1;
   }
   bbc->econet.fitted = false;
@@ -3557,38 +3549,35 @@ static void EconetClose(BbcMachine* bbc) {
 static int EconetBind(BbcMachine* bbc, int port) {
   int fd;
   int on = 1;
-  int flags;
-  unsigned char loop = 0;
   struct sockaddr_in addr;
   struct ip_mreq mreq;
-  fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     return -1;
   }
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
 #ifdef SO_REUSEPORT
-  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   memset(&mreq, 0, sizeof(mreq));
   inet_pton(AF_INET, ECONET_GROUP, &mreq.imr_multiaddr);
   mreq.imr_interface.s_addr = htonl(INADDR_ANY);
-  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) != 0) {
-    close(fd);
+  if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq)) != 0) {
+    SocketClose(fd);
     return -1;
   }
-  setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
-  flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) {
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  }
+  SocketSetNonBlocking(fd);
   bbc->econet.fd = fd;
   return 0;
 }
@@ -3608,7 +3597,13 @@ int BbcMachineOpenEconet(BbcMachine* bbc, int station, int port) {
     bbc->cmos[14] = (uint8_t)station;
   }
   pthread_mutex_lock(&g_econet_mu);
-  bbc->econet.instance = g_econet_next_instance++;
+  // Every process on the wire hears every frame, its own included, and
+  // drops the ones whose instance is local. Instances must differ between
+  // processes, so they start from the process id.
+  if (g_econet_next_instance == 0) {
+    g_econet_next_instance = HostProcessId() << 10;
+  }
+  bbc->econet.instance = ++g_econet_next_instance;
   if (g_econet_peers_n < 16) {
     g_econet_peers[g_econet_peers_n++] = bbc;
   }
@@ -4426,12 +4421,12 @@ bool BbcMachineWritePpm(BbcMachine* bbc, const char* path) {
   return true;
 }
 
-static bool ReadFile(const char* path, uint8_t** out, size_t* length) {
+static bool ReadWholeFile(const char* path, uint8_t** out, size_t* length) {
   char expanded[PATH_MAX];
   FILE* fp;
   // The shell does not expand ~ after the comma in -rom 15,~/file.
   if (path != NULL && path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
-    const char* home = getenv("HOME");
+    const char* home = HostHomeDirectory();
     int written;
     if (home != NULL && home[0] != '\0') {
       written = snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
@@ -4480,7 +4475,7 @@ bool BbcMachineLoadOs(BbcMachine* bbc, const char* path) {
   if (bbc->ram == NULL || path == NULL) {
     return false;
   }
-  if (!ReadFile(path, &buf, &length)) {
+  if (!ReadWholeFile(path, &buf, &length)) {
     fprintf(stderr, "Unable to read BBC OS ROM '%s'\n", path);
     return false;
   }
@@ -4615,7 +4610,7 @@ static void DiscRelease(BbcDiscImage* image) {
   }
   if (image->fd >= 0) {
     shutdown(image->fd, SHUT_RDWR);
-    close(image->fd);
+    SocketClose(image->fd);
     image->fd = -1;
   }
   free(image->data);
@@ -4683,7 +4678,7 @@ bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path) {
   }
   stored = path;
   if (path[0] == '~' && (path[1] == '/' || path[1] == '\0')) {
-    const char* home = getenv("HOME");
+    const char* home = HostHomeDirectory();
     int written;
     if (home != NULL && home[0] != '\0') {
       written = snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
@@ -4692,7 +4687,7 @@ bool BbcMachineLoadDisc(BbcMachine* bbc, int drive, const char* path) {
       }
     }
   }
-  if (!ReadFile(stored, &buf, &length)) {
+  if (!ReadWholeFile(stored, &buf, &length)) {
     fprintf(stderr, "Unable to read disc image '%s'\n", path);
     return false;
   }
@@ -4725,9 +4720,9 @@ static int DiscPullRead(void* ctx, void* buf, size_t n) {
     }
     pfd.fd = pull->fd;
     pfd.events = POLLIN;
-    ready = poll(&pfd, 1, 200);
+    ready = SocketPoll(&pfd, 1, 200);
     if (ready < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;
@@ -4741,9 +4736,9 @@ static int DiscPullRead(void* ctx, void* buf, size_t n) {
     if ((pfd.revents & (POLLIN | POLLHUP)) == 0) {
       continue;
     }
-    got = read(pull->fd, bytes + off, n - off);
+    got = SocketRead(pull->fd, bytes + off, n - off);
     if (got < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;
@@ -4762,7 +4757,7 @@ static void DiscEnqueue(BbcMachine* bbc, int fd, CumanaInsert* insert) {
   if (item == NULL) {
     CumanaSendReply(fd, CUMANA_ERR, -1, "out of memory");
     CumanaInsertFree(insert);
-    close(fd);
+    SocketClose(fd);
     return;
   }
   item->fd = fd;
@@ -4800,9 +4795,9 @@ static void* DiscListenMain(void* arg) {
       int ready;
       listen_pfd.fd = bbc->disc_listen_fd;
       listen_pfd.events = POLLIN;
-      ready = poll(&listen_pfd, 1, 200);
+      ready = SocketPoll(&listen_pfd, 1, 200);
       if (ready < 0) {
-        if (errno == EINTR) {
+        if (SocketInterrupted()) {
           continue;
         }
         break;
@@ -4811,9 +4806,9 @@ static void* DiscListenMain(void* arg) {
         continue;
       }
     }
-    fd = accept(bbc->disc_listen_fd, (struct sockaddr*)&addr, &len);
+    fd = (int)accept(bbc->disc_listen_fd, (struct sockaddr*)&addr, &len);
     if (fd < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (SocketWouldBlock()) {
         continue;
       }
       pthread_mutex_lock(&bbc->disc_mu);
@@ -4829,14 +4824,14 @@ static void* DiscListenMain(void* arg) {
 #ifdef SO_NOSIGPIPE
       setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     }
     pthread_mutex_lock(&bbc->disc_mu);
     bbc->disc_handshake_fd = fd;
     stop = bbc->disc_listen_stop;
     pthread_mutex_unlock(&bbc->disc_mu);
     if (stop) {
-      close(fd);
+      SocketClose(fd);
       break;
     }
     {
@@ -4845,11 +4840,11 @@ static void* DiscListenMain(void* arg) {
       pull.bbc = bbc;
       pull.fd = fd;
       if (CumanaReadInsert(DiscPullRead, &pull, &insert) != 0) {
-        close(fd);
+        SocketClose(fd);
       } else if (insert.drive > 3) {
         CumanaSendReply(fd, CUMANA_ERR, -1, "drive must be 0, 1, 2, or 3");
         CumanaInsertFree(&insert);
-        close(fd);
+        SocketClose(fd);
       } else {
         DiscEnqueue(bbc, fd, &insert);
       }
@@ -4867,7 +4862,7 @@ static void DiscDropPending(struct CumanaPending* pending) {
   while (pending != NULL) {
     struct CumanaPending* next = pending->next;
     if (pending->fd >= 0) {
-      close(pending->fd);
+      SocketClose(pending->fd);
     }
     CumanaInsertFree(&pending->insert);
     free(pending);
@@ -4893,7 +4888,7 @@ static void DiscStop(BbcMachine* bbc) {
   }
   pthread_join(bbc->disc_listen_thread, NULL);
   if (bbc->disc_listen_fd >= 0) {
-    close(bbc->disc_listen_fd);
+    SocketClose(bbc->disc_listen_fd);
     bbc->disc_listen_fd = -1;
   }
   pthread_mutex_lock(&bbc->disc_mu);
@@ -4913,11 +4908,20 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
   if (bbc == NULL || bbc->disc_listen_started || port < 0 || port > 65535) {
     return -1;
   }
-  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
   }
+  // On Windows SO_REUSEADDR lets a second listener take a port already in
+  // use, so a second emulator would steal the disc socket.
+#ifdef _WIN32
+  setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof(one));
+#else
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
 #ifdef SO_NOSIGPIPE
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
@@ -4926,16 +4930,16 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   len = sizeof(addr);
   if (getsockname(fd, (struct sockaddr*)&addr, &len) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   if (pthread_mutex_init(&bbc->disc_mu, NULL) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   bbc->disc_listen_fd = fd;
@@ -4947,7 +4951,7 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
   if (pthread_create(&bbc->disc_listen_thread, NULL, DiscListenMain, bbc) != 0) {
     bbc->disc_listen_started = false;
     pthread_mutex_destroy(&bbc->disc_mu);
-    close(fd);
+    SocketClose(fd);
     bbc->disc_listen_fd = -1;
     return -1;
   }
@@ -5017,14 +5021,14 @@ static void DiscWatch(BbcDiscImage* image) {
   }
   pfd.fd = image->fd;
   pfd.events = POLLIN;
-  if (poll(&pfd, 1, 0) <= 0) {
+  if (SocketPoll(&pfd, 1, 0) <= 0) {
     return;
   }
   if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
     return;
   }
-  n = read(image->fd, drain, sizeof(drain));
-  if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+  n = SocketRead(image->fd, drain, sizeof(drain));
+  if (n == 0 || (n < 0 && !SocketWouldBlock())) {
     DiscRelease(image);
   }
 }
@@ -5060,11 +5064,11 @@ static void DiscService(BbcMachine* bbc) {
     drive = DiscChoose(bbc, &pending->insert, &error);
     if (drive < 0) {
       CumanaSendReply(fd, CUMANA_ERR, -1, error != NULL ? error : "disc not inserted");
-      close(fd);
+      SocketClose(fd);
       free(data);
     } else if (!DiscMount(bbc, drive, data, length, name, protect, fd)) {
       CumanaSendReply(fd, CUMANA_ERR, -1, "disc not inserted");
-      close(fd);
+      SocketClose(fd);
       free(data);
     } else if (CumanaSendReply(fd, CUMANA_OK, drive, "inserted") != 0) {
       DiscRelease(drive >= 2 ? &bbc->fdc.extra[drive - 2] : &bbc->fdc.disc[drive]);
@@ -5137,7 +5141,7 @@ bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path) {
   uint8_t* buf = NULL;
   size_t length = 0;
   bool ok;
-  if (!ReadFile(path, &buf, &length)) {
+  if (!ReadWholeFile(path, &buf, &length)) {
     fprintf(stderr, "Unable to read sideways ROM '%s'\n", path);
     return false;
   }
@@ -5235,6 +5239,18 @@ static char* JoinPath(const char* dir, const char* name) {
   return path;
 }
 
+// Windows paths may use either separator.
+static const char* LastSeparator(const char* path) {
+  const char* slash = strrchr(path, '/');
+#ifdef _WIN32
+  const char* backslash = strrchr(path, '\\');
+  if (backslash != NULL && (slash == NULL || backslash > slash)) {
+    slash = backslash;
+  }
+#endif
+  return slash;
+}
+
 static char* RomDirectoryBeside(const char* binary, const char* directory) {
   char folder[PATH_MAX];
   char candidate[PATH_MAX];
@@ -5243,7 +5259,7 @@ static char* RomDirectoryBeside(const char* binary, const char* directory) {
   if (binary == NULL || binary[0] == '\0' || directory == NULL) {
     return NULL;
   }
-  slash = strrchr(binary, '/');
+  slash = LastSeparator(binary);
   if (slash == NULL || slash == binary) {
     return NULL;
   }
@@ -5257,7 +5273,7 @@ static char* RomDirectoryBeside(const char* binary, const char* directory) {
   if (DirectoryExists(candidate)) {
     return strdup(candidate);
   }
-  slash = strrchr(folder, '/');
+  slash = LastSeparator(folder);
   if (slash == NULL) {
     return NULL;
   }
@@ -6106,7 +6122,7 @@ static uint8_t* TapeEncode(const BbcMachine* bbc, size_t* out_len) {
 static void TapeClose(BbcMachine* bbc) {
   if (bbc->tape_fd >= 0) {
     shutdown(bbc->tape_fd, SHUT_RDWR);
-    close(bbc->tape_fd);
+    SocketClose(bbc->tape_fd);
     bbc->tape_fd = -1;
   }
 }
@@ -6157,7 +6173,7 @@ bool BbcMachineLoadTape(BbcMachine* bbc, const char* path) {
   uint8_t* buf = NULL;
   size_t length = 0;
   char* copy;
-  if (bbc == NULL || path == NULL || !ReadFile(path, &buf, &length)) {
+  if (bbc == NULL || path == NULL || !ReadWholeFile(path, &buf, &length)) {
     return false;
   }
   copy = strdup(path);
@@ -6191,9 +6207,9 @@ static int TapePullRead(void* ctx, void* buf, size_t n) {
     }
     pfd.fd = pull->fd;
     pfd.events = POLLIN;
-    ready = poll(&pfd, 1, 200);
+    ready = SocketPoll(&pfd, 1, 200);
     if (ready < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;
@@ -6204,9 +6220,9 @@ static int TapePullRead(void* ctx, void* buf, size_t n) {
       }
       continue;
     }
-    got = read(pull->fd, bytes + off, n - off);
+    got = SocketRead(pull->fd, bytes + off, n - off);
     if (got < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       return -1;
@@ -6225,7 +6241,7 @@ static void TapeEnqueue(BbcMachine* bbc, int fd, CassetteInsert* insert) {
   if (item == NULL) {
     CassetteSendReply(fd, CASSETTE_ERR, "out of memory");
     CassetteInsertFree(insert);
-    close(fd);
+    SocketClose(fd);
     return;
   }
   item->fd = fd;
@@ -6262,9 +6278,9 @@ static void* TapeListenMain(void* arg) {
     }
     listen_pfd.fd = bbc->tape_listen_fd;
     listen_pfd.events = POLLIN;
-    ready = poll(&listen_pfd, 1, 200);
+    ready = SocketPoll(&listen_pfd, 1, 200);
     if (ready < 0) {
-      if (errno == EINTR) {
+      if (SocketInterrupted()) {
         continue;
       }
       break;
@@ -6272,9 +6288,9 @@ static void* TapeListenMain(void* arg) {
     if (ready == 0) {
       continue;
     }
-    fd = accept(bbc->tape_listen_fd, (struct sockaddr*)&addr, &len);
+    fd = (int)accept(bbc->tape_listen_fd, (struct sockaddr*)&addr, &len);
     if (fd < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (SocketWouldBlock()) {
         continue;
       }
       break;
@@ -6284,14 +6300,14 @@ static void* TapeListenMain(void* arg) {
 #ifdef SO_NOSIGPIPE
       setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     }
     pthread_mutex_lock(&bbc->tape_mu);
     bbc->tape_handshake_fd = fd;
     stop = bbc->tape_listen_stop;
     pthread_mutex_unlock(&bbc->tape_mu);
     if (stop) {
-      close(fd);
+      SocketClose(fd);
       break;
     }
     {
@@ -6300,7 +6316,7 @@ static void* TapeListenMain(void* arg) {
       pull.bbc = bbc;
       pull.fd = fd;
       if (CassetteReadInsert(TapePullRead, &pull, &insert) != 0) {
-        close(fd);
+        SocketClose(fd);
       } else {
         TapeEnqueue(bbc, fd, &insert);
       }
@@ -6324,14 +6340,14 @@ static void TapeWatch(BbcMachine* bbc) {
   }
   pfd.fd = bbc->tape_fd;
   pfd.events = POLLIN;
-  if (poll(&pfd, 1, 0) <= 0) {
+  if (SocketPoll(&pfd, 1, 0) <= 0) {
     return;
   }
   if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
     return;
   }
-  n = read(bbc->tape_fd, drain, sizeof(drain));
-  if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+  n = SocketRead(bbc->tape_fd, drain, sizeof(drain));
+  if (n == 0 || (n < 0 && !SocketWouldBlock())) {
     TapeClose(bbc);
     TapeReset(bbc);
     bbc->tape_protect = false;
@@ -6397,7 +6413,7 @@ static void TapeStop(BbcMachine* bbc) {
   }
   pthread_join(bbc->tape_listen_thread, NULL);
   if (bbc->tape_listen_fd >= 0) {
-    close(bbc->tape_listen_fd);
+    SocketClose(bbc->tape_listen_fd);
     bbc->tape_listen_fd = -1;
   }
   pthread_mutex_lock(&bbc->tape_mu);
@@ -6407,7 +6423,7 @@ static void TapeStop(BbcMachine* bbc) {
   while (pending != NULL) {
     struct TapePending* next = pending->next;
     if (pending->fd >= 0) {
-      close(pending->fd);
+      SocketClose(pending->fd);
     }
     CassetteInsertFree(&pending->insert);
     free(pending);
@@ -6425,11 +6441,18 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
   if (bbc == NULL || bbc->tape_listen_started || port < 0 || port > 65535) {
     return -1;
   }
-  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
   }
+#ifdef _WIN32
+  setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof(one));
+#else
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
 #ifdef SO_NOSIGPIPE
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
@@ -6438,16 +6461,16 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 2) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   len = sizeof(addr);
   if (getsockname(fd, (struct sockaddr*)&addr, &len) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   if (pthread_mutex_init(&bbc->tape_mu, NULL) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   bbc->tape_listen_fd = fd;
@@ -6459,7 +6482,7 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
   if (pthread_create(&bbc->tape_listen_thread, NULL, TapeListenMain, bbc) != 0) {
     bbc->tape_listen_started = false;
     pthread_mutex_destroy(&bbc->tape_mu);
-    close(fd);
+    SocketClose(fd);
     bbc->tape_listen_fd = -1;
     return -1;
   }

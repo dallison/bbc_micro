@@ -1,19 +1,43 @@
 #include "bbc_hardware.h"
+#include "bbc_platform.h"
 #include "cassette.h"
 #include "cumana.h"
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#endif
+
 static int g_failures = 0;
+
+// Scratch files go in the system temporary directory.
+static const char* TempPath(char* buf, size_t n, const char* name) {
+#ifdef _WIN32
+  char dir[MAX_PATH];
+  DWORD len = GetTempPathA(sizeof(dir), dir);
+  if (len == 0 || len >= sizeof(dir)) {
+    strcpy(dir, ".\\");
+  }
+  snprintf(buf, n, "%s%s", dir, name);
+#else
+  snprintf(buf, n, "/tmp/%s", name);
+#endif
+  return buf;
+}
+
+static char* MakeTempDir(char* templ) {
+#ifdef _WIN32
+  return _mktemp(templ) != NULL && _mkdir(templ) == 0 ? templ : NULL;
+#else
+  return mkdtemp(templ);
+#endif
+}
 
 #define EXPECT(cond)                                                          \
   do {                                                                        \
@@ -156,8 +180,10 @@ static void TestSheila(BbcMachine* bbc, uint8_t* ram) {
 }
 
 static void TestOsAndPpm(BbcMachine* bbc, uint8_t* ram) {
-  const char* os_path = "/tmp/bbc-test-os.rom";
-  const char* ppm_path = "/tmp/bbc-test-screen.ppm";
+  char os_buf[512];
+  char ppm_buf[512];
+  const char* os_path = TempPath(os_buf, sizeof(os_buf), "bbc-test-os.rom");
+  const char* ppm_path = TempPath(ppm_buf, sizeof(ppm_buf), "bbc-test-screen.ppm");
   FILE* fp = fopen(os_path, "wb");
   uint8_t bytes[4] = {0x60, 0xea, 0xea, 0xea};
   char header[32];
@@ -403,9 +429,12 @@ static void WriteImage(const char* path, const uint8_t* data, size_t length) {
 }
 
 static void TestDisc(void) {
-  const char* ssd = "/tmp/bbc-disc-test.ssd";
-  const char* locked = "/tmp/bbc-disc-locked.ssd";
-  const char* adf = "/tmp/bbc-disc-test.adf";
+  char ssd_buf[512];
+  char locked_buf[512];
+  char adf_buf[512];
+  const char* ssd = TempPath(ssd_buf, sizeof(ssd_buf), "bbc-disc-test.ssd");
+  const char* locked = TempPath(locked_buf, sizeof(locked_buf), "bbc-disc-locked.ssd");
+  const char* adf = TempPath(adf_buf, sizeof(adf_buf), "bbc-disc-test.adf");
   uint8_t image[2560];
   uint8_t adf_image[4096];
   uint8_t back[2560];
@@ -599,8 +628,10 @@ static int CellWhite(BbcMachine* bbc, int col, int y) {
 }
 
 static void TestPeripherals(void) {
-  const char* tape_path = "/tmp/bbc-tape-test.bin";
-  const char* disc_path = "/tmp/bbc-format-test.ssd";
+  char tape_buf[512];
+  char disc_buf[512];
+  const char* tape_path = TempPath(tape_buf, sizeof(tape_buf), "bbc-tape-test.bin");
+  const char* disc_path = TempPath(disc_buf, sizeof(disc_buf), "bbc-format-test.ssd");
   uint8_t image[2560];
   uint8_t sync = 0x2a;
   BbcMachine* bbc;
@@ -804,7 +835,7 @@ static int FindSlot(const BbcRomFile* files, int count, int slot) {
 }
 
 static void TestRomDirectory(void) {
-  char dir[] = "/tmp/bbc-roms-XXXXXX";
+  char dir[512];
   char path[512];
   BbcRomFile files[BBC_ROM_IMAGE_MAX];
   int count;
@@ -812,7 +843,8 @@ static void TestRomDirectory(void) {
   uint8_t* ram;
   BbcMachine* bbc;
   bool skip[16];
-  EXPECT(mkdtemp(dir) != NULL);
+  TempPath(dir, sizeof(dir), "bbc-roms-XXXXXX");
+  EXPECT(MakeTempDir(dir) != NULL);
   WriteNamed(dir, "os-1.20.rom", 0x11);
   WriteNamed(dir, "15-basic2.rom", 0x22);
   WriteNamed(dir, "14-adfs-1.30.rom", 0x33);
@@ -942,7 +974,8 @@ static void TestMaster(void) {
   bool banks[16];
   bool before;
   FILE* fp;
-  const char* os_path = "/tmp/bbc-master-os.rom";
+  char os_buf[512];
+  const char* os_path = TempPath(os_buf, sizeof(os_buf), "bbc-master-os.rom");
   int i;
   EXPECT(ram != NULL && bbc != NULL);
   EXPECT(BbcMachineParseModel("b") == BBC_MACHINE_B);
@@ -1193,20 +1226,23 @@ static int CumanaConnect(int port) {
   int fd;
   int one = 1;
   struct sockaddr_in addr;
-  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
   }
 #ifdef SO_NOSIGPIPE
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   return fd;
@@ -1223,7 +1259,7 @@ static void* CumanaRefuseMain(void* arg) {
       CumanaSendInsert(fd, trial->drive, 0, trial->name, trial->image, trial->length) != 0 ||
       CumanaReadReply(fd, &code, &assigned, reply, sizeof(reply)) != 0) {
     if (fd >= 0) {
-      close(fd);
+      SocketClose(fd);
     }
     pthread_mutex_lock(&trial->mu);
     trial->failed = 1;
@@ -1231,7 +1267,7 @@ static void* CumanaRefuseMain(void* arg) {
     pthread_mutex_unlock(&trial->mu);
     return NULL;
   }
-  close(fd);
+  SocketClose(fd);
   pthread_mutex_lock(&trial->mu);
   trial->failed = code != CUMANA_ERR;
   trial->ready = 1;
@@ -1252,7 +1288,7 @@ static void* CumanaTrialMain(void* arg) {
       CumanaSendInsert(fd, trial->drive, 0, trial->name, trial->image, trial->length) != 0 ||
       CumanaReadReply(fd, &code, &assigned, reply, sizeof(reply)) != 0 || code != CUMANA_OK) {
     if (fd >= 0) {
-      close(fd);
+      SocketClose(fd);
     }
     pthread_mutex_lock(&trial->mu);
     trial->failed = 1;
@@ -1278,7 +1314,7 @@ static void* CumanaTrialMain(void* arg) {
     }
     free(extra);
   }
-  close(fd);
+  SocketClose(fd);
   return NULL;
 }
 
@@ -1457,7 +1493,7 @@ static void* CassetteTrialMain(void* arg) {
       CassetteSendInsert(fd, 0, "blank.uef", trial->image, trial->length) != 0 ||
       CassetteReadReply(fd, &code, reply, sizeof(reply)) != 0 || code != CASSETTE_OK) {
     if (fd >= 0) {
-      close(fd);
+      SocketClose(fd);
     }
     pthread_mutex_lock(&trial->mu);
     trial->failed = 1;
@@ -1495,7 +1531,7 @@ static void* CassetteTrialMain(void* arg) {
     }
     usleep(1000);
   }
-  close(fd);
+  SocketClose(fd);
   return NULL;
 }
 
@@ -1520,7 +1556,8 @@ static int WaitCassette(BbcMachine* bbc, struct CassetteTrial* trial, int want_w
 }
 
 static void TestCassette(void) {
-  const char* path = "/tmp/bbc-uef-test.uef";
+  char path_buf[512];
+  const char* path = TempPath(path_buf, sizeof(path_buf), "bbc-uef-test.uef");
   uint8_t uef[] = {
       'U', 'E', 'F', ' ', 'F', 'i', 'l', 'e', '!', 0, 0x0a, 0,
       0x10, 0x01, 2, 0, 0, 0, 0x80, 0x02,
@@ -1595,7 +1632,8 @@ static void TestCassette(void) {
   free(trial.written);
 
   {
-    const char* saved_path = "/tmp/bbc-tape-saved.uef";
+    char saved_buf[512];
+    const char* saved_path = TempPath(saved_buf, sizeof(saved_buf), "bbc-tape-saved.uef");
     uint8_t marker[] = {0x2a};
     uint8_t* back = NULL;
     size_t back_len = 0;
@@ -1733,6 +1771,61 @@ static void TestEconet(void) {
   BbcMachineDestroy(b);
 }
 
+// A second emulator process is only a socket on the same port. It must
+// hear a frame this process sends, so multicast loopback stays on.
+static void TestEconetOtherProcess(void) {
+  uint8_t frame[5] = {0x04, 0x00, 0x03, 0x00, 0x99};
+  uint8_t buf[64];
+  int on = 1;
+  int fd;
+  int i;
+  ssize_t n = -1;
+  struct sockaddr_in addr;
+  struct ip_mreq mreq;
+  BbcMachine* c;
+  EXPECT(SocketStartup());
+  fd = (int)socket(AF_INET, SOCK_DGRAM, 0);
+  EXPECT(fd >= 0);
+  if (fd < 0) {
+    return;
+  }
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+#ifdef SO_REUSEPORT
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
+#endif
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(28181);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  EXPECT(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+  memset(&mreq, 0, sizeof(mreq));
+  inet_pton(AF_INET, "239.255.19.82", &mreq.imr_multiaddr);
+  mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+  EXPECT(setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq)) == 0);
+  SocketSetNonBlocking(fd);
+
+  c = BbcMachineCreate();
+  EXPECT(c != NULL);
+  EXPECT(BbcMachineOpenEconet(c, 3, 28181) != 0);
+  BbcMachineWrite(c, 0xfea0, 0x00);
+  EconetSend(c, frame, 5);
+  for (i = 0; i < 40 && n < 0; i++) {
+    struct pollfd p;
+    BbcMachineAdvance(c, 80);
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
+    if (SocketPoll(&p, 1, 25) == 1) {
+      n = recvfrom(fd, (char*)buf, (int)sizeof(buf), 0, NULL, NULL);
+    }
+  }
+  EXPECT(n == 14 + 5);
+  EXPECT(n >= 14 && memcmp(buf, "ECONET01", 8) == 0);
+  EXPECT(n == 14 + 5 && memcmp(buf + 14, frame, 5) == 0);
+  BbcMachineDestroy(c);
+  SocketClose(fd);
+}
+
 int main(void) {
   uint8_t* ram = calloc(65536, 1);
   BbcMachine* bbc = BbcMachineCreate();
@@ -1754,6 +1847,7 @@ int main(void) {
     TestRomDirectory();
     TestMaster();
     TestEconet();
+    TestEconetOtherProcess();
   }
   BbcMachineDestroy(bbc);
   free(ram);

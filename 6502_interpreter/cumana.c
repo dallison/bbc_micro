@@ -9,12 +9,6 @@
 
 #include "cumana.h"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,13 +50,19 @@ static int ParseDrive(const char* text) {
 
 static const char* BaseName(const char* path) {
   const char* slash = strrchr(path, '/');
+#ifdef _WIN32
+  const char* backslash = strrchr(path, '\\');
+  if (backslash != NULL && (slash == NULL || backslash > slash)) {
+    slash = backslash;
+  }
+#endif
   if (slash != NULL && slash[1] != '\0') {
     return slash + 1;
   }
   return path;
 }
 
-static int ReadFile(const char* path, uint8_t** data, size_t* length) {
+static int ReadWholeFile(const char* path, uint8_t** data, size_t* length) {
   FILE* fp;
   long size;
   uint8_t* buf;
@@ -99,20 +99,23 @@ static int ConnectTo(const char* host, int port) {
   int fd;
   struct sockaddr_in addr;
   int one = 1;
-  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
   }
 #ifdef SO_NOSIGPIPE
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
 #endif
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   if (inet_pton(AF_INET, host, &addr.sin_addr) != 1 ||
       connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    close(fd);
+    SocketClose(fd);
     return -1;
   }
   return fd;
@@ -194,7 +197,7 @@ int main(int argc, char** argv) {
   if (access(path, W_OK) != 0) {
     protect = 1;
   }
-  if (ReadFile(path, &image, &length) != 0) {
+  if (ReadWholeFile(path, &image, &length) != 0) {
     fprintf(stderr, "Unable to read %s\n", path);
     return 1;
   }
@@ -207,13 +210,13 @@ int main(int argc, char** argv) {
   if (CumanaSendInsert(fd, drive, protect, BaseName(path), image, length) != 0 ||
       CumanaReadReply(fd, &code, &assigned, reply, sizeof(reply)) != 0) {
     fprintf(stderr, "The emulator did not accept %s\n", path);
-    close(fd);
+    SocketClose(fd);
     free(image);
     return 1;
   }
   if (code != CUMANA_OK) {
     fprintf(stderr, "Refused: %s\n", reply[0] != '\0' ? reply : "disc not inserted");
-    close(fd);
+    SocketClose(fd);
     free(image);
     return 1;
   }
@@ -242,7 +245,7 @@ int main(int argc, char** argv) {
   if (fp != NULL) {
     fclose(fp);
   }
-  close(fd);
+  SocketClose(fd);
   fprintf(stderr, "Drive %d ejected\n", assigned);
   return 0;
 }

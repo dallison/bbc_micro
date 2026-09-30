@@ -286,6 +286,8 @@ static void PressHostKey(XKeyEvent* event) {
     return;
   }
   ReleaseHostKey(event->keycode);
+  // The per-frame poll can lag a fast Shift+key, which would put Shift on ':'.
+  g_host_shift = (event->state & ShiftMask) != 0;
   if (FunctionToBbc(sym, &column, &row)) {
     mapped = true;
   }

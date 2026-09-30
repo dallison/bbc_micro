@@ -12,6 +12,52 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef _WIN32
+#include <sys/utime.h>
+#include <windows.h>
+
+// Windows has no symbolic links a guest can make without a privilege, no
+// *at calls, and only the owner-write permission bit. These cover what
+// the services below use.
+#define AT_FDCWD (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define UTIME_OMIT ((1L << 30) - 2L)
+
+static int lstat(const char* path, struct stat* value) {
+  return stat(path, value);
+}
+
+static int linkat(int olddir, const char* target, int newdir, const char* link, int flags) {
+  (void)olddir;
+  (void)newdir;
+  (void)flags;
+  if (!CreateHardLinkA(link, target, NULL)) {
+    errno = GetLastError() == ERROR_ALREADY_EXISTS ? EEXIST : EACCES;
+    return -1;
+  }
+  return 0;
+}
+
+static int fchmodat(int dir, const char* path, mode_t mode, int flags) {
+  (void)dir;
+  (void)flags;
+  return chmod(path, (mode & S_IWUSR) != 0 ? (S_IREAD | S_IWRITE) : S_IREAD);
+}
+
+static int utimensat(int dir, const char* path, const struct timespec times[2], int flags) {
+  struct stat value;
+  struct __utimbuf64 stamp;
+  (void)dir;
+  (void)flags;
+  if (stat(path, &value) != 0) {
+    return -1;
+  }
+  stamp.actime = times[0].tv_nsec == UTIME_OMIT ? value.st_atime : times[0].tv_sec;
+  stamp.modtime = times[1].tv_nsec == UTIME_OMIT ? value.st_mtime : times[1].tv_sec;
+  return _utime64(path, &stamp);
+}
+#endif
+
 static int DaveHostFilesystemTranslateError(int value) {
   switch (value) {
     case ENOENT: return DAVE_HOST_ENOENT;
@@ -75,6 +121,10 @@ static void DaveHostFilesystemCopyStatus(
       DaveHostFilesystemTimespecNanoseconds(value->st_mtimespec);
   result->status_change_time_ns =
       DaveHostFilesystemTimespecNanoseconds(value->st_ctimespec);
+#elif defined(_WIN32)
+  result->access_time_ns = (int64_t)value->st_atime * 1000000000LL;
+  result->modification_time_ns = (int64_t)value->st_mtime * 1000000000LL;
+  result->status_change_time_ns = (int64_t)value->st_ctime * 1000000000LL;
 #else
   result->access_time_ns =
       DaveHostFilesystemTimespecNanoseconds(value->st_atim);
@@ -179,7 +229,12 @@ int64_t DaveHostFilesystemReadDirectory(
     pthread_mutex_unlock(&dave_directory_mutex);
     return -DAVE_HOST_ENAMETOOLONG;
   }
+#ifdef _WIN32
+  // MinGW's dirent has no type. 0 is DT_UNKNOWN, so the guest stats it.
+  result->type = 0;
+#else
   result->type = (uint32_t)entry->d_type;
+#endif
   result->reserved = 0;
   memcpy(result->name, entry->d_name, length + 1);
   pthread_mutex_unlock(&dave_directory_mutex);
@@ -206,7 +261,12 @@ int64_t DaveHostFilesystemCreateDirectory(const char* path, uint32_t mode) {
   if (path == NULL) {
     return -DAVE_HOST_EINVAL;
   }
+#ifdef _WIN32
+  (void)mode;
+  return mkdir(path) == 0 ? 0 : DaveHostFilesystemError();
+#else
   return mkdir(path, (mode_t)mode) == 0 ? 0 : DaveHostFilesystemError();
+#endif
 }
 
 int64_t DaveHostFilesystemRemove(const char* path) {
@@ -348,6 +408,9 @@ int64_t DaveHostFilesystemCopyFile(const char* source, const char* destination,
         DaveHostFilesystemTimespecNanoseconds(source_status.st_mtimespec);
     int64_t destination_time =
         DaveHostFilesystemTimespecNanoseconds(destination_status.st_mtimespec);
+#elif defined(_WIN32)
+    int64_t source_time = (int64_t)source_status.st_mtime * 1000000000LL;
+    int64_t destination_time = (int64_t)destination_status.st_mtime * 1000000000LL;
 #else
     int64_t source_time =
         DaveHostFilesystemTimespecNanoseconds(source_status.st_mtim);
