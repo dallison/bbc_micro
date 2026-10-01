@@ -1767,6 +1767,22 @@ static void TestEconet(void) {
   BbcMachineWrite(a, 0xfea0, 0x00);
   BbcMachineWrite(b, 0xfea0, 0x00);
   EXPECT((BbcMachineRead(a, 0xfea0) & 0x40) != 0);
+  BbcMachineAdvance(a, 80);
+  EXPECT((BbcMachineRead(a, 0xfea0) & 0x10) != 0);
+  EXPECT((BbcMachineRead(a, 0xfea1) & 0x04) != 0);
+  // NFS gates the NMI with BIT &FE18 and BIT &FE20, which are reads.
+  BbcMachineWrite(a, 0xfea0, 0x04);
+  EXPECT(!BbcMachineNmiPending(a));
+  EXPECT(BbcMachineRead(a, 0xfe20) == 0xfe);
+  EXPECT(BbcMachineNmiPending(a));
+  BbcMachineClearNmi(a);
+  EXPECT(BbcMachineRead(a, 0xfe18) == 1);
+  EXPECT(!BbcMachineNmiPending(a));
+  EXPECT(BbcMachineRead(a, 0xfe20) == 0xfe);
+  EXPECT(BbcMachineNmiPending(a));
+  BbcMachineClearNmi(a);
+  BbcMachineWrite(a, 0xfea0, 0x00);
+  EXPECT(BbcMachineRead(a, 0xfe18) == 1);
 
   BbcMachineWrite(a, 0xfea2, 0x11);
   BbcMachineAdvance(a, 80);
@@ -1860,7 +1876,11 @@ static void TestEconetOtherProcess(void) {
   EXPECT(bind(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
   memset(&mreq, 0, sizeof(mreq));
   inet_pton(AF_INET, "239.255.19.82", &mreq.imr_multiaddr);
+#ifdef __APPLE__
+  inet_pton(AF_INET, "127.0.0.1", &mreq.imr_interface);
+#else
   mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+#endif
   EXPECT(setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq)) == 0);
   SocketSetNonBlocking(fd);
 
@@ -2018,6 +2038,12 @@ static void TestHardDisc(void) {
   for (i = 0; i < 256; i++) {
     BbcMachineWrite(bbc, 0xfc40, 0x5a);
   }
+  EXPECT(!BbcMachineIrqPending(bbc));
+  BbcMachineWrite(bbc, 0xfc43, 0xff);
+  EXPECT(HdPins(bbc) == 0xf2);
+  EXPECT(BbcMachineIrqPending(bbc));
+  BbcMachineWrite(bbc, 0xfc43, 0x00);
+  EXPECT(!BbcMachineIrqPending(bbc));
   EXPECT(HdFinish(bbc) == 0x00);
   BbcMachineDestroy(bbc);
 

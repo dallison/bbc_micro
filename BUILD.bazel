@@ -156,6 +156,16 @@ cc_binary(
     includes = COMMON_INCLUDES,
 )
 
+cc_binary(
+    name = "fileserver",
+    srcs = [
+        "6502_interpreter/bbc_platform.h",
+        "6502_interpreter/fileserver.c",
+    ],
+    copts = COMMON_COPTS,
+    includes = COMMON_INCLUDES,
+)
+
 cc_library(
     name = "bbc_session",
     srcs = ["6502_interpreter/bbc_session.c"],

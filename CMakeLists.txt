@@ -114,6 +114,10 @@ add_executable(cassette 6502_interpreter/cassette.c)
 target_include_directories(cassette PRIVATE ${BBC_INCLUDES})
 target_link_libraries(cassette PRIVATE ${BBC_SOCKET_LIBS})
 
+add_executable(fileserver 6502_interpreter/fileserver.c)
+target_include_directories(fileserver PRIVATE ${BBC_INCLUDES})
+target_link_libraries(fileserver PRIVATE ${BBC_SOCKET_LIBS})
+
 add_executable(bbc_hardware_test
   6502_interpreter/bbc_hardware.c
   6502_interpreter/bbc_hardware_test.c

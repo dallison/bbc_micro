@@ -4,7 +4,11 @@ Econet is not the RS423 port. RS423 is the 6850 serial chip at `&FE08`. Econet i
 
 The interface stays absent until `-econet` names a station from 1 to 254. Station 0 and station 255 are reserved. Two emulators on the same port share one wire. The network clock is on, so a station does not report "No clock".
 
-There is no file server inside the emulator. A second `bbc` is the other station. Put an Econet ROM (NFS or ANFS) in a sideways socket, named like the other ROM images, for example `12-nfs.rom` in `bbc_b_rom_sockets` or `bbc_master_rom_sockets`.
+There is no file server inside the emulator. Put an Econet ROM (NFS or ANFS) in a sideways socket, named like the other ROM images, for example `12-nfs.rom` in `bbc_b_rom_sockets` or `bbc_master_rom_sockets`.
+
+`fileserver` is that other station. How to run it is in [FILESERVER.md](FILESERVER.md).
+
+A second `bbc -econet 254` can still be the other station. Two emulators on the same port share one wire:
 
 ```
 ./build/bbc -econet 1
@@ -13,7 +17,7 @@ There is no file server inside the emulator. A second `bbc` is the other station
 
 On the Model B the station number is those links. Hold N and press F12 to select the network filing system. On a Master, `-econet` also stores that station number in CMOS.
 
-The default wire is UDP port 8179. `-econet-port` chooses a different one, which keeps two networks on the same machine apart:
+The wire is UDP multicast, and on a Mac it stays on the loopback interface so it does not travel out onto the local network. The default port is 8179. `-econet-port` chooses a different one, which keeps two networks on the same machine apart. `fileserver -port` must use that same number:
 
 ```
 ./build/bbc -econet 1 -econet-port 8180

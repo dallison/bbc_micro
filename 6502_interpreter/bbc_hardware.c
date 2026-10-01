@@ -198,6 +198,9 @@ struct BbcMachine {
     bool dirty;
     char* path;
     uint8_t latch;
+    // &FC43 enables the adapter interrupt. ADFS 1.30 sets it after a sector
+    // write and waits until the service interrupt clears the busy flag.
+    bool irq;
     int phase;
     int cdb_i;
     int cdb_n;
@@ -3170,7 +3173,9 @@ static uint8_t EconetSr1(BbcMachine* bbc) {
   bool fc = bbc->econet.fc_latched;
   bool tx_bit = (bbc->econet.cr2 & CR2_FC) != 0 ? fc : tdra;
   bool fd = bbc->econet.fd_latched && (bbc->econet.cr3 & CR3_FDSE) != 0;
-  bool s2 = (EconetSr2(bbc) & (uint8_t)~0x80) != 0;
+  // Idle is a level the transmit routine polls. It is not an interrupt, or a
+  // quiet network would NMI on every byte.
+  bool s2 = (EconetSr2(bbc) & (uint8_t)~0x84) != 0;
   bool rda = EconetRda(bbc);
   bool pse = (bbc->econet.cr2 & 0x01) != 0;
   bool txu = bbc->econet.txu;
@@ -3203,6 +3208,9 @@ static uint8_t EconetSr1(BbcMachine* bbc) {
   if ((bbc->econet.cr1 & CR1_RDSR) != 0) {
     sr1 = (uint8_t)(sr1 & (uint8_t)~0x01);
   }
+  // CTS is the network clock. NFS will not transmit until this is set and
+  // the receiver reports the line idle. A fitted interface has the clock on.
+  sr1 |= 0x10;
   if (((bbc->econet.cr1 & CR1_RIE) != 0 && (rda_service || fd || s2 || bbc->econet.ap)) ||
       ((bbc->econet.cr1 & CR1_TIE) != 0 && (tx_service || txu))) {
     sr1 |= 0x80;
@@ -3421,8 +3429,14 @@ static void EconetRxTick(BbcMachine* bbc) {
   }
   if (!bbc->econet.rx_active) {
     if (!EconetTakeInbox(bbc)) {
+      // Fifteen ones on a quiet wire. NFS waits for this before a scout,
+      // and reports "Line Jammed" when it never arrives.
+      if (bbc->econet.rx_count == 0 && !bbc->econet.fv_latched && !bbc->econet.err_latched) {
+        bbc->econet.rx_idle = true;
+      }
       return;
     }
+    bbc->econet.rx_idle = false;
     bbc->econet.rx_active = true;
     bbc->econet.rx_pos = 0;
   }
@@ -3641,6 +3655,9 @@ static int EconetBind(BbcMachine* bbc, int port) {
   setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&on, sizeof(on));
 #endif
   memset(&addr, 0, sizeof(addr));
+#ifdef __APPLE__
+  addr.sin_len = sizeof(addr);
+#endif
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -3650,7 +3667,16 @@ static int EconetBind(BbcMachine* bbc, int port) {
   }
   memset(&mreq, 0, sizeof(mreq));
   inet_pton(AF_INET, ECONET_GROUP, &mreq.imr_multiaddr);
+#ifdef __APPLE__
+  // The Wi-Fi interface is simplex, and a looped multicast packet comes
+  // back with the LAN address as its source. An ordinary program then
+  // never sees it. Loopback keeps the wire on this machine.
+  inet_pton(AF_INET, "127.0.0.1", &mreq.imr_interface);
+  setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, (const char*)&mreq.imr_interface,
+             sizeof(mreq.imr_interface));
+#else
   mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+#endif
   if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof(mreq)) != 0) {
     SocketClose(fd);
     return -1;
@@ -3720,15 +3746,15 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
   }
   if (page < 0x20) {
     // A write to &FE18-&FE1F disables Econet NMIs. The station links are read-only.
-    if (bbc->econet.fitted) {
+    if (bbc->econet.fitted && !bbc->master) {
       bbc->econet.nmi_enable = false;
       UpdateNmiLine(bbc);
     }
     return;
   }
   if (page < 0x30) {
-    // On the Model B a write to &FE20 enables Econet NMIs as well as the video ULA.
-    if (page == 0x20 && bbc->econet.fitted && !bbc->master) {
+    // On the Model B the video ULA select (&FE20-&FE2F) enables Econet NMIs.
+    if (bbc->econet.fitted && !bbc->master) {
       bbc->econet.nmi_enable = true;
       UpdateNmiLine(bbc);
     }
@@ -3818,11 +3844,21 @@ static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
   }
   if (page < 0x20) {
     if (bbc->econet.fitted) {
+      // NFS masks the NMI with BIT &FE18. The read is the gate, not a write.
+      if (!bbc->master) {
+        bbc->econet.nmi_enable = false;
+        UpdateNmiLine(bbc);
+      }
       return (uint8_t)bbc->econet.station;
     }
     return 0xfe;
   }
   if (page < 0x30) {
+    // BIT &FE20 is how NFS lets the NMI through again after the handler.
+    if (bbc->econet.fitted && !bbc->master) {
+      bbc->econet.nmi_enable = true;
+      UpdateNmiLine(bbc);
+    }
     if (bbc->master && page >= 0x24) {
       int reg = MasterFdcReg(page);
       if (reg > 0) {
@@ -4065,7 +4101,17 @@ static uint8_t HdStatusBits(const BbcMachine* bbc) {
   if (bbc->hd.phase == HD_DATA_IN || bbc->hd.phase == HD_STATUS || bbc->hd.phase == HD_MESSAGE) {
     pins |= HD_IO;
   }
+  // With the interrupt enabled, status phase reads as &F2: request is no
+  // longer showing, and bit 4 marks the pending interrupt. ADFS claims the
+  // interrupt only when the status register is exactly that value.
+  if (bbc->hd.irq && bbc->hd.phase == HD_STATUS) {
+    pins = (uint8_t)((pins & (uint8_t)~HD_REQ) | 0x10);
+  }
   return pins;
+}
+
+static bool HdIrqPending(const BbcMachine* bbc) {
+  return bbc->hd.data != NULL && bbc->hd.irq && bbc->hd.phase == HD_STATUS;
 }
 
 static uint8_t HdReadReg(BbcMachine* bbc, int reg) {
@@ -4094,6 +4140,10 @@ static uint8_t HdReadReg(BbcMachine* bbc, int reg) {
 static void HdWriteReg(BbcMachine* bbc, int reg, uint8_t value) {
   if (reg == 2) {
     HdSelect(bbc);
+    return;
+  }
+  if (reg == 3) {
+    bbc->hd.irq = value != 0;
     return;
   }
   if (reg != 0) {
@@ -4829,7 +4879,7 @@ bool BbcMachineIrqPending(const BbcMachine* bbc) {
   if (bbc->master && (bbc->acccon & 0x80) != 0) {
     return true;
   }
-  return ViaIrq(&bbc->sys) || ViaIrq(&bbc->user) || AcaiIrq(bbc);
+  return ViaIrq(&bbc->sys) || ViaIrq(&bbc->user) || AcaiIrq(bbc) || HdIrqPending(bbc);
 }
 
 int BbcFrameWidth(const BbcMachine* bbc) { return bbc->frame_width; }
