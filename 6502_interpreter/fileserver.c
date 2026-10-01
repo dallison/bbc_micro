@@ -14,13 +14,18 @@
 //  The directory you name is the disc root ($). A subdirectory with the
 //  user's name, when it exists, is that user's home. Library is $.LIBRARY
 //  when that directory exists. A file called passwd in the root, lines of
-//  "NAME SECRET", requires those passwords. With no passwd file, any *I AM
-//  is accepted.
+//  "NAME SECRET" or "NAME SECRET S", requires those passwords. S marks a
+//  system user, who may *NEWUSER and *PRIV. "-" is an empty password. With
+//  no passwd file, any *I AM is accepted and that user may create accounts.
 //
 //  Load and execution addresses are kept in a sibling NAME.inf file, three
 //  hex fields: load, exec, access. Those .inf files are not part of the
 //  catalogue. Access bits, low to high, are public read, public write,
 //  owner read, owner write, locked, directory.
+//
+//  An ELF executable is left untouched on disk. Its load and execution
+//  addresses come from the program headers, and a load or a read builds
+//  the BBC memory image from those headers at the moment it is asked for.
 //
 
 #include "bbc_platform.h"
@@ -28,9 +33,13 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/statvfs.h>
+#endif
 
 #define ECONET_GROUP "239.255.19.82"
 #define ECONET_PORT 8179
@@ -38,6 +47,10 @@
 #define FS_COMMAND_PORT 0x99
 #define FS_DATA_PORT 0x90
 #define FS_BLOCK 256
+// NFS copies the first two bytes of the PutBytes reply into its block size,
+// and the second of those bytes is also the return code. The size therefore
+// has to fit in one byte, with a zero return code beside it.
+#define FS_PUT_BLOCK 128
 #define MAX_HANDLES 16
 #define MAX_FILES 8
 #define NAME_LEN 10
@@ -81,6 +94,17 @@ static uint32_t g_save_load = 0;
 static uint32_t g_save_exec = 0;
 static char g_save_path[512];
 static FILE* g_save_fp = NULL;
+
+static bool g_putting = false;
+static uint8_t g_put_client = 0;
+static uint8_t g_put_reply = 0;
+static uint8_t g_put_port = 0;
+static int g_put_slot = -1;
+static bool g_put_sequential = false;
+static uint32_t g_put_offset = 0;
+static uint32_t g_put_count = 0;
+static uint32_t g_put_got = 0;
+static uint32_t g_put_valid = 0;
 
 static uint8_t g_stash[ECONET_MAX_FRAME];
 static int g_stash_len = 0;
@@ -320,6 +344,204 @@ static void ReadInf(const char* path, bool directory, uint32_t* load, uint32_t* 
   }
 }
 
+#define ELF_MAX_FILE (8u * 1024u * 1024u)
+#define ELF_MAX_IMAGE (256u * 1024u)
+#define ELF_PT_LOAD 1
+
+static uint16_t ElfU16(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+static uint32_t ElfU32(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t ElfU64(const uint8_t* p) {
+  return (uint64_t)ElfU32(p) | ((uint64_t)ElfU32(p + 4) << 32);
+}
+
+// bytes, when not NULL, receives a freshly allocated memory image. The file
+// on disk is not rewritten. A file that is not a loadable ELF returns false.
+static bool ElfImage(const char* path, uint32_t* load, uint32_t* exec, uint32_t* length,
+                     uint8_t** bytes) {
+  FILE* fp;
+  uint8_t ident[16];
+  uint8_t* file = NULL;
+  long file_size;
+  size_t n;
+  bool is64;
+  uint64_t entry;
+  uint64_t phoff;
+  unsigned phentsize;
+  unsigned phnum;
+  unsigned i;
+  bool saw = false;
+  uint64_t base = 0;
+  uint64_t end = 0;
+  struct {
+    uint64_t offset;
+    uint64_t vaddr;
+    uint64_t filesz;
+    uint64_t memsz;
+  } seg[64];
+  unsigned nseg = 0;
+  uint8_t* image;
+  if (bytes != NULL) {
+    *bytes = NULL;
+  }
+  fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return false;
+  }
+  if (fread(ident, 1, 16, fp) != 16 || ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' ||
+      ident[3] != 'F' || ident[5] != 1 || (ident[4] != 1 && ident[4] != 2)) {
+    fclose(fp);
+    return false;
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    return false;
+  }
+  file_size = ftell(fp);
+  if (file_size < 16 || (unsigned long)file_size > ELF_MAX_FILE) {
+    fclose(fp);
+    return false;
+  }
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    return false;
+  }
+  file = (uint8_t*)malloc((size_t)file_size);
+  if (file == NULL) {
+    fclose(fp);
+    return false;
+  }
+  n = fread(file, 1, (size_t)file_size, fp);
+  fclose(fp);
+  if (n != (size_t)file_size) {
+    free(file);
+    return false;
+  }
+  is64 = file[4] == 2;
+  if (is64) {
+    if (file_size < 64) {
+      free(file);
+      return false;
+    }
+    entry = ElfU64(file + 24);
+    phoff = ElfU64(file + 32);
+    phentsize = ElfU16(file + 54);
+    phnum = ElfU16(file + 56);
+  } else {
+    if (file_size < 52) {
+      free(file);
+      return false;
+    }
+    entry = ElfU32(file + 24);
+    phoff = ElfU32(file + 28);
+    phentsize = ElfU16(file + 42);
+    phnum = ElfU16(file + 44);
+  }
+  if (phnum == 0 || phnum > 64 || phentsize < (is64 ? 56u : 32u) ||
+      phoff > (uint64_t)file_size || phoff + (uint64_t)phnum * phentsize > (uint64_t)file_size) {
+    free(file);
+    return false;
+  }
+  for (i = 0; i < phnum; i++) {
+    const uint8_t* ph = file + phoff + (uint64_t)i * phentsize;
+    uint32_t type;
+    uint64_t offset;
+    uint64_t vaddr;
+    uint64_t filesz;
+    uint64_t memsz;
+    uint64_t seg_end;
+    if (is64) {
+      type = ElfU32(ph);
+      offset = ElfU64(ph + 8);
+      vaddr = ElfU64(ph + 16);
+      filesz = ElfU64(ph + 32);
+      memsz = ElfU64(ph + 40);
+    } else {
+      type = ElfU32(ph);
+      offset = ElfU32(ph + 4);
+      vaddr = ElfU32(ph + 8);
+      filesz = ElfU32(ph + 16);
+      memsz = ElfU32(ph + 20);
+    }
+    if (type != ELF_PT_LOAD || memsz == 0) {
+      continue;
+    }
+    if (filesz > memsz) {
+      filesz = memsz;
+    }
+    if (offset > (uint64_t)file_size || filesz > (uint64_t)file_size - offset ||
+        vaddr > 0xffffffffu || memsz > ELF_MAX_IMAGE || vaddr + memsz < vaddr) {
+      free(file);
+      return false;
+    }
+    seg_end = vaddr + memsz;
+    if (!saw || vaddr < base) {
+      base = vaddr;
+    }
+    if (!saw || seg_end > end) {
+      end = seg_end;
+    }
+    saw = true;
+    seg[nseg].offset = offset;
+    seg[nseg].vaddr = vaddr;
+    seg[nseg].filesz = filesz;
+    seg[nseg].memsz = memsz;
+    nseg++;
+  }
+  if (!saw || end <= base || end - base > ELF_MAX_IMAGE || entry > 0xffffffffu) {
+    free(file);
+    return false;
+  }
+  *load = (uint32_t)base;
+  *exec = (uint32_t)entry;
+  *length = (uint32_t)(end - base);
+  if (bytes == NULL) {
+    free(file);
+    return true;
+  }
+  image = (uint8_t*)calloc(1, (size_t)*length);
+  if (image == NULL) {
+    free(file);
+    return false;
+  }
+  for (i = 0; i < nseg; i++) {
+    if (seg[i].filesz == 0) {
+      continue;
+    }
+    memcpy(image + (size_t)(seg[i].vaddr - base), file + seg[i].offset, (size_t)seg[i].filesz);
+  }
+  free(file);
+  *bytes = image;
+  return true;
+}
+
+static void DescribeFile(const char* path, bool directory, uint32_t* load, uint32_t* exec,
+                         uint32_t* length, uint8_t* access) {
+  uint32_t elf_load = 0;
+  uint32_t elf_exec = 0;
+  uint32_t elf_len = 0;
+  ReadInf(path, directory, load, exec, access);
+  if (length != NULL) {
+    *length = directory ? 0 : FileLength(path);
+  }
+  if (!directory && ElfImage(path, &elf_load, &elf_exec, &elf_len, NULL)) {
+    if (load != NULL) {
+      *load = elf_load;
+    }
+    if (exec != NULL) {
+      *exec = elf_exec;
+    }
+    if (length != NULL) {
+      *length = elf_len;
+    }
+  }
+}
+
 static void WriteInf(const char* path, uint32_t load, uint32_t exec, uint8_t access) {
   char inf[540];
   FILE* fp;
@@ -503,37 +725,121 @@ static void AccessText(uint8_t access, char* out) {
   out[n] = '\0';
 }
 
-static bool PasswordOk(const char* user, const char* secret) {
+#define MAX_ACCOUNTS 64
+
+struct Account {
+  char name[64];
+  char secret[64];
+  bool system;
+};
+
+static int LoadAccounts(struct Account* list, bool* existed) {
   char path[540];
   FILE* fp;
   char line[128];
-  bool saw = false;
+  int count = 0;
+  *existed = false;
   snprintf(path, sizeof(path), "%s/passwd", g_root);
   fp = fopen(path, "r");
   if (fp == NULL) {
-    return true;
+    return 0;
   }
-  while (fgets(line, sizeof(line), fp) != NULL) {
+  *existed = true;
+  while (fgets(line, sizeof(line), fp) != NULL && count < MAX_ACCOUNTS) {
     char name[64];
     char pass[64];
-    int got = sscanf(line, "%63s %63s", name, pass);
+    char priv[16];
+    int got = sscanf(line, "%63s %63s %15s", name, pass, priv);
     if (got < 1 || name[0] == '#') {
       continue;
     }
-    saw = true;
     Upper(name);
-    if (strcmp(name, user) != 0) {
-      continue;
+    snprintf(list[count].name, sizeof(list[count].name), "%s", name);
+    if (got < 2 || strcmp(pass, "-") == 0) {
+      list[count].secret[0] = '\0';
+    } else {
+      Upper(pass);
+      snprintf(list[count].secret, sizeof(list[count].secret), "%s", pass);
     }
-    fclose(fp);
-    if (got < 2) {
-      return secret[0] == '\0';
-    }
-    Upper(pass);
-    return strcmp(pass, secret) == 0;
+    list[count].system = got >= 3 && (priv[0] == 'S' || priv[0] == 's');
+    count++;
   }
   fclose(fp);
-  return !saw;
+  return count;
+}
+
+static bool SaveAccounts(const struct Account* list, int count) {
+  char path[540];
+  char temp[540];
+  FILE* fp;
+  int i;
+  snprintf(path, sizeof(path), "%s/passwd", g_root);
+  snprintf(temp, sizeof(temp), "%s/passwd.tmp", g_root);
+  fp = fopen(temp, "w");
+  if (fp == NULL) {
+    return false;
+  }
+  for (i = 0; i < count; i++) {
+    const char* secret = list[i].secret[0] != '\0' ? list[i].secret : "-";
+    if (list[i].system) {
+      fprintf(fp, "%s %s S\n", list[i].name, secret);
+    } else {
+      fprintf(fp, "%s %s\n", list[i].name, secret);
+    }
+  }
+  if (fclose(fp) != 0) {
+    remove(temp);
+    return false;
+  }
+  if (rename(temp, path) != 0) {
+    remove(temp);
+    return false;
+  }
+  return true;
+}
+
+static int FindAccount(const struct Account* list, int count, const char* user) {
+  int i;
+  for (i = 0; i < count; i++) {
+    if (strcmp(list[i].name, user) == 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static bool CallerIsSystem(const struct Account* list, int count, bool existed) {
+  int i;
+  int mine;
+  bool any = false;
+  if (!existed) {
+    return true;
+  }
+  for (i = 0; i < count; i++) {
+    if (list[i].system) {
+      any = true;
+    }
+  }
+  mine = FindAccount(list, count, g_user);
+  if (mine >= 0 && list[mine].system) {
+    return true;
+  }
+  return !any;
+}
+
+static bool PasswordOk(const char* user, const char* secret) {
+  struct Account list[MAX_ACCOUNTS];
+  bool existed = false;
+  int count = LoadAccounts(list, &existed);
+  int at;
+  if (!existed) {
+    return true;
+  }
+  at = FindAccount(list, count, user);
+  if (at < 0) {
+    return count == 0;
+  }
+  return strcmp(list[at].secret, secret) == 0;
 }
 
 static void Put24(uint8_t* dest, uint32_t value) {
@@ -894,6 +1200,89 @@ static void CmdDir(uint8_t from, uint8_t port, int csd, const char* args, bool l
   Reply(from, port, body, 3);
 }
 
+static bool HasWild(const char* name) {
+  return strchr(name, '*') != NULL || strchr(name, '#') != NULL;
+}
+
+static bool WildMatch(const char* pattern, const char* text) {
+  if (*pattern == '*') {
+    return WildMatch(pattern + 1, text) || (*text != '\0' && WildMatch(pattern, text + 1));
+  }
+  if (*pattern == '#') {
+    return *text != '\0' && WildMatch(pattern + 1, text + 1);
+  }
+  if (*pattern == '\0' || *text == '\0') {
+    return *pattern == '\0' && *text == '\0';
+  }
+  if (toupper((unsigned char)*pattern) != toupper((unsigned char)*text)) {
+    return false;
+  }
+  return WildMatch(pattern + 1, text + 1);
+}
+
+static bool PatternDir(int csd, const char* spec, char* dir, size_t dir_cap, char* pattern,
+                       size_t pattern_cap) {
+  char parent[256];
+  const char* dot = strrchr(spec, '.');
+  const char* leaf = spec;
+  parent[0] = '\0';
+  if (dot != NULL) {
+    size_t n = (size_t)(dot - spec);
+    if (n >= sizeof(parent)) {
+      return false;
+    }
+    memcpy(parent, spec, n);
+    parent[n] = '\0';
+    leaf = dot + 1;
+  }
+  if (HasWild(parent) || strlen(leaf) >= pattern_cap) {
+    return false;
+  }
+  if (parent[0] == '\0') {
+    const char* cur = DirPath(csd);
+    snprintf(dir, dir_cap, "%s", cur != NULL ? cur : g_root);
+  } else if (!Resolve(csd, parent, dir, dir_cap) || !IsDir(dir)) {
+    return false;
+  }
+  snprintf(pattern, pattern_cap, "%s", leaf);
+  return true;
+}
+
+static int MatchObjects(const char* dir, const char* pattern, char paths[][512], int cap,
+                        bool files_only) {
+  DIR* dp;
+  struct dirent* ent;
+  int count = 0;
+  dp = opendir(dir);
+  if (dp == NULL) {
+    return 0;
+  }
+  while ((ent = readdir(dp)) != NULL && count < cap) {
+    char path[512];
+    char name[NAME_LEN + 1];
+    size_t n = strlen(ent->d_name);
+    if (ent->d_name[0] == '.' || EndsWithInf(ent->d_name) || n > NAME_LEN) {
+      continue;
+    }
+    memcpy(name, ent->d_name, n + 1);
+    Upper(name);
+    if (!BbcName(name) || !WildMatch(pattern, name) || !JoinName(path, sizeof(path), dir, ent->d_name)) {
+      continue;
+    }
+    if (files_only) {
+      if (!IsFile(path)) {
+        continue;
+      }
+    } else if (!IsFile(path) && !IsDir(path)) {
+      continue;
+    }
+    snprintf(paths[count], 512, "%s", path);
+    count++;
+  }
+  closedir(dp);
+  return count;
+}
+
 static void CmdDelete(uint8_t from, uint8_t port, int csd, const char* args) {
   char path[512];
   char inf[540];
@@ -904,6 +1293,39 @@ static void CmdDelete(uint8_t from, uint8_t port, int csd, const char* args) {
   const char* name = args;
   while (*name == ' ') {
     name++;
+  }
+  if (HasWild(name)) {
+    char dir[512];
+    char pattern[NAME_LEN + 1];
+    char paths[64][512];
+    int count;
+    int i;
+    if (!PatternDir(csd, name, dir, sizeof(dir), pattern, sizeof(pattern))) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    count = MatchObjects(dir, pattern, paths, 64, true);
+    if (count == 0) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    for (i = 0; i < count; i++) {
+      ReadInf(paths[i], false, &load, &exec, &access);
+      if ((access & 0x10) != 0) {
+        Fail(from, port, 0xbd, "Locked");
+        return;
+      }
+    }
+    for (i = 0; i < count; i++) {
+      char gone[540];
+      remove(paths[i]);
+      InfPath(paths[i], gone, sizeof(gone));
+      remove(gone);
+    }
+    body[0] = 0;
+    body[1] = 0;
+    Reply(from, port, body, 2);
+    return;
   }
   if (!Resolve(csd, name, path, sizeof(path)) || strcmp(path, g_root) == 0) {
     Fail(from, port, 0xd6, "Not found");
@@ -958,34 +1380,192 @@ static void CmdCdir(uint8_t from, uint8_t port, int csd, const char* args) {
   Reply(from, port, body, 2);
 }
 
-static void CmdInfo(uint8_t from, uint8_t port, int csd, const char* args) {
-  char path[512];
-  char text[80];
+static void RewritePath(char* path, size_t cap, const char* old_path, const char* new_path) {
+  size_t n = strlen(old_path);
+  char rest[512];
+  if (strcmp(path, old_path) == 0) {
+    snprintf(path, cap, "%s", new_path);
+    return;
+  }
+  if (strncmp(path, old_path, n) == 0 && path[n] == '/') {
+    snprintf(rest, sizeof(rest), "%s", path + n);
+    snprintf(path, cap, "%s%s", new_path, rest);
+  }
+}
+
+static void NoteRename(const char* old_path, const char* new_path) {
+  int i;
+  for (i = 0; i < MAX_HANDLES; i++) {
+    if (g_dir[i].used) {
+      RewritePath(g_dir[i].path, sizeof(g_dir[i].path), old_path, new_path);
+    }
+  }
+  for (i = 0; i < MAX_FILES; i++) {
+    if (g_file[i].used) {
+      RewritePath(g_file[i].path, sizeof(g_file[i].path), old_path, new_path);
+    }
+  }
+  if (g_saving) {
+    RewritePath(g_save_path, sizeof(g_save_path), old_path, new_path);
+  }
+}
+
+static bool NextWord(const char** line, char* word, size_t cap) {
+  size_t n = 0;
+  const char* p = *line;
+  while (*p == ' ') {
+    p++;
+  }
+  if (*p == '\0') {
+    word[0] = '\0';
+    return false;
+  }
+  while (*p != '\0' && *p != ' ') {
+    if (n + 1 < cap) {
+      word[n++] = *p;
+    }
+    p++;
+  }
+  word[n] = '\0';
+  while (*p == ' ') {
+    p++;
+  }
+  *line = p;
+  return true;
+}
+
+static void CmdRename(uint8_t from, uint8_t port, int csd, const char* args) {
+  char old_name[256];
+  char new_name[256];
+  char old_path[512];
+  char new_path[512];
+  char parent[512];
+  char old_inf[540];
+  char new_inf[540];
+  uint32_t load;
+  uint32_t exec;
+  uint8_t access;
+  uint8_t body[2] = {0, 0};
+  const char* rest = args;
+  const char* slash;
+  if (!NextWord(&rest, old_name, sizeof(old_name)) || !NextWord(&rest, new_name, sizeof(new_name))) {
+    Fail(from, port, 0xfe, "Bad command");
+    return;
+  }
+  if (!Resolve(csd, old_name, old_path, sizeof(old_path)) || strcmp(old_path, g_root) == 0 ||
+      (!IsFile(old_path) && !IsDir(old_path))) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  if (!Resolve(csd, new_name, new_path, sizeof(new_path)) || strcmp(new_path, g_root) == 0) {
+    Fail(from, port, 0xfd, "Bad name");
+    return;
+  }
+  slash = strrchr(new_path, '/');
+  if (slash == NULL || slash == new_path) {
+    Fail(from, port, 0xfd, "Bad name");
+    return;
+  }
+  memcpy(parent, new_path, (size_t)(slash - new_path));
+  parent[slash - new_path] = '\0';
+  if (!IsDir(parent)) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  if (strcmp(old_path, new_path) == 0) {
+    Reply(from, port, body, 2);
+    return;
+  }
+  if (IsDir(old_path) && strncmp(new_path, old_path, strlen(old_path)) == 0 &&
+      new_path[strlen(old_path)] == '/') {
+    Fail(from, port, 0xfd, "Bad name");
+    return;
+  }
+  if (IsFile(new_path) || IsDir(new_path)) {
+    Fail(from, port, 0xaf, "Already exists");
+    return;
+  }
+  ReadInf(old_path, IsDir(old_path), &load, &exec, &access);
+  if ((access & 0x10) != 0) {
+    Fail(from, port, 0xbd, "Locked");
+    return;
+  }
+  if (rename(old_path, new_path) != 0) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  InfPath(old_path, old_inf, sizeof(old_inf));
+  InfPath(new_path, new_inf, sizeof(new_inf));
+  if (IsFile(old_inf) || IsDir(old_inf)) {
+    rename(old_inf, new_inf);
+  }
+  NoteRename(old_path, new_path);
+  fprintf(stderr, "station %u: RENAME %s %s\n", from, old_name, new_name);
+  Reply(from, port, body, 2);
+}
+
+static int InfoLine(const char* path, char* text, size_t cap) {
   char access[12];
   uint32_t load;
   uint32_t exec;
   uint8_t attr;
-  uint8_t body[96];
-  size_t n;
+  bool directory = IsDir(path);
+  uint32_t length = 0;
+  DescribeFile(path, directory, &load, &exec, &length, &attr);
+  AccessText(attr, access);
+  snprintf(text, cap, "%-10s %-8s %08X %08X %06X", Leaf(path), access, load, exec, length);
+  Upper(text);
+  return (int)strlen(text);
+}
+
+static void CmdInfo(uint8_t from, uint8_t port, int csd, const char* args) {
+  char path[512];
+  char text[80];
+  uint8_t body[ECONET_MAX_FRAME];
+  int n;
   const char* name = args;
   while (*name == ' ') {
     name++;
+  }
+  body[0] = 4;
+  body[1] = 0;
+  if (HasWild(name)) {
+    char dir[512];
+    char pattern[NAME_LEN + 1];
+    char paths[64][512];
+    int count;
+    int i;
+    int used = 2;
+    if (!PatternDir(csd, name, dir, sizeof(dir), pattern, sizeof(pattern))) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    count = MatchObjects(dir, pattern, paths, 64, false);
+    if (count == 0) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    for (i = 0; i < count; i++) {
+      n = InfoLine(paths[i], text, sizeof(text));
+      if (used + n + 1 > ECONET_MAX_FRAME - 4) {
+        break;
+      }
+      memcpy(body + used, text, (size_t)n);
+      used += n;
+      body[used++] = 0x00;
+    }
+    body[used - 1] = 0x80;
+    Reply(from, port, body, used);
+    return;
   }
   if (!Resolve(csd, name, path, sizeof(path)) || (!IsFile(path) && !IsDir(path))) {
     Fail(from, port, 0xd6, "Not found");
     return;
   }
-  ReadInf(path, IsDir(path), &load, &exec, &attr);
-  AccessText(attr, access);
-  snprintf(text, sizeof(text), "%-10s %-8s %08X %08X %06X", Leaf(path), access, load, exec,
-           IsDir(path) ? 0 : FileLength(path));
-  Upper(text);
-  n = strlen(text);
-  body[0] = 4;
-  body[1] = 0;
-  memcpy(body + 2, text, n);
+  n = InfoLine(path, text, sizeof(text));
+  memcpy(body + 2, text, (size_t)n);
   body[2 + n] = 0x80;
-  Reply(from, port, body, (int)(3 + n));
+  Reply(from, port, body, 3 + n);
 }
 
 static uint8_t ParseAccess(const char* text, uint8_t previous) {
@@ -1030,6 +1610,31 @@ static void CmdAccess(uint8_t from, uint8_t port, int csd, const char* args) {
     return;
   }
   Upper(name);
+  if (HasWild(name)) {
+    char dir[512];
+    char pattern[NAME_LEN + 1];
+    char paths[64][512];
+    int count;
+    int i;
+    if (!PatternDir(csd, name, dir, sizeof(dir), pattern, sizeof(pattern))) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    count = MatchObjects(dir, pattern, paths, 64, false);
+    if (count == 0) {
+      Fail(from, port, 0xd6, "Not found");
+      return;
+    }
+    for (i = 0; i < count; i++) {
+      ReadInf(paths[i], IsDir(paths[i]), &load, &exec, &access);
+      access = ParseAccess(rights, access);
+      WriteInf(paths[i], load, exec, access);
+    }
+    body[0] = 0;
+    body[1] = 0;
+    Reply(from, port, body, 2);
+    return;
+  }
   if (!Resolve(csd, name, path, sizeof(path)) || (!IsFile(path) && !IsDir(path))) {
     Fail(from, port, 0xd6, "Not found");
     return;
@@ -1083,6 +1688,186 @@ static bool IAmCommand(const char* line, const char** args) {
   return true;
 }
 
+static void CmdRun(uint8_t from, uint8_t port, const char* line) {
+  uint8_t body[96];
+  size_t n = 0;
+  while (*line == ' ') {
+    line++;
+  }
+  if (*line == '\0') {
+    Fail(from, port, 0xfe, "Bad command");
+    return;
+  }
+  while (line[n] != '\0' && line[n] != ' ' && n < 80) {
+    n++;
+  }
+  body[0] = 8;
+  body[1] = 0;
+  memcpy(body + 2, line, n);
+  body[2 + n] = 0x0d;
+  fprintf(stderr, "station %u: RUN %.*s\n", from, (int)n, line);
+  Reply(from, port, body, (int)(3 + n));
+}
+
+static void CmdPass(uint8_t from, uint8_t port, const char* args) {
+  struct Account list[MAX_ACCOUNTS];
+  bool existed = false;
+  int count = LoadAccounts(list, &existed);
+  int at = FindAccount(list, count, g_user);
+  char old_secret[64];
+  char new_secret[64];
+  const char* rest = args;
+  uint8_t body[2] = {0, 0};
+  const char* current = at >= 0 ? list[at].secret : "";
+  if (!NextWord(&rest, old_secret, sizeof(old_secret))) {
+    Fail(from, port, 0xfe, "Bad command");
+    return;
+  }
+  Upper(old_secret);
+  if (!NextWord(&rest, new_secret, sizeof(new_secret))) {
+    if (current[0] != '\0') {
+      Fail(from, port, 0xbb, "Wrong password");
+      return;
+    }
+    snprintf(new_secret, sizeof(new_secret), "%s", old_secret);
+    old_secret[0] = '\0';
+  } else {
+    Upper(new_secret);
+  }
+  if (strcmp(current, old_secret) != 0) {
+    Fail(from, port, 0xbb, "Wrong password");
+    return;
+  }
+  if (at < 0) {
+    if (count >= MAX_ACCOUNTS) {
+      Fail(from, port, 0xc0, "Too many users");
+      return;
+    }
+    at = count++;
+    snprintf(list[at].name, sizeof(list[at].name), "%s", g_user);
+    list[at].system = true;
+  }
+  snprintf(list[at].secret, sizeof(list[at].secret), "%s", new_secret);
+  if (!SaveAccounts(list, count)) {
+    Fail(from, port, 0xc7, "Disc full");
+    return;
+  }
+  Reply(from, port, body, 2);
+}
+
+static void CmdNewUser(uint8_t from, uint8_t port, const char* args) {
+  struct Account list[MAX_ACCOUNTS];
+  bool existed = false;
+  int count = LoadAccounts(list, &existed);
+  char name[64];
+  char secret[64];
+  char path[512];
+  const char* rest = args;
+  uint8_t body[2] = {0, 0};
+  if (!CallerIsSystem(list, count, existed)) {
+    Fail(from, port, 0xbd, "Insufficient privilege");
+    return;
+  }
+  if (!NextWord(&rest, name, sizeof(name)) || !BbcName(name)) {
+    Fail(from, port, 0xfe, "Bad command");
+    return;
+  }
+  Upper(name);
+  if (!NextWord(&rest, secret, sizeof(secret))) {
+    secret[0] = '\0';
+  } else {
+    Upper(secret);
+  }
+  if (FindAccount(list, count, name) >= 0) {
+    Fail(from, port, 0xaf, "Already exists");
+    return;
+  }
+  if (count + (FindAccount(list, count, g_user) < 0 ? 1 : 0) >= MAX_ACCOUNTS) {
+    Fail(from, port, 0xc0, "Too many users");
+    return;
+  }
+  if (!JoinName(path, sizeof(path), g_root, name)) {
+    Fail(from, port, 0xfd, "Bad name");
+    return;
+  }
+  if (IsFile(path)) {
+    Fail(from, port, 0xaf, "Types don't match");
+    return;
+  }
+  if (!IsDir(path)) {
+    if (MakeDir(path) != 0) {
+      Fail(from, port, 0xc7, "Disc full");
+      return;
+    }
+    WriteInf(path, 0, 0, 0x2d);
+  }
+  if (FindAccount(list, count, g_user) < 0) {
+    snprintf(list[count].name, sizeof(list[count].name), "%s", g_user);
+    list[count].secret[0] = '\0';
+    list[count].system = true;
+    count++;
+  }
+  snprintf(list[count].name, sizeof(list[count].name), "%s", name);
+  snprintf(list[count].secret, sizeof(list[count].secret), "%s", secret);
+  list[count].system = false;
+  count++;
+  if (!SaveAccounts(list, count)) {
+    Fail(from, port, 0xc7, "Disc full");
+    return;
+  }
+  fprintf(stderr, "station %u: NEWUSER %s\n", from, name);
+  Reply(from, port, body, 2);
+}
+
+static void CmdPriv(uint8_t from, uint8_t port, const char* args) {
+  struct Account list[MAX_ACCOUNTS];
+  bool existed = false;
+  int count = LoadAccounts(list, &existed);
+  char name[64];
+  char flag[16];
+  const char* rest = args;
+  int at;
+  int i;
+  int systems = 0;
+  bool grant;
+  uint8_t body[2] = {0, 0};
+  if (!CallerIsSystem(list, count, existed)) {
+    Fail(from, port, 0xbd, "Insufficient privilege");
+    return;
+  }
+  if (!NextWord(&rest, name, sizeof(name))) {
+    Fail(from, port, 0xfe, "Bad command");
+    return;
+  }
+  Upper(name);
+  grant = NextWord(&rest, flag, sizeof(flag)) && (flag[0] == 'S' || flag[0] == 's');
+  at = FindAccount(list, count, name);
+  if (at < 0) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  if (!grant && list[at].system) {
+    for (i = 0; i < count; i++) {
+      if (list[i].system) {
+        systems++;
+      }
+    }
+    if (systems <= 1) {
+      Fail(from, port, 0xbd, "Insufficient privilege");
+      return;
+    }
+  }
+  list[at].system = grant;
+  if (!SaveAccounts(list, count)) {
+    Fail(from, port, 0xc7, "Disc full");
+    return;
+  }
+  Reply(from, port, body, 2);
+}
+
+static void CmdFree(uint8_t from, uint8_t port, const char* args);
+static void CmdSdisc(uint8_t from, uint8_t port, const char* args);
+
 static void Command(uint8_t from, const uint8_t* payload, int len) {
   char line[256];
   int csd;
@@ -1119,6 +1904,18 @@ static void Command(uint8_t from, const uint8_t* payload, int len) {
     CmdDir(from, reply, csd, CommandRest(rest), false);
   } else if (CommandWord(rest, "LIB") || (rest[0] == 'L' && rest[1] == 'I')) {
     CmdDir(from, reply, csd, CommandRest(rest), true);
+  } else if (CommandWord(rest, "PASS")) {
+    CmdPass(from, reply, CommandRest(rest));
+  } else if (CommandWord(rest, "NEWUSER") || CommandWord(rest, "NEWU")) {
+    CmdNewUser(from, reply, CommandRest(rest));
+  } else if (CommandWord(rest, "PRIV")) {
+    CmdPriv(from, reply, CommandRest(rest));
+  } else if (CommandWord(rest, "FREE")) {
+    CmdFree(from, reply, CommandRest(rest));
+  } else if (CommandWord(rest, "SDISC") || CommandWord(rest, "SD")) {
+    CmdSdisc(from, reply, CommandRest(rest));
+  } else if (CommandWord(rest, "RENAME") || CommandWord(rest, "REN")) {
+    CmdRename(from, reply, csd, CommandRest(rest));
   } else if (CommandWord(rest, "DELETE") || CommandWord(rest, "DESTROY") ||
              (rest[0] == 'D' && rest[1] == '.')) {
     CmdDelete(from, reply, csd, CommandRest(rest));
@@ -1137,7 +1934,12 @@ static void Command(uint8_t from, const uint8_t* payload, int len) {
     g_logged = false;
     Reply(from, reply, body, 2);
   } else {
-    Fail(from, reply, 0xfe, "Bad command");
+    // NFS has no local *RUN. An unknown line is the filename, and command
+    // code 8 tells the client to load it (function 5) and jump to the
+    // execution address. The name has to start at the third reply byte:
+    // the client checks the second byte as the return code, then leaves
+    // the rest in place as the function 5 filename.
+    CmdRun(from, reply, rest);
   }
 }
 
@@ -1179,8 +1981,8 @@ static int Collect(const char* dir, struct Entry* entries, int cap) {
       at--;
     }
     snprintf(entries[at].name, sizeof(entries[at].name), "%s", name);
-    ReadInf(path, IsDir(path), &entries[at].load, &entries[at].exec, &entries[at].access);
-    entries[at].length = IsDir(path) ? 0 : FileLength(path);
+    DescribeFile(path, IsDir(path), &entries[at].load, &entries[at].exec, &entries[at].length,
+                 &entries[at].access);
     count++;
   }
   closedir(dp);
@@ -1349,6 +2151,58 @@ static void SaveData(uint8_t from, const uint8_t* data, int len) {
   Reply(from, g_save_ack, ack, 1);
 }
 
+static void FinishPut(uint8_t from) {
+  uint8_t body[8];
+  int slot = g_put_slot;
+  g_putting = false;
+  if (slot >= 0 && g_file[slot].used && g_file[slot].fp != NULL) {
+    uint32_t end = g_put_offset + g_put_valid;
+    fflush(g_file[slot].fp);
+    if (end > g_file[slot].length) {
+      g_file[slot].length = end;
+    }
+    if (g_put_sequential) {
+      g_file[slot].ptr = end;
+    }
+  }
+  body[0] = 0;
+  body[1] = 0;
+  body[2] = g_put_valid < g_put_count ? 0x80 : 0x00;
+  Put24(body + 3, g_put_valid);
+  body[6] = 0;
+  Reply(from, g_put_reply, body, 7);
+}
+
+static void PutData(uint8_t from, const uint8_t* data, int len) {
+  uint8_t ack[1] = {0};
+  int store;
+  FILE* fp;
+  if (!g_putting || from != g_put_client || g_put_slot < 0) {
+    return;
+  }
+  if (g_put_got >= g_put_count) {
+    FinishPut(from);
+    return;
+  }
+  store = len;
+  if ((uint32_t)store > g_put_count - g_put_got) {
+    store = (int)(g_put_count - g_put_got);
+  }
+  fp = g_file[g_put_slot].fp;
+  if (store > 0 && fp != NULL &&
+      fseek(fp, (long)(g_put_offset + g_put_got), SEEK_SET) == 0) {
+    g_put_valid += (uint32_t)fwrite(data, 1, (size_t)store, fp);
+  }
+  g_put_got += (uint32_t)store;
+  // The last block is not acknowledged. NFS has already stopped listening
+  // on the data port and is waiting for the completion reply.
+  if (g_put_got >= g_put_count) {
+    FinishPut(from);
+    return;
+  }
+  Reply(from, g_put_port, ack, 1);
+}
+
 static void Save(uint8_t from, const uint8_t* payload, int len) {
   char name[256];
   char path[512];
@@ -1437,6 +2291,20 @@ static bool SendSpan(uint8_t from, uint8_t port, FILE* fp, uint32_t offset, uint
   return true;
 }
 
+static void SendBytes(uint8_t from, uint8_t data_port, const uint8_t* bytes, uint32_t length) {
+  uint32_t sent = 0;
+  while (sent < length) {
+    uint32_t chunk = FS_BLOCK;
+    if (chunk > length - sent) {
+      chunk = length - sent;
+    }
+    if (!Transmit(from, data_port, bytes + sent, (int)chunk)) {
+      return;
+    }
+    sent += chunk;
+  }
+}
+
 static void SendFile(uint8_t from, uint8_t data_port, const char* path, uint32_t length) {
   FILE* fp = fopen(path, "rb");
   uint8_t block[FS_BLOCK];
@@ -1495,26 +2363,44 @@ static void Load(uint8_t from, const uint8_t* payload, int len, bool library_too
     }
   }
   ReadInf(path, false, &load, &exec, &access);
-  length = FileLength(path);
-  Today(date);
-  fprintf(stderr, "station %u: LOAD %s\n", from, name);
-  body[0] = 0;
-  body[1] = 0;
-  Put32(body + 2, load);
-  Put32(body + 6, exec);
-  Put24(body + 10, length);
-  body[13] = access;
-  body[14] = date[0];
-  body[15] = date[1];
-  name_n = strlen(name);
-  if (name_n > 30) {
-    name_n = 30;
-  }
-  memcpy(body + 16, name, name_n);
-  body[16 + name_n] = 0x0d;
-  Reply(from, reply, body, (int)(17 + name_n));
-  if (length > 0) {
-    SendFile(from, data_port, path, length);
+  {
+    uint8_t* image = NULL;
+    uint32_t elf_load = 0;
+    uint32_t elf_exec = 0;
+    uint32_t elf_len = 0;
+    if (ElfImage(path, &elf_load, &elf_exec, &elf_len, &image)) {
+      load = elf_load;
+      exec = elf_exec;
+      length = elf_len;
+    } else {
+      length = FileLength(path);
+      image = NULL;
+    }
+    Today(date);
+    fprintf(stderr, "station %u: LOAD %s%s\n", from, name, image != NULL ? " (ELF)" : "");
+    body[0] = 0;
+    body[1] = 0;
+    Put32(body + 2, load);
+    Put32(body + 6, exec);
+    Put24(body + 10, length);
+    body[13] = access;
+    body[14] = date[0];
+    body[15] = date[1];
+    name_n = strlen(name);
+    if (name_n > 30) {
+      name_n = 30;
+    }
+    memcpy(body + 16, name, name_n);
+    body[16 + name_n] = 0x0d;
+    Reply(from, reply, body, (int)(17 + name_n));
+    if (length > 0) {
+      if (image != NULL) {
+        SendBytes(from, data_port, image, length);
+      } else {
+        SendFile(from, data_port, path, length);
+      }
+    }
+    free(image);
   }
   used = 2;
   body[0] = 0;
@@ -1561,9 +2447,34 @@ static void Open(uint8_t from, const uint8_t* payload, int len) {
     Fail(from, reply, 0x64, "Too many open files");
     return;
   }
-  g_file[i].fp = fopen(path, read_only ? "rb" : "r+b");
-  if (g_file[i].fp == NULL && !read_only) {
+  g_file[i].fp = NULL;
+  g_file[i].length = 0;
+  if (read_only) {
+    uint8_t* image = NULL;
+    uint32_t elf_load = 0;
+    uint32_t elf_exec = 0;
+    uint32_t elf_len = 0;
+    FILE* image_file = NULL;
+    if (ElfImage(path, &elf_load, &elf_exec, &elf_len, &image)) {
+      image_file = tmpfile();
+      if (image_file != NULL &&
+          fwrite(image, 1, (size_t)elf_len, image_file) == (size_t)elf_len) {
+        rewind(image_file);
+        g_file[i].fp = image_file;
+        g_file[i].length = elf_len;
+      } else if (image_file != NULL) {
+        fclose(image_file);
+      }
+      free(image);
+    }
+    if (g_file[i].fp == NULL) {
+      g_file[i].fp = fopen(path, "rb");
+    }
+  } else if (create) {
+    // OPENOUT replaces an existing file. OPENUP (create clear) keeps it.
     g_file[i].fp = fopen(path, "w+b");
+  } else {
+    g_file[i].fp = fopen(path, "r+b");
   }
   if (g_file[i].fp == NULL) {
     Fail(from, reply, 0xd6, "Not found");
@@ -1572,7 +2483,9 @@ static void Open(uint8_t from, const uint8_t* payload, int len) {
   g_file[i].used = true;
   g_file[i].write = !read_only;
   g_file[i].ptr = 0;
-  g_file[i].length = FileLength(path);
+  if (g_file[i].length == 0) {
+    g_file[i].length = FileLength(path);
+  }
   snprintf(g_file[i].path, sizeof(g_file[i].path), "%s", path);
   body[0] = 0;
   body[1] = 0;
@@ -1699,6 +2612,67 @@ static void SetPointer(uint8_t from, const uint8_t* payload, int len) {
   Reply(from, reply, body, 2);
 }
 
+static void SetObject(uint8_t from, const uint8_t* payload, int len) {
+  char name[256];
+  char path[512];
+  uint8_t body[2] = {0, 0};
+  uint8_t reply = payload[0];
+  int arg;
+  int name_at;
+  int csd;
+  bool directory;
+  uint32_t load = 0;
+  uint32_t exec = 0;
+  uint8_t access = 0;
+  if (!NeedLogin(from, reply) || len < 8) {
+    return;
+  }
+  arg = payload[5];
+  csd = payload[3];
+  if (arg == 1) {
+    name_at = 15;
+  } else if (arg == 2 || arg == 3) {
+    name_at = 10;
+  } else if (arg == 4) {
+    name_at = 7;
+  } else {
+    Fail(from, reply, 0x85, "Invalid function");
+    return;
+  }
+  if (len <= name_at) {
+    return;
+  }
+  CrText(payload + name_at, len - name_at, name, sizeof(name));
+  if (!Resolve(csd, name, path, sizeof(path)) || (!IsFile(path) && !IsDir(path))) {
+    Fail(from, reply, 0xd6, "Not found");
+    return;
+  }
+  directory = IsDir(path);
+  ReadInf(path, directory, &load, &exec, &access);
+  if ((arg == 2 || arg == 3) && (access & 0x10) != 0) {
+    Fail(from, reply, 0xbd, "Locked");
+    return;
+  }
+  if (arg == 1) {
+    load = Get32(payload + 6);
+    exec = Get32(payload + 10);
+    access = payload[14];
+  } else if (arg == 2) {
+    load = Get32(payload + 6);
+  } else if (arg == 3) {
+    exec = Get32(payload + 6);
+  } else {
+    access = payload[6];
+  }
+  if (directory) {
+    access = (uint8_t)(access | 0x20);
+  } else {
+    access = (uint8_t)(access & (uint8_t)~0x20);
+  }
+  WriteInf(path, load, exec, access);
+  Reply(from, reply, body, 2);
+}
+
 static void ReadEof(uint8_t from, const uint8_t* payload, int len) {
   uint8_t body[3];
   uint8_t reply = payload[0];
@@ -1745,8 +2719,7 @@ static void ObjectInfo(uint8_t from, const uint8_t* payload, int len) {
     }
   }
   if (kind != 0) {
-    ReadInf(path, kind == 2, &load, &exec, &access);
-    length = kind == 2 ? 0 : FileLength(path);
+    DescribeFile(path, kind == 2, &load, &exec, &length, &access);
   }
   Today(date);
   body[0] = 0;
@@ -1815,6 +2788,119 @@ static void Environment(uint8_t from, const uint8_t* payload, int len) {
   Pad(body + 19, csd_leaf, NAME_LEN);
   Pad(body + 29, lib_leaf, NAME_LEN);
   Reply(from, reply, body, 39);
+}
+
+static void DiscBytes(uint64_t* free_bytes, uint64_t* total_bytes) {
+  *free_bytes = 0;
+  *total_bytes = 0;
+#ifndef _WIN32
+  {
+    struct statvfs st;
+    if (statvfs(g_root, &st) == 0) {
+      *free_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_frsize;
+      *total_bytes = (uint64_t)st.f_blocks * (uint64_t)st.f_frsize;
+    }
+  }
+#endif
+}
+
+static bool ThisDisc(const char* name) {
+  char text[32];
+  size_t n = 0;
+  while (name[n] != '\0' && name[n] != ' ' && n + 1 < sizeof(text)) {
+    text[n] = name[n];
+    n++;
+  }
+  text[n] = '\0';
+  if (text[0] == ':') {
+    memmove(text, text + 1, strlen(text));
+  }
+  Upper(text);
+  return text[0] == '\0' || strcmp(text, g_disc) == 0;
+}
+
+static void CmdFree(uint8_t from, uint8_t port, const char* args) {
+  char text[80];
+  uint8_t body[96];
+  uint64_t free_bytes;
+  uint64_t total_bytes;
+  size_t n;
+  while (*args == ' ') {
+    args++;
+  }
+  if (!ThisDisc(args)) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  DiscBytes(&free_bytes, &total_bytes);
+  snprintf(text, sizeof(text), "%s  %lluK free of %lluK", g_disc,
+           (unsigned long long)(free_bytes / 1024), (unsigned long long)(total_bytes / 1024));
+  n = strlen(text);
+  body[0] = 4;
+  body[1] = 0;
+  memcpy(body + 2, text, n);
+  body[2 + n] = 0x80;
+  Reply(from, port, body, (int)(3 + n));
+}
+
+static void CmdSdisc(uint8_t from, uint8_t port, const char* args) {
+  char library[512];
+  uint8_t body[6];
+  while (*args == ' ') {
+    args++;
+  }
+  if (!ThisDisc(args)) {
+    Fail(from, port, 0xd6, "Not found");
+    return;
+  }
+  g_csd = g_urd;
+  g_lib = g_urd;
+  if (FindChild(g_root, "LIBRARY", library, sizeof(library)) && IsDir(library)) {
+    g_lib = DirHandle(library);
+  }
+  body[0] = 6;
+  body[1] = 0;
+  body[2] = (uint8_t)g_urd;
+  body[3] = (uint8_t)g_csd;
+  body[4] = (uint8_t)g_lib;
+  fprintf(stderr, "station %u: SDISC %s\n", from, g_disc);
+  Reply(from, port, body, 5);
+}
+
+static void FreeSpace(uint8_t from, const uint8_t* payload, int len) {
+  char name[64];
+  uint8_t body[8];
+  uint8_t reply = payload[0];
+  uint64_t free_bytes;
+  uint64_t total_bytes;
+  uint32_t free_blocks;
+  uint32_t total_blocks;
+  if (!NeedLogin(from, reply)) {
+    return;
+  }
+  name[0] = '\0';
+  if (len > 5) {
+    CrText(payload + 5, len - 5, name, sizeof(name));
+  }
+  if (!ThisDisc(name)) {
+    Fail(from, reply, 0xd6, "Not found");
+    return;
+  }
+  DiscBytes(&free_bytes, &total_bytes);
+  free_blocks = (uint32_t)(free_bytes / 256);
+  total_blocks = (uint32_t)(total_bytes / 256);
+  if (free_blocks > 0xffffffu) {
+    free_blocks = 0xffffffu;
+  }
+  if (total_blocks > 0xffffffu) {
+    total_blocks = 0xffffffu;
+  }
+  // The first byte is 1 when both the free space and the disc size follow.
+  body[0] = 1;
+  body[1] = 0;
+  Put24(body + 2, free_blocks);
+  Put24(body + 5, total_blocks);
+  Reply(from, reply, body, 8);
 }
 
 static void Version(uint8_t from, uint8_t reply) {
@@ -1952,8 +3038,93 @@ static void GetBytes(uint8_t from, const uint8_t* payload, int len) {
   Reply(from, reply, body, 7);
 }
 
+// Fill a hole when a write starts past the current end.
+static bool PadTo(FILE* fp, uint32_t length, uint32_t pos) {
+  uint8_t zeros[256];
+  if (pos <= length) {
+    return true;
+  }
+  memset(zeros, 0, sizeof(zeros));
+  if (fseek(fp, (long)length, SEEK_SET) != 0) {
+    return false;
+  }
+  while (length < pos) {
+    uint32_t n = pos - length;
+    if (n > sizeof(zeros)) {
+      n = (uint32_t)sizeof(zeros);
+    }
+    if (fwrite(zeros, 1, (size_t)n, fp) != (size_t)n) {
+      return false;
+    }
+    length += n;
+  }
+  return true;
+}
+
+// OSGBPB write. Same header as GetBytes, but the data then arrives from the
+// client on the port it named (NFS uses &91). The first reply's first byte
+// is the block size NFS will send; the second byte has to stay zero because
+// that is the return code.
+static void PutBytes(uint8_t from, const uint8_t* payload, int len) {
+  uint8_t body[8];
+  uint8_t reply;
+  int slot;
+  uint32_t count;
+  uint32_t offset;
+  bool sequential;
+  if (len < 13) {
+    return;
+  }
+  reply = payload[0];
+  if (!NeedLogin(from, reply)) {
+    return;
+  }
+  if (g_putting || g_saving) {
+    Fail(from, reply, 0xc2, "Server busy");
+    return;
+  }
+  slot = FileSlot(payload[5]);
+  if (slot < 0 || !g_file[slot].write || g_file[slot].fp == NULL) {
+    Fail(from, reply, 0x65, "Not open");
+    return;
+  }
+  sequential = payload[6] == 0;
+  count = Get24(payload + 7);
+  offset = sequential ? g_file[slot].ptr : Get24(payload + 10);
+  if (count > 0 && offset > g_file[slot].length) {
+    if (!PadTo(g_file[slot].fp, g_file[slot].length, offset)) {
+      Fail(from, reply, 0x73, "Beyond file end");
+      return;
+    }
+    g_file[slot].length = offset;
+  }
+  g_putting = true;
+  g_put_client = from;
+  g_put_reply = reply;
+  g_put_port = payload[2];
+  g_put_slot = slot;
+  g_put_sequential = sequential;
+  g_put_offset = offset;
+  g_put_count = count;
+  g_put_got = 0;
+  g_put_valid = 0;
+  body[0] = (uint8_t)FS_PUT_BLOCK;
+  body[1] = 0;
+  body[2] = g_put_port;
+  body[3] = (uint8_t)FS_PUT_BLOCK;
+  body[4] = 0;
+  Reply(from, reply, body, 5);
+  if (count == 0) {
+    FinishPut(from);
+  }
+}
+
 static void Dispatch(uint8_t from, uint8_t scout_port, const uint8_t* payload, int len) {
   uint8_t function;
+  if (g_putting && scout_port == g_put_port) {
+    PutData(from, payload, len);
+    return;
+  }
   if (scout_port == FS_DATA_PORT) {
     if (!g_saving && len >= 2 && (payload[1] == 8 || payload[1] == 9)) {
       ByteStream(from, payload, len);
@@ -1994,6 +3165,8 @@ static void Dispatch(uint8_t from, uint8_t scout_port, const uint8_t* payload, i
     PutByte(from, payload, len);
   } else if (function == 10) {
     GetBytes(from, payload, len);
+  } else if (function == 11) {
+    PutBytes(from, payload, len);
   } else if (function == 12) {
     ReadPointer(from, payload, len);
   } else if (function == 13) {
@@ -2002,6 +3175,8 @@ static void Dispatch(uint8_t from, uint8_t scout_port, const uint8_t* payload, i
     ReadEof(from, payload, len);
   } else if (function == 18) {
     ObjectInfo(from, payload, len);
+  } else if (function == 19) {
+    SetObject(from, payload, len);
   } else if (function == 20) {
     DeleteObject(from, payload, len);
   } else if (function == 21) {
@@ -2023,13 +3198,18 @@ static void Dispatch(uint8_t from, uint8_t scout_port, const uint8_t* payload, i
     Reply(from, payload[0], body, 2);
   } else if (function == 25) {
     Version(from, payload[0]);
+  } else if (function == 26) {
+    FreeSpace(from, payload, len);
   } else {
     Fail(from, payload[0], 0x85, "Invalid function");
   }
 }
 
 static bool Listening(uint8_t port) {
-  return port == FS_COMMAND_PORT || port == FS_DATA_PORT;
+  if (port == FS_COMMAND_PORT || port == FS_DATA_PORT) {
+    return true;
+  }
+  return g_putting && port == g_put_port;
 }
 
 static void OnFrame(const uint8_t* frame, int len) {
@@ -2044,8 +3224,13 @@ static void OnFrame(const uint8_t* frame, int len) {
   }
   // Bit 7 marks a scout. Bit 0 is the byte-stream sequence number, which the
   // reply scout has to repeat or the client retries until it gives up.
+  // A short data block is six bytes on the wire, the same length as a scout.
+  // Once a save or a block write has announced itself, the next frame from
+  // that station on the data port is the file bytes.
   if (len == 6 && (frame[4] & 0xfe) == 0x80 && Listening(frame[5]) &&
-      !(g_saving && scout_open && frame[2] == g_save_client && scout_port == FS_DATA_PORT)) {
+      !(scout_open && frame[2] == scout_from &&
+        ((g_saving && scout_port == FS_DATA_PORT && frame[2] == g_save_client) ||
+         (g_putting && scout_port == g_put_port && frame[2] == g_put_client)))) {
     SendAck(frame[2], frame[3]);
     scout_from = frame[2];
     scout_port = frame[5];
