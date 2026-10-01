@@ -469,6 +469,23 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
       fprintf(stderr, "ROM os: %s\n", os_path);
     }
   }
+  // With no OS the interpreter runs its built-in demo, which -selftest
+  // checks. A normal run would only show that demo, so refuse to start.
+  if (os_path == NULL && !selftest) {
+    const char* searched = roms_arg != NULL ? roms_arg : g_rom_dir;
+    if (searched != NULL) {
+      fprintf(stderr, "No OS ROM in %s. Add os.rom or os-<name>.rom, or pass -os file.\n",
+              searched);
+    } else {
+      fprintf(stderr,
+              "No %s directory found. Create it with os.rom or os-<name>.rom, or pass -os "
+              "file.\n",
+              BbcMachineRomDirectoryName(machine));
+    }
+    ReleaseRoms();
+    *status = 1;
+    return false;
+  }
   W65C02InterpreterInit(&g_cpu, false, true, false, NULL);
   cpu_inited = true;
   if (!run_ahead && !W65C02InterpreterSetClockMhz(&g_cpu, clock_mhz)) {
