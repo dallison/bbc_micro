@@ -54,18 +54,6 @@ def hugo_at(data, sector):
             data[base + 0x4FB:base + 0x4FF] == b"Hugo")
 
 
-def directory_ok(data, sector):
-    """A directory Hugo may be missing from a blank trailer, as on c14's h."""
-    if hugo_at(data, sector):
-        return True
-    base = sector * SECTOR
-    if sector < 0 or base + DIR_BYTES > len(data):
-        return False
-    if data[base + 1:base + 5] != b"Hugo":
-        return False
-    return data[base + 0x4CC:base + DIR_BYTES] == bytes(DIR_BYTES - 0x4CC)
-
-
 def decode_name(raw):
     """Return the visible name and the attribute bits stored in it."""
     chars = []
@@ -140,6 +128,62 @@ class AdfsImage(object):
             if total != data[base + 255]:
                 raise DiscError("%s has a bad free-space checksum" % path)
         self.size = size
+        # Some double-sided images leave side 1 blank and number sectors as
+        # 16 per track on side 0. Sector 16 is then side 0 of the next track.
+        # A linear read treats it as side 1 and mixes the blank side into the file.
+        self.side0 = False
+        self.side0 = self._prefer_side0()
+
+    def _file_sector(self, sector):
+        if self.side0:
+            track, within = divmod(sector, 16)
+            return track * 32 + within
+        return sector
+
+    def _interleaved_floppy(self):
+        sectors = len(self.data) // SECTOR
+        if sectors % 32 != 0:
+            return False
+        # 40 or 80 tracks is a floppy. A hard disc is a flat run of sectors.
+        return sectors // 32 in (40, 80)
+
+    def _prefer_side0(self):
+        # A double-sided image can still be numbered 16 sectors per track, with
+        # every sector on side 0. That is the layout when the other side is
+        # unused. Prefer it when the root's directories are actually there.
+        if not self._interleaved_floppy():
+            return False
+        saved = self.side0
+        self.side0 = False
+        try:
+            entries = self.entries(ROOT_SECTOR)
+        finally:
+            self.side0 = saved
+        identity = 0
+        sided = 0
+        for entry in entries:
+            if entry["length"] != DIR_BYTES and (entry["attrs"] & ATTR_D) == 0:
+                continue
+            if self._dir_at(entry["sector"], False):
+                identity += 1
+            if self._dir_at(entry["sector"], True):
+                sided += 1
+        return sided > identity
+
+    def _dir_at(self, sector, side0):
+        saved = self.side0
+        self.side0 = side0
+        try:
+            blob = self.read_bytes(sector, DIR_BYTES)
+        except DiscError:
+            return False
+        finally:
+            self.side0 = saved
+        if len(blob) != DIR_BYTES or blob[1:5] != b"Hugo":
+            return False
+        if blob[0x4FB:0x4FF] == b"Hugo":
+            return True
+        return blob[0x4CC:] == bytes(DIR_BYTES - 0x4CC)
 
     def save(self):
         with open(self.path, "wb") as handle:
@@ -214,30 +258,39 @@ class AdfsImage(object):
     def read_bytes(self, sector, length):
         if length <= 0:
             return b""
-        start = sector * SECTOR
-        end = start + length
-        if start < 0 or end > len(self.data):
-            raise DiscError("file at sector %d runs off the end of the disc" % sector)
-        return bytes(self.data[start:end])
+        out = bytearray()
+        logical = sector
+        left = length
+        while left:
+            base = self._file_sector(logical) * SECTOR
+            if logical < 0 or base < 0 or base + SECTOR > len(self.data):
+                raise DiscError("file at sector %d runs off the end of the disc" % sector)
+            take = SECTOR if left > SECTOR else left
+            out += self.data[base:base + take]
+            left -= take
+            logical += 1
+        return bytes(out)
 
     def write_bytes(self, sector, payload):
         if not payload:
             return
-        count = (len(payload) + SECTOR - 1) // SECTOR
-        start = sector * SECTOR
-        end = start + count * SECTOR
-        if end > len(self.data):
-            raise DiscError("file at sector %d runs off the end of the disc" % sector)
-        self.data[start:end] = b"\x00" * (count * SECTOR)
-        self.data[start:start + len(payload)] = payload
+        logical = sector
+        offset = 0
+        while offset < len(payload):
+            base = self._file_sector(logical) * SECTOR
+            if base < 0 or base + SECTOR > len(self.data):
+                raise DiscError("file at sector %d runs off the end of the disc" % sector)
+            chunk = payload[offset:offset + SECTOR]
+            self.data[base:base + SECTOR] = b"\x00" * SECTOR
+            self.data[base:base + len(chunk)] = chunk
+            offset += SECTOR
+            logical += 1
 
     def directory(self, sector):
-        base = sector * SECTOR
-        return self.data[base:base + DIR_BYTES]
+        return self.read_bytes(sector, DIR_BYTES)
 
     def store_directory(self, sector, directory):
-        base = sector * SECTOR
-        self.data[base:base + DIR_BYTES] = directory
+        self.write_bytes(sector, bytes(directory))
 
     def bump(self, directory):
         sequence = (directory[0] + 1) & 255
@@ -278,7 +331,7 @@ class AdfsImage(object):
         return None
 
     def is_directory(self, entry):
-        if not directory_ok(self.data, entry["sector"]):
+        if not self._dir_at(entry["sector"], self.side0):
             return False
         if entry["attrs"] & ATTR_D:
             return True
@@ -501,7 +554,7 @@ def read_dfs(path, data):
 def read_adfs_dir(image, sector, seen):
     if sector in seen:
         raise DiscError("the floppy directories loop")
-    if not directory_ok(image.data, sector):
+    if not image._dir_at(sector, image.side0):
         raise DiscError("broken directory at sector %d" % sector)
     seen.add(sector)
     children = []
@@ -514,7 +567,7 @@ def read_adfs_dir(image, sector, seen):
                     "children": read_adfs_dir(image, entry["sector"], seen),
                 })
             else:
-                print("copy_to_hd: skipping broken directory %s" % entry["name"], file=sys.stderr)
+                print("skipping broken directory %s" % entry["name"], file=sys.stderr)
             continue
         children.append({
             "name": entry["name"],
