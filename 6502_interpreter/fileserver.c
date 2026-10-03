@@ -27,18 +27,40 @@
 //  addresses come from the program headers, and a load or a read builds
 //  the BBC memory image from those headers at the moment it is asked for.
 //
+//  ADFS uses '.' between directory names. A UNIX path is shown the other
+//  way round: '/' becomes '.', and a '.' inside a name becomes ','.
+//  src/main.c is $.SRC.MAIN,C. A name from the BBC is read back the same way.
+//
+//  A * command whose first word is a Mac or Unix program, or a symbolic
+//  link to one, runs that program on this machine. The current directory
+//  is the working directory. The rest of the line is the argument list,
+//  spelled the same way as the catalogue: '.' is '/' and ',' is '.'.
+//  Command words match in either case. Arguments keep the case the BBC
+//  sent. A 6502 file, including a 6502 ELF, is still loaded by the BBC.
+//  Windows keeps the load-and-run reply for every name.
+//
+//  Output that fits in one reply is printed by the filing system. Longer
+//  output is written to $.HOST.Ostation and $.HOST.Rstation is run to
+//  print it. When the text fits between BASIC's variables and BASIC's
+//  stack, that program reads it in one transfer. Otherwise it reads
+//  pieces of that free memory. With no such gap it reads 256 bytes at a
+//  time. The text file is removed after printing.
+//
 
 #include "bbc_platform.h"
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #ifndef _WIN32
+#include <signal.h>
 #include <sys/statvfs.h>
+#include <sys/wait.h>
 #endif
 
 #define ECONET_GROUP "239.255.19.82"
@@ -173,6 +195,40 @@ static bool BbcName(const char* name) {
   return true;
 }
 
+// A directory entry the BBC may see. '.' is a UNIX dot that will be shown
+// as ',', and ',' is already that ADFS form. A leading dot stays hidden.
+static bool FileName(const char* name) {
+  size_t n = strlen(name);
+  size_t i;
+  if (n < 1 || n > NAME_LEN || name[0] == '.') {
+    return false;
+  }
+  for (i = 0; i < n; i++) {
+    unsigned char ch = (unsigned char)name[i];
+    if (isalnum(ch) || ch == '!' || ch == '-' || ch == '_' || ch == '.' || ch == ',') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static void UnixToAdfs(char* name) {
+  for (; *name != '\0'; name++) {
+    if (*name == '.') {
+      *name = ',';
+    }
+  }
+}
+
+static void AdfsToUnix(char* name) {
+  for (; *name != '\0'; name++) {
+    if (*name == ',') {
+      *name = '.';
+    }
+  }
+}
+
 static void DiscName(const char* root) {
   const char* slash = strrchr(root, '/');
   const char* base = (slash != NULL && slash[1] != '\0') ? slash + 1 : root;
@@ -183,6 +239,7 @@ static void DiscName(const char* root) {
   memcpy(g_disc, base, n);
   g_disc[n] = '\0';
   Upper(g_disc);
+  UnixToAdfs(g_disc);
   if (g_disc[0] == '\0') {
     memcpy(g_disc, "DISC", 5);
   }
@@ -615,6 +672,7 @@ static bool FindChild(const char* dir, const char* name, char* out, size_t cap) 
 // bbc_path is the text inside a file server packet, without its CR.
 // A relative name is inside csd. $, @, and & start again from the disc
 // root, the current directory, and the library. ^ is the parent.
+// '.' separates directories (a UNIX '/'). ',' in a component is a UNIX '.'.
 static bool Resolve(int csd, const char* bbc_path, char* out, size_t cap) {
   const char* base = DirPath(csd);
   char current[512];
@@ -668,7 +726,8 @@ static bool Resolve(int csd, const char* bbc_path, char* out, size_t cap) {
       }
       continue;
     }
-    if (!BbcName(token)) {
+    AdfsToUnix(token);
+    if (!FileName(token)) {
       return false;
     }
     if (!FindChild(current, token, child, sizeof(child))) {
@@ -691,6 +750,17 @@ static const char* Leaf(const char* path) {
     return path;
   }
   return slash + 1;
+}
+
+// The leaf the BBC prints. '$' is the disc root. A UNIX '.' is shown as ','.
+static void ShowLeaf(char* out, size_t cap, const char* path) {
+  if (path == NULL || strcmp(path, g_root) == 0) {
+    snprintf(out, cap, "$");
+    return;
+  }
+  snprintf(out, cap, "%s", Leaf(path));
+  Upper(out);
+  UnixToAdfs(out);
 }
 
 static void Pad(uint8_t* dest, const char* text, int width) {
@@ -1154,8 +1224,7 @@ static void CmdCat(uint8_t from, uint8_t port, int csd, const char* args) {
     Fail(from, port, 0xd6, "Not found");
     return;
   }
-  snprintf(leaf, sizeof(leaf), "%s", strcmp(path, g_root) == 0 ? "$" : Leaf(path));
-  Upper(leaf);
+  ShowLeaf(leaf, sizeof(leaf), path);
   body[0] = 3;
   body[1] = 0;
   n = strlen(leaf);
@@ -1266,7 +1335,11 @@ static int MatchObjects(const char* dir, const char* pattern, char paths[][512],
     }
     memcpy(name, ent->d_name, n + 1);
     Upper(name);
-    if (!BbcName(name) || !WildMatch(pattern, name) || !JoinName(path, sizeof(path), dir, ent->d_name)) {
+    if (!FileName(name) || !JoinName(path, sizeof(path), dir, ent->d_name)) {
+      continue;
+    }
+    UnixToAdfs(name);
+    if (!WildMatch(pattern, name)) {
       continue;
     }
     if (files_only) {
@@ -1506,6 +1579,7 @@ static void CmdRename(uint8_t from, uint8_t port, int csd, const char* args) {
 
 static int InfoLine(const char* path, char* text, size_t cap) {
   char access[12];
+  char leaf[NAME_LEN + 1];
   uint32_t load;
   uint32_t exec;
   uint8_t attr;
@@ -1513,7 +1587,8 @@ static int InfoLine(const char* path, char* text, size_t cap) {
   uint32_t length = 0;
   DescribeFile(path, directory, &load, &exec, &length, &attr);
   AccessText(attr, access);
-  snprintf(text, cap, "%-10s %-8s %08X %08X %06X", Leaf(path), access, load, exec, length);
+  ShowLeaf(leaf, sizeof(leaf), path);
+  snprintf(text, cap, "%-10s %-8s %08X %08X %06X", leaf, access, load, exec, length);
   Upper(text);
   return (int)strlen(text);
 }
@@ -1672,12 +1747,27 @@ static const char* CommandRest(const char* line) {
   return line;
 }
 
+static bool Starts(const char* line, const char* word) {
+  size_t i;
+  for (i = 0; word[i] != '\0'; i++) {
+    if ((char)toupper((unsigned char)line[i]) != word[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool Two(const char* line, char a, char b) {
+  return (char)toupper((unsigned char)line[0]) == a &&
+         (char)toupper((unsigned char)line[1]) == b;
+}
+
 static bool IAmCommand(const char* line, const char** args) {
-  if (strncmp(line, "I AM", 4) == 0) {
+  if (Starts(line, "I AM")) {
     *args = line + 4;
-  } else if (strncmp(line, "I A.", 4) == 0) {
+  } else if (Starts(line, "I A.")) {
     *args = line + 4;
-  } else if (strncmp(line, "IAM", 3) == 0) {
+  } else if (Starts(line, "IAM")) {
     *args = line + 3;
   } else {
     return false;
@@ -1868,6 +1958,792 @@ static void CmdPriv(uint8_t from, uint8_t port, const char* args) {
 static void CmdFree(uint8_t from, uint8_t port, const char* args);
 static void CmdSdisc(uint8_t from, uint8_t port, const char* args);
 
+#define ELF_MACHINE_6502 6502
+#define HOST_MAX_ARGS 64
+#define HOST_ARG_LEN 1024
+#define HOST_OUT_MAX (1024 * 1024)
+#define HOST_TEXT_BUDGET 250
+
+#ifdef _WIN32
+static bool TryHost(uint8_t from, uint8_t port, int csd, const char* line) {
+  (void)from;
+  (void)port;
+  (void)csd;
+  (void)line;
+  return false;
+}
+#else
+
+struct HostOut {
+  uint8_t* data;
+  int len;
+  int cap;
+  bool truncated;
+  bool cr;
+};
+
+static bool HostOutInit(struct HostOut* out) {
+  memset(out, 0, sizeof(*out));
+  out->cap = 4096;
+  out->data = (uint8_t*)malloc((size_t)out->cap);
+  if (out->data == NULL) {
+    out->cap = 0;
+    return false;
+  }
+  return true;
+}
+
+static void HostOutFree(struct HostOut* out) {
+  free(out->data);
+  out->data = NULL;
+  out->cap = 0;
+}
+
+static int ElfMachine(const char* path) {
+  FILE* fp;
+  uint8_t ident[20];
+  fp = fopen(path, "rb");
+  if (fp == NULL) {
+    return -1;
+  }
+  if (fread(ident, 1, 20, fp) != 20) {
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+  if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F' || ident[5] != 1) {
+    return -1;
+  }
+  return (int)ident[18] | ((int)ident[19] << 8);
+}
+
+// A host program is a regular file with an execute bit, reached through a
+// symbolic link as well. A 6502 ELF stays on the BBC load-and-run path.
+static bool HostExecutable(const char* path) {
+  struct stat st;
+  int machine;
+  uint32_t load;
+  uint32_t exec;
+  uint32_t length;
+  if (path == NULL || path[0] != '/' || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+    return false;
+  }
+  if ((st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0) {
+    return false;
+  }
+  machine = ElfMachine(path);
+  if (machine == ELF_MACHINE_6502) {
+    return false;
+  }
+  if (machine >= 0 && ElfImage(path, &load, &exec, &length, NULL)) {
+    return false;
+  }
+  return true;
+}
+
+// The current directory wins when it holds a file of this name, executable
+// or not. The library is used only when the name is not a file there.
+static bool HostFind(int csd, const char* word, char* path, size_t cap) {
+  if (Resolve(csd, word, path, cap) && IsFile(path)) {
+    return HostExecutable(path);
+  }
+  if (g_lib != 0 && Resolve(g_lib, word, path, cap) && IsFile(path)) {
+    return HostExecutable(path);
+  }
+  return false;
+}
+
+static bool PathMeta(const char* text) {
+  for (; *text != '\0'; text++) {
+    if (*text == '.' || *text == ',' || *text == '$' || *text == '@' || *text == '&' ||
+        *text == '^') {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ADFS spelling, without the catalogue's ten-character cap and without
+// forcing capitals. '$' '@' '&' '^' are the root, the current directory,
+// the library, and the parent. A path that already contains '/' is left
+// for the caller to keep as typed.
+static bool TranslatePath(const char* adfs, char* out, size_t cap, const char* csd) {
+  const char* p = adfs;
+  size_t used = 0;
+  bool any = false;
+  out[0] = '\0';
+  while (*p != '\0') {
+    char decoded[512];
+    const char* piece;
+    size_t n = 0;
+    size_t plen;
+    if (*p == '.') {
+      p++;
+      continue;
+    }
+    while (*p != '\0' && *p != '.') {
+      if (n + 1 >= sizeof(decoded)) {
+        return false;
+      }
+      decoded[n++] = (*p == ',') ? '.' : *p;
+      p++;
+    }
+    decoded[n] = '\0';
+    if (*p == '.') {
+      p++;
+    }
+    if (n == 0) {
+      continue;
+    }
+    piece = decoded;
+    if (!any && strcmp(decoded, "$") == 0) {
+      piece = g_root;
+    } else if (!any && strcmp(decoded, "@") == 0) {
+      piece = (csd != NULL && csd[0] != '\0') ? csd : g_root;
+    } else if (!any && strcmp(decoded, "&") == 0) {
+      const char* lib = DirPath(g_lib);
+      piece = lib != NULL ? lib : g_root;
+    } else if (strcmp(decoded, "^") == 0) {
+      piece = "..";
+    }
+    any = true;
+    plen = strlen(piece);
+    if (used != 0 && piece[0] != '/') {
+      if (used + 1 >= cap) {
+        return false;
+      }
+      out[used++] = '/';
+    }
+    if (used + plen >= cap) {
+      return false;
+    }
+    memcpy(out + used, piece, plen);
+    used += plen;
+    out[used] = '\0';
+  }
+  return used > 0;
+}
+
+static void TranslateArg(const char* in, char* out, size_t cap, const char* csd) {
+  const char* path = in;
+  size_t prefix = 0;
+  char translated[HOST_ARG_LEN];
+  if (!PathMeta(in)) {
+    snprintf(out, cap, "%s", in);
+    return;
+  }
+  if (in[0] == '-') {
+    const char* p = in + 1;
+    while (*p != '\0' && *p != '.' && *p != ',' && *p != '$' && *p != '@' && *p != '&' &&
+           *p != '^') {
+      if (*p == '=') {
+        p++;
+        break;
+      }
+      p++;
+    }
+    prefix = (size_t)(p - in);
+    path = p;
+  }
+  if (path[0] == '\0' || strchr(path, '/') != NULL ||
+      !TranslatePath(path, translated, sizeof(translated), csd)) {
+    snprintf(out, cap, "%s", in);
+    return;
+  }
+  if (prefix >= cap) {
+    snprintf(out, cap, "%s", in);
+    return;
+  }
+  memcpy(out, in, prefix);
+  snprintf(out + prefix, cap - prefix, "%s", translated);
+}
+
+static void HostOutByte(struct HostOut* out, uint8_t b) {
+  if (out->len == out->cap) {
+    if (out->cap < HOST_OUT_MAX) {
+      int ncap = out->cap <= HOST_OUT_MAX / 2 ? out->cap * 2 : HOST_OUT_MAX;
+      uint8_t* grown = (uint8_t*)realloc(out->data, (size_t)ncap);
+      if (grown != NULL) {
+        out->data = grown;
+        out->cap = ncap;
+      }
+    }
+    if (out->len == out->cap) {
+      int keep = out->cap / 2;
+      memmove(out->data, out->data + (out->cap - keep), (size_t)keep);
+      out->len = keep;
+      out->truncated = true;
+    }
+  }
+  out->data[out->len++] = b;
+}
+
+static void HostOutAdd(struct HostOut* out, const uint8_t* buf, int n) {
+  int i;
+  for (i = 0; i < n; i++) {
+    uint8_t b = buf[i];
+    if (out->cr) {
+      out->cr = false;
+      if (b == '\n') {
+        continue;
+      }
+    }
+    if (b == '\r') {
+      out->cr = true;
+      HostOutByte(out, 0x00);
+      continue;
+    }
+    if (b == '\n') {
+      HostOutByte(out, 0x00);
+      continue;
+    }
+    if (b == '\t') {
+      b = ' ';
+    } else if (b < 0x20 || b == 0x7f) {
+      continue;
+    } else if (b > 0x7e) {
+      b = '?';
+    }
+    HostOutByte(out, b);
+  }
+}
+
+// Loaded and entered at &0900. The three bytes at HOST_LEN_OFF are the
+// text length, and the twelve bytes at HOST_NAME_OFF are its CR-terminated
+// name. NFS writes an OSGBPB read straight into the address given to it
+// and leaves the count in the control block alone, so this prints the
+// number of bytes it asked for and stops when the length above is used up.
+// Free space in BASIC is from VARTOP (&02) up to the BASIC stack (&04).
+// One read covers the whole text when it fits there. &70-&73 are scratch.
+// The fallback buffer is the function-key page at &0B00.
+#define HOST_LEN_OFF 402
+#define HOST_NAME_OFF 405
+#define HOST_NAME_LEN 12
+static const uint8_t kHostPrint[] = {
+    0xa9, 0x84, 0x20, 0xf4, 0xff, 0xe4, 0x06, 0xd0, 0x52, 0xc4, 0x07, 0xd0,
+    0x4e, 0xa9, 0x83, 0x20, 0xf4, 0xff, 0xc4, 0x18, 0xd0, 0x45, 0xa5, 0x13,
+    0xc5, 0x18, 0x90, 0x3f, 0xa5, 0x02, 0xc5, 0x12, 0xa5, 0x03, 0xe5, 0x13,
+    0x90, 0x35, 0xa5, 0x04, 0xc5, 0x02, 0xa5, 0x05, 0xe5, 0x03, 0x90, 0x2b,
+    0xa5, 0x06, 0xc5, 0x04, 0xa5, 0x07, 0xe5, 0x05, 0x90, 0x21, 0x38, 0xa5,
+    0x04, 0xe5, 0x02, 0x8d, 0x7e, 0x0a, 0xa5, 0x05, 0xe5, 0x03, 0x8d, 0x7f,
+    0x0a, 0x0d, 0x7e, 0x0a, 0xf0, 0x0d, 0xa5, 0x02, 0x8d, 0x7c, 0x0a, 0xa5,
+    0x03, 0x8d, 0x7d, 0x0a, 0x4c, 0x6f, 0x09, 0xa9, 0x00, 0x8d, 0x7c, 0x0a,
+    0xa9, 0x0b, 0x8d, 0x7d, 0x0a, 0xa9, 0x00, 0x8d, 0x7e, 0x0a, 0xa9, 0x01,
+    0x8d, 0x7f, 0x0a, 0xad, 0x92, 0x0a, 0x8d, 0x82, 0x0a, 0xad, 0x93, 0x0a,
+    0x8d, 0x83, 0x0a, 0xad, 0x94, 0x0a, 0x8d, 0x84, 0x0a, 0x0d, 0x82, 0x0a,
+    0x0d, 0x83, 0x0a, 0xd0, 0x03, 0x4c, 0x72, 0x0a, 0xa9, 0x40, 0xa2, 0x95,
+    0xa0, 0x0a, 0x20, 0xce, 0xff, 0xd0, 0x03, 0x4c, 0x72, 0x0a, 0x8d, 0x7b,
+    0x0a, 0xad, 0x84, 0x0a, 0xd0, 0x1d, 0xad, 0x7e, 0x0a, 0xcd, 0x82, 0x0a,
+    0xad, 0x7f, 0x0a, 0xed, 0x83, 0x0a, 0x90, 0x0f, 0xad, 0x82, 0x0a, 0x8d,
+    0x80, 0x0a, 0xad, 0x83, 0x0a, 0x8d, 0x81, 0x0a, 0x4c, 0xcb, 0x09, 0xad,
+    0x7e, 0x0a, 0x8d, 0x80, 0x0a, 0xad, 0x7f, 0x0a, 0x8d, 0x81, 0x0a, 0xa0,
+    0x0c, 0xa9, 0x00, 0x99, 0x85, 0x0a, 0x88, 0x10, 0xfa, 0xad, 0x7b, 0x0a,
+    0x8d, 0x85, 0x0a, 0xad, 0x7c, 0x0a, 0x8d, 0x86, 0x0a, 0xad, 0x7d, 0x0a,
+    0x8d, 0x87, 0x0a, 0xad, 0x80, 0x0a, 0x8d, 0x8a, 0x0a, 0xad, 0x81, 0x0a,
+    0x8d, 0x8b, 0x0a, 0xa9, 0x04, 0xa2, 0x85, 0xa0, 0x0a, 0x20, 0xd1, 0xff,
+    0xad, 0x7c, 0x0a, 0x85, 0x70, 0xad, 0x7d, 0x0a, 0x85, 0x71, 0xad, 0x80,
+    0x0a, 0x85, 0x72, 0xad, 0x81, 0x0a, 0x85, 0x73, 0x20, 0x44, 0x0a, 0x38,
+    0xad, 0x82, 0x0a, 0xed, 0x80, 0x0a, 0x8d, 0x82, 0x0a, 0xad, 0x83, 0x0a,
+    0xed, 0x81, 0x0a, 0x8d, 0x83, 0x0a, 0xad, 0x84, 0x0a, 0xe9, 0x00, 0x8d,
+    0x84, 0x0a, 0x0d, 0x82, 0x0a, 0x0d, 0x83, 0x0a, 0xf0, 0x03, 0x4c, 0x9d,
+    0x09, 0xa9, 0x00, 0xac, 0x7b, 0x0a, 0x20, 0xce, 0xff, 0x4c, 0x72, 0x0a,
+    0xa5, 0x72, 0x05, 0x73, 0xf0, 0x18, 0xa0, 0x00, 0xb1, 0x70, 0x20, 0xe3,
+    0xff, 0xe6, 0x70, 0xd0, 0x02, 0xe6, 0x71, 0xa5, 0x72, 0xd0, 0x02, 0xc6,
+    0x73, 0xc6, 0x72, 0x4c, 0x44, 0x0a, 0x60, 0xa9, 0x95, 0x8d, 0x85, 0x0a,
+    0xa9, 0x0a, 0x8d, 0x86, 0x0a, 0xa2, 0x85, 0xa0, 0x0a, 0x60, 0x20, 0x63,
+    0x0a, 0xa9, 0x06, 0x20, 0xdd, 0xff, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x2e, 0x48,
+    0x4f, 0x53, 0x54, 0x2e, 0x4f, 0x32, 0x35, 0x34, 0x0d,
+};
+
+static bool HostWriteInf(const char* path, uint32_t load, uint32_t exec, uint8_t access) {
+  char inf[640];
+  FILE* fp;
+  InfPath(path, inf, sizeof(inf));
+  fp = fopen(inf, "w");
+  if (fp == NULL) {
+    return false;
+  }
+  if (fprintf(fp, "%08X %08X %02X\n", load, exec, access) < 0) {
+    fclose(fp);
+    return false;
+  }
+  return fclose(fp) == 0;
+}
+
+static bool HostShowFile(uint8_t from, uint8_t port, const struct HostOut* out) {
+  char dir[640];
+  char text_path[640];
+  char run_path[640];
+  char adfs[32];
+  uint8_t image[sizeof(kHostPrint)];
+  uint8_t body[48];
+  FILE* fp;
+  int i;
+  int n;
+  int wrote;
+  int text_len = 0;
+  wrote = snprintf(dir, sizeof(dir), "%s/HOST", g_root);
+  if (wrote < 0 || wrote >= (int)sizeof(dir)) {
+    return false;
+  }
+  if (MakeDir(dir) != 0 && !IsDir(dir)) {
+    return false;
+  }
+  wrote = snprintf(text_path, sizeof(text_path), "%s/O%u", dir, from);
+  if (wrote < 0 || wrote >= (int)sizeof(text_path)) {
+    return false;
+  }
+  wrote = snprintf(run_path, sizeof(run_path), "%s/R%u", dir, from);
+  if (wrote < 0 || wrote >= (int)sizeof(run_path)) {
+    return false;
+  }
+  fp = fopen(text_path, "wb");
+  if (fp == NULL) {
+    return false;
+  }
+  if (out->truncated) {
+    if (fwrite("...\r", 1, 4, fp) != 4) {
+      fclose(fp);
+      remove(text_path);
+      return false;
+    }
+    text_len += 4;
+  }
+  for (i = 0; i < out->len; i++) {
+    uint8_t b = out->data[i] == 0 ? 0x0d : out->data[i];
+    if (fputc(b, fp) == EOF) {
+      fclose(fp);
+      remove(text_path);
+      return false;
+    }
+    text_len++;
+  }
+  if (out->len == 0 || out->data[out->len - 1] != 0) {
+    if (fputc(0x0d, fp) == EOF) {
+      fclose(fp);
+      remove(text_path);
+      return false;
+    }
+    text_len++;
+  }
+  if (fclose(fp) != 0) {
+    remove(text_path);
+    return false;
+  }
+  if (chmod(text_path, 0644) != 0) {
+    remove(text_path);
+    return false;
+  }
+  n = snprintf(adfs, sizeof(adfs), "$.HOST.O%u", from);
+  if (n < 1 || n + 1 > HOST_NAME_LEN) {
+    remove(text_path);
+    return false;
+  }
+  memcpy(image, kHostPrint, sizeof(image));
+  image[HOST_LEN_OFF] = (uint8_t)text_len;
+  image[HOST_LEN_OFF + 1] = (uint8_t)((unsigned)text_len >> 8);
+  image[HOST_LEN_OFF + 2] = (uint8_t)((unsigned)text_len >> 16);
+  memset(image + HOST_NAME_OFF, 0, HOST_NAME_LEN);
+  memcpy(image + HOST_NAME_OFF, adfs, (size_t)n);
+  image[HOST_NAME_OFF + n] = 0x0d;
+  fp = fopen(run_path, "wb");
+  if (fp == NULL) {
+    remove(text_path);
+    return false;
+  }
+  if (fwrite(image, 1, sizeof(image), fp) != sizeof(image)) {
+    fclose(fp);
+    remove(text_path);
+    remove(run_path);
+    return false;
+  }
+  if (fclose(fp) != 0) {
+    remove(text_path);
+    remove(run_path);
+    return false;
+  }
+  if (chmod(run_path, 0644) != 0 || !HostWriteInf(run_path, 0x0900, 0x0900, 0x0d)) {
+    char inf[640];
+    remove(text_path);
+    remove(run_path);
+    InfPath(run_path, inf, sizeof(inf));
+    remove(inf);
+    return false;
+  }
+  n = snprintf(adfs, sizeof(adfs), "$.HOST.R%u", from);
+  if (n < 1 || n + 3 > (int)sizeof(body)) {
+    remove(text_path);
+    remove(run_path);
+    return false;
+  }
+  body[0] = 8;
+  body[1] = 0;
+  memcpy(body + 2, adfs, (size_t)n);
+  body[2 + n] = 0x0d;
+  fprintf(stderr, "station %u: HOST show $.HOST.R%u (%d bytes)\n", from, from, out->len);
+  Reply(from, port, body, n + 3);
+  return true;
+}
+
+static void HostReply(uint8_t from, uint8_t port, struct HostOut* out, int code) {
+  uint8_t body[ECONET_MAX_FRAME];
+  int budget;
+  int start = 0;
+  int n;
+  int used;
+  // NFS and ANFS copy this reply until a carriage return, and the index
+  // they use is one byte wide. With no 0x0D in the first 254 bytes the
+  // copy never ends and the BBC stays inside the ROM. 0x00 is a new line.
+  // 0x80 ends the printing without being shown, so the program's own final
+  // new line has to come before it. 0x0D is the copy's stop, after that.
+  // Anything longer is handed to the BBC as a file, which is not limited
+  // by that copy. If the file cannot be written, the short reply below
+  // is still capped so the copy ends.
+  if (out->len == 0) {
+    if (code == 0) {
+      uint8_t quiet[2] = {0, 0};
+      Reply(from, port, quiet, 2);
+    } else {
+      char message[32];
+      snprintf(message, sizeof(message), "Exit %d", code);
+      Fail(from, port, 0xfe, message);
+    }
+    return;
+  }
+  if ((out->len > HOST_TEXT_BUDGET || out->truncated) && HostShowFile(from, port, out)) {
+    return;
+  }
+  if (out->len > HOST_TEXT_BUDGET || out->truncated) {
+    fprintf(stderr, "station %u: HOST show failed\n", from);
+  }
+  budget = HOST_TEXT_BUDGET;
+  if (out->truncated || out->len > budget) {
+    int room = budget - 4;
+    int i;
+    if (room < 1) {
+      room = 1;
+    }
+    start = out->len - room;
+    if (start < 0) {
+      start = 0;
+    }
+    for (i = start; i < out->len; i++) {
+      if (out->data[i] == 0x00) {
+        start = i + 1;
+        break;
+      }
+    }
+    if (start >= out->len) {
+      start = out->len - room;
+      if (start < 0) {
+        start = 0;
+      }
+    }
+    out->truncated = true;
+  }
+  body[0] = 4;
+  body[1] = 0;
+  used = 2;
+  if (out->truncated) {
+    memcpy(body + used, "...", 3);
+    used += 3;
+    body[used++] = 0x00;
+  }
+  n = out->len - start;
+  if (n < 0) {
+    n = 0;
+  }
+  if (used + n + 2 > 254) {
+    int room = 254 - used - 2;
+    if (room < 0) {
+      room = 0;
+    }
+    start += n - room;
+    n = room;
+  }
+  if (n > 0) {
+    memcpy(body + used, out->data + start, (size_t)n);
+    used += n;
+  }
+  body[used++] = 0x80;
+  body[used++] = 0x0d;
+  Reply(from, port, body, used);
+}
+
+// Returns 1 when this station has moved on and the program should be
+// killed. A repeat of the command, which a slow compile provokes when the
+// client sends the line again, is acknowledged and discarded so the
+// program keeps running. Its reply uses the latest scout sequence bit.
+static int HostNet(uint8_t from, bool* expect_data) {
+  uint8_t frame[ECONET_MAX_FRAME];
+  int n = RecvRaw(frame, (int)sizeof(frame), 0, false);
+  if (n <= 0) {
+    return -1;
+  }
+  if (n < 4 || frame[0] != g_station) {
+    return 0;
+  }
+  if (frame[2] != from) {
+    Stash(frame, n);
+    return 0;
+  }
+  if (n == 4) {
+    return 0;
+  }
+  if (!*expect_data && n == 6 && (frame[4] & 0xfe) == 0x80 && frame[5] == FS_COMMAND_PORT) {
+    SendAck(frame[2], frame[3]);
+    g_scout_ctrl = (uint8_t)(0x80 | (frame[4] & 0x01));
+    *expect_data = true;
+    return 0;
+  }
+  if (*expect_data) {
+    SendAck(frame[2], frame[3]);
+    *expect_data = false;
+    return 0;
+  }
+  Stash(frame, n);
+  return 1;
+}
+
+static bool TryHost(uint8_t from, uint8_t port, int csd, const char* line) {
+  char word[256];
+  char path[512];
+  char* argv[HOST_MAX_ARGS + 1];
+  char* store = NULL;
+  const char* cursor;
+  const char* cwd;
+  struct HostOut out;
+  int argc = 0;
+  size_t n = 0;
+  int pipes[2];
+  int status = 0;
+  int code = 1;
+  pid_t pid;
+  bool expect_data = false;
+  bool pipe_open = true;
+  bool child_done = false;
+  bool aborted = false;
+  bool have_status = false;
+  int i;
+
+  while (*line == ' ') {
+    line++;
+  }
+  if (*line == '\0') {
+    return false;
+  }
+  while (line[n] != '\0' && line[n] != ' ') {
+    if (n + 1 >= sizeof(word)) {
+      return false;
+    }
+    word[n] = line[n];
+    n++;
+  }
+  word[n] = '\0';
+  if (!HostFind(csd, word, path, sizeof(path))) {
+    return false;
+  }
+  store = (char*)malloc((size_t)HOST_MAX_ARGS * HOST_ARG_LEN);
+  if (store == NULL) {
+    Fail(from, port, 0xfe, "Bad command");
+    return true;
+  }
+  cwd = DirPath(csd);
+  if (cwd == NULL) {
+    cwd = g_root;
+  }
+  argv[argc++] = path;
+  cursor = line + n;
+  while (*cursor != '\0') {
+    char raw[256];
+    char* slot;
+    const char* start;
+    size_t argn = 0;
+    while (*cursor == ' ') {
+      cursor++;
+    }
+    if (*cursor == '\0') {
+      break;
+    }
+    if (argc >= HOST_MAX_ARGS) {
+      free(store);
+      Fail(from, port, 0xfe, "Bad command");
+      return true;
+    }
+    start = cursor;
+    while (*cursor != '\0' && *cursor != ' ') {
+      cursor++;
+      argn++;
+    }
+    if (argn >= sizeof(raw)) {
+      free(store);
+      Fail(from, port, 0xfe, "Bad command");
+      return true;
+    }
+    memcpy(raw, start, argn);
+    raw[argn] = '\0';
+    slot = store + (size_t)argc * HOST_ARG_LEN;
+    TranslateArg(raw, slot, HOST_ARG_LEN, cwd);
+    argv[argc++] = slot;
+  }
+  argv[argc] = NULL;
+  fprintf(stderr, "station %u: HOST %s", from, path);
+  for (i = 1; i < argc; i++) {
+    fprintf(stderr, " %s", argv[i]);
+  }
+  fprintf(stderr, "\n");
+  if (pipe(pipes) != 0) {
+    free(store);
+    Fail(from, port, 0xfe, "Bad command");
+    return true;
+  }
+  pid = fork();
+  if (pid < 0) {
+    close(pipes[0]);
+    close(pipes[1]);
+    free(store);
+    Fail(from, port, 0xfe, "Bad command");
+    return true;
+  }
+  if (pid == 0) {
+    int devnull = open("/dev/null", O_RDONLY);
+    setpgid(0, 0);
+    if (devnull < 0) {
+      _exit(127);
+    }
+    if (devnull != STDIN_FILENO) {
+      if (dup2(devnull, STDIN_FILENO) < 0) {
+        _exit(127);
+      }
+      close(devnull);
+    }
+    if (dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0) {
+      _exit(127);
+    }
+    if (pipes[1] != STDOUT_FILENO && pipes[1] != STDERR_FILENO) {
+      close(pipes[1]);
+    }
+    close(pipes[0]);
+    if (g_fd > 2) {
+      close(g_fd);
+    }
+    if (chdir(cwd) != 0) {
+      _exit(127);
+    }
+    execv(path, argv);
+    _exit(127);
+  }
+  free(store);
+  setpgid(pid, pid);
+  close(pipes[1]);
+  SocketSetNonBlocking(pipes[0]);
+  if (!HostOutInit(&out)) {
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    close(pipes[0]);
+    Fail(from, port, 0xfe, "Bad command");
+    return true;
+  }
+  while (!aborted && !(child_done && !pipe_open)) {
+    struct pollfd pfd[2];
+    int nfds = 1;
+    int rc;
+    pfd[0].fd = pipe_open ? pipes[0] : -1;
+    pfd[0].events = POLLIN;
+    pfd[0].revents = 0;
+    if (g_stash_len == 0) {
+      pfd[1].fd = g_fd;
+      pfd[1].events = POLLIN;
+      pfd[1].revents = 0;
+      nfds = 2;
+    }
+    rc = poll(pfd, (nfds_t)nfds, 200);
+    if (rc < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if (pipe_open && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+      for (;;) {
+        uint8_t buf[512];
+        ssize_t got = read(pipes[0], buf, sizeof(buf));
+        if (got > 0) {
+          HostOutAdd(&out, buf, (int)got);
+          continue;
+        }
+        if (got < 0 && errno == EINTR) {
+          continue;
+        }
+        if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+          break;
+        }
+        pipe_open = false;
+        break;
+      }
+    }
+    if (nfds == 2 && (pfd[1].revents & (POLLIN | POLLERR | POLLHUP))) {
+      for (;;) {
+        int net = HostNet(from, &expect_data);
+        if (net < 0) {
+          break;
+        }
+        if (net > 0) {
+          aborted = true;
+          break;
+        }
+        if (g_stash_len != 0) {
+          break;
+        }
+      }
+    }
+    if (!child_done) {
+      pid_t got = waitpid(pid, &status, WNOHANG);
+      if (got == pid) {
+        child_done = true;
+        have_status = true;
+      } else if (got < 0 && errno != EINTR) {
+        child_done = true;
+      }
+    }
+  }
+  if (aborted) {
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    close(pipes[0]);
+    HostOutFree(&out);
+    fprintf(stderr, "station %u: HOST aborted %s\n", from, path);
+    return true;
+  }
+  if (!child_done) {
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    close(pipes[0]);
+    HostOutFree(&out);
+    Fail(from, port, 0xfe, "Bad command");
+    return true;
+  }
+  close(pipes[0]);
+  if (have_status && WIFEXITED(status)) {
+    code = WEXITSTATUS(status);
+  } else if (have_status && WIFSIGNALED(status)) {
+    code = 128;
+  }
+  fprintf(stderr, "station %u: HOST exit %d\n", from, code);
+  HostReply(from, port, &out, code);
+  HostOutFree(&out);
+  return true;
+}
+#endif
+
 static void Command(uint8_t from, const uint8_t* payload, int len) {
   char line[256];
   int csd;
@@ -1879,7 +2755,6 @@ static void Command(uint8_t from, const uint8_t* payload, int len) {
   }
   csd = payload[3];
   CrText(payload + 5, len - 5, line, sizeof(line));
-  Upper(line);
   rest = line;
   while (*rest == ' ') {
     rest++;
@@ -1902,7 +2777,7 @@ static void Command(uint8_t from, const uint8_t* payload, int len) {
     CmdCat(from, reply, csd, CommandRest(rest));
   } else if (CommandWord(rest, "DIR")) {
     CmdDir(from, reply, csd, CommandRest(rest), false);
-  } else if (CommandWord(rest, "LIB") || (rest[0] == 'L' && rest[1] == 'I')) {
+  } else if (CommandWord(rest, "LIB") || Two(rest, 'L', 'I')) {
     CmdDir(from, reply, csd, CommandRest(rest), true);
   } else if (CommandWord(rest, "PASS")) {
     CmdPass(from, reply, CommandRest(rest));
@@ -1917,28 +2792,31 @@ static void Command(uint8_t from, const uint8_t* payload, int len) {
   } else if (CommandWord(rest, "RENAME") || CommandWord(rest, "REN")) {
     CmdRename(from, reply, csd, CommandRest(rest));
   } else if (CommandWord(rest, "DELETE") || CommandWord(rest, "DESTROY") ||
-             (rest[0] == 'D' && rest[1] == '.')) {
+             Two(rest, 'D', '.')) {
     CmdDelete(from, reply, csd, CommandRest(rest));
-  } else if (CommandWord(rest, "CDIR") || (rest[0] == 'C' && rest[1] == 'D')) {
+  } else if (CommandWord(rest, "CDIR") || Two(rest, 'C', 'D')) {
     CmdCdir(from, reply, csd, CommandRest(rest));
-  } else if (CommandWord(rest, "INFO") || (rest[0] == 'I' && rest[1] == '.')) {
+  } else if (CommandWord(rest, "INFO") || Two(rest, 'I', '.')) {
     CmdInfo(from, reply, csd, CommandRest(rest));
   } else if (CommandWord(rest, "EX") || CommandWord(rest, "EXAMINE")) {
     CmdInfo(from, reply, csd, CommandRest(rest));
-  } else if (CommandWord(rest, "ACCESS") || (rest[0] == 'A' && (rest[1] == '.' || rest[1] == '\0' || rest[1] == ' '))) {
+  } else if (CommandWord(rest, "ACCESS") ||
+             ((char)toupper((unsigned char)rest[0]) == 'A' &&
+              (rest[1] == '.' || rest[1] == '\0' || rest[1] == ' '))) {
     CmdAccess(from, reply, csd, CommandRest(rest));
   } else if (CommandWord(rest, "BYE") || CommandWord(rest, "LOGOFF") ||
-             (rest[0] == 'B' && rest[1] == 'Y')) {
+             Two(rest, 'B', 'Y')) {
     uint8_t body[2] = {0, 0};
     CloseFiles();
     g_logged = false;
     Reply(from, reply, body, 2);
-  } else {
+  } else if (!TryHost(from, reply, csd, rest)) {
     // NFS has no local *RUN. An unknown line is the filename, and command
     // code 8 tells the client to load it (function 5) and jump to the
     // execution address. The name has to start at the third reply byte:
     // the client checks the second byte as the return code, then leaves
-    // the rest in place as the function 5 filename.
+    // the rest in place as the function 5 filename. A host program is
+    // run here instead, and only a BBC file reaches this reply.
     CmdRun(from, reply, rest);
   }
 }
@@ -1969,9 +2847,10 @@ static int Collect(const char* dir, struct Entry* entries, int cap) {
     }
     memcpy(name, ent->d_name, n + 1);
     Upper(name);
-    if (!BbcName(name) || !JoinName(path, sizeof(path), dir, ent->d_name)) {
+    if (!FileName(name) || !JoinName(path, sizeof(path), dir, ent->d_name)) {
       continue;
     }
+    UnixToAdfs(name);
     if (!IsFile(path) && !IsDir(path)) {
       continue;
     }
@@ -2080,10 +2959,10 @@ static void Examine(uint8_t from, const uint8_t* payload, int len) {
 static void CatalogueHeader(uint8_t from, const uint8_t* payload, int len) {
   char name[256];
   char path[512];
+  char shown[NAME_LEN + 1];
   uint8_t body[40];
   uint8_t reply = payload[0];
   int csd = len > 3 ? payload[3] : g_csd;
-  const char* leaf;
   if (!NeedLogin(from, reply)) {
     return;
   }
@@ -2095,10 +2974,10 @@ static void CatalogueHeader(uint8_t from, const uint8_t* payload, int len) {
     Fail(from, reply, 0xd6, "Not found");
     return;
   }
-  leaf = strcmp(path, g_root) == 0 ? "$" : Leaf(path);
+  ShowLeaf(shown, sizeof(shown), path);
   body[0] = 0;
   body[1] = 0;
-  Pad(body + 2, leaf, NAME_LEN);
+  Pad(body + 2, shown, NAME_LEN);
   memcpy(body + 12, "OWN", 3);
   body[15] = ' ';
   Pad(body + 16, g_disc, 13);
@@ -2487,10 +3366,13 @@ static void Open(uint8_t from, const uint8_t* payload, int len) {
     g_file[i].length = FileLength(path);
   }
   snprintf(g_file[i].path, sizeof(g_file[i].path), "%s", path);
-  body[0] = 0;
+  // NFS 3.34 and ANFS 4.25 take the first byte as the handle mask. Zero
+  // means the open failed. Bit 0 is the first file; the ROM turns that bit
+  // into a channel number. The mask is repeated for a reader that looks
+  // further along the reply.
+  body[0] = (uint8_t)(1u << i);
   body[1] = 0;
-  // Bit 0 is the first open file. NFS turns that mask into a channel number.
-  body[2] = (uint8_t)(1u << i);
+  body[2] = body[0];
   Reply(from, reply, body, 3);
 }
 
@@ -2750,7 +3632,12 @@ static void ObjectInfo(uint8_t from, const uint8_t* payload, int len) {
     body[4] = date[1];
     used = 5;
   } else if (arg == 6) {
-    const char* leaf = kind == 0 ? "" : (strcmp(path, g_root) == 0 ? "$" : Leaf(path));
+    char leaf[NAME_LEN + 1];
+    if (kind == 0) {
+      leaf[0] = '\0';
+    } else {
+      ShowLeaf(leaf, sizeof(leaf), path);
+    }
     body[2] = 0;
     body[3] = 0;
     body[4] = NAME_LEN;
@@ -2774,13 +3661,15 @@ static void DeleteObject(uint8_t from, const uint8_t* payload, int len) {
 static void Environment(uint8_t from, const uint8_t* payload, int len) {
   uint8_t body[40];
   uint8_t reply = len > 0 ? payload[0] : 0;
+  char csd_leaf[NAME_LEN + 1];
+  char lib_leaf[NAME_LEN + 1];
   const char* csd = DirPath(g_csd);
   const char* lib = DirPath(g_lib);
-  const char* csd_leaf = (csd != NULL && strcmp(csd, g_root) != 0) ? Leaf(csd) : "$";
-  const char* lib_leaf = (lib != NULL && strcmp(lib, g_root) != 0) ? Leaf(lib) : "$";
   if (!NeedLogin(from, reply)) {
     return;
   }
+  ShowLeaf(csd_leaf, sizeof(csd_leaf), csd);
+  ShowLeaf(lib_leaf, sizeof(lib_leaf), lib);
   body[0] = 0;
   body[1] = 0;
   body[2] = (uint8_t)strlen(g_disc);

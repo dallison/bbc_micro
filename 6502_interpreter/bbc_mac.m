@@ -185,10 +185,10 @@ static void ReleaseStuckKeys(void) {
   SyncShift();
 }
 
-// Matrix key for this character. Most shifted symbols are the MOS bit-paired
-// values. 3 and the pound key are the exception: shift-3 is 0x5F and shift of
-// the pound key is 0x23. The UK MODE 7 set draws those as # and the pound
-// sign, and the table follows that. A US keyboard asks for the ASCII code.
+// Matrix key for the character that was typed. Modes 0-6 draw that MOS
+// code: shift-3 is &23 (#), column 8 row 2 is &5F (_), and its shift is
+// &60 (the pound sign). UK MODE 7 draws those three as the pound sign, #
+// and a dash. That chip is the only place the shapes differ.
 static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
   static const int kDigit[10][2] = {
       {7, 2}, {0, 3}, {1, 3}, {1, 1}, {2, 1}, {3, 1}, {4, 3}, {4, 2}, {5, 1}, {6, 2},
@@ -215,26 +215,6 @@ static bool GlyphToBbc(unichar ch, int* column, int* row, bool* need_shift) {
     *row = kDigit[ch - '0'][1];
     *need_shift = false;
     return true;
-  }
-  if (g_cpu.bbc != NULL && BbcMachineKeyboard(g_cpu.bbc) == BBC_KEYBOARD_US) {
-    if (ch == '#') {
-      *column = 8;
-      *row = 2;
-      *need_shift = true;
-      return true;
-    }
-    if (ch == '_') {
-      *column = 1;
-      *row = 1;
-      *need_shift = true;
-      return true;
-    }
-    if (ch == '`') {
-      *column = 8;
-      *row = 2;
-      *need_shift = false;
-      return true;
-    }
   }
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     if (keys[i].ch == ch) {
@@ -304,6 +284,20 @@ static void PressHostKey(NSEvent* event) {
       }
     }
   }
+  if (!mapped && event.keyCode == 27) {
+    // The key beside 0, used when AppKit did not hand over a character.
+    // Shift types '_'. The BBC minus key's shift is '=', so the underscore
+    // byte (&5F) is a different key and Shift has to be up.
+    if (g_host_shift) {
+      column = 8;
+      row = 2;
+      shift_force = 0;
+    } else {
+      column = 7;
+      row = 1;
+    }
+    mapped = true;
+  }
   if (!mapped) {
     mapped = KeyPosition(event.keyCode, &column, &row);
   }
@@ -323,8 +317,10 @@ static void PressHostKey(NSEvent* event) {
   g_held[slot].column = column;
   g_held[slot].row = row;
   g_held[slot].shift_force = shift_force;
-  BbcMachineSetKey(g_cpu.bbc, column, row, true);
+  // Release Shift before the key is visible. A scan in between would turn
+  // the underscore key into &60.
   SyncShift();
+  BbcMachineSetKey(g_cpu.bbc, column, row, true);
 }
 
 @interface BbcView : NSView

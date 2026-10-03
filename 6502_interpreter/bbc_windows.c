@@ -143,28 +143,9 @@ static bool GlyphToBbc(unsigned ch, int* column, int* row, bool* need_shift) {
     *need_shift = false;
     return true;
   }
-  // Shift-3 is 0x5F and the pound key's shift is 0x23. UK MODE 7 draws those
-  // as # and the pound sign. US typing follows the ASCII code.
-  if (g_cpu.bbc != NULL && BbcMachineKeyboard(g_cpu.bbc) == BBC_KEYBOARD_US) {
-    if (ch == '#') {
-      *column = 8;
-      *row = 2;
-      *need_shift = true;
-      return true;
-    }
-    if (ch == '_') {
-      *column = 1;
-      *row = 1;
-      *need_shift = true;
-      return true;
-    }
-    if (ch == '`') {
-      *column = 8;
-      *row = 2;
-      *need_shift = false;
-      return true;
-    }
-  }
+  // Modes 0-6 draw the typed code. Shift-3 is &23 (#), column 8 row 2 is
+  // &5F (_), and its shift is &60 (the pound sign). UK MODE 7 draws those
+  // as the pound sign, # and a dash.
   for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
     if (keys[i].ch == ch) {
       *column = keys[i].column;
@@ -342,8 +323,10 @@ static void PressHostKey(UINT vk, LPARAM lparam) {
   g_held[slot].column = column;
   g_held[slot].row = row;
   g_held[slot].shift_force = shift_force;
-  BbcMachineSetKey(g_cpu.bbc, column, row, true);
+  // Release Shift before the key is visible. A scan in between would turn
+  // the underscore key into &60.
   SyncShift();
+  BbcMachineSetKey(g_cpu.bbc, column, row, true);
 }
 
 static void OnKey(UINT vk, LPARAM lparam, bool down) {
