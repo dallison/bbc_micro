@@ -1,0 +1,5 @@
+This installs BBC Micro in /Applications/BBC Micro.
+
+The folder contains the machine, Cumana, the file server, the cassette player, the 6502 interpreter, and the disc Python scripts.
+
+ROM images are not included. After installation, copy your own images into the socket folders beside the application.

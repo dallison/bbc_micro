@@ -262,6 +262,10 @@ struct BbcMachine {
   bool tt_bottom;
   bool tt_row_double;
   uint8_t* sideways[16];
+  // Virtual images 1-7. Image 0 is sideways[] above. Bits 4-6 of ROMSEL
+  // select the image. These are ROM: writes are ignored and are not copied
+  // back.
+  uint8_t* sideways_page[16][7];
   bool sideways_loaded[16];
   bool sideways_ram[16];
   uint8_t rom_fs[16];
@@ -271,6 +275,7 @@ struct BbcMachine {
   int keyboard;
   bool master;
   int mapped_slot;
+  int mapped_virt;
   bool andy_mapped;
   bool lynne_mapped;
   bool hazel_mapped;
@@ -1717,6 +1722,10 @@ bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr) {
   if (bbc->master && bbc->andy_mapped && addr < 0x9000) {
     return false;
   }
+  // Bits 4-6 select a virtual image. Those images are ROM.
+  if (((bbc->romsel >> 4) & 7) != 0) {
+    return true;
+  }
   return !bbc->sideways_ram[bbc->romsel & 0x0f];
 }
 
@@ -1789,6 +1798,10 @@ static void ApplyHazel(BbcMachine* bbc, bool on) {
 
 static void CommitSideways(BbcMachine* bbc) {
   int slot = bbc->mapped_slot;
+  // A virtual image is ROM. Leave it, and leave the RAM image, unchanged.
+  if (bbc->mapped_virt != 0) {
+    return;
+  }
   if (bbc->ram == NULL || slot < 0 || slot > 15 || !bbc->sideways_ram[slot] ||
       bbc->sideways[slot] == NULL) {
     return;
@@ -1801,21 +1814,32 @@ static void CommitSideways(BbcMachine* bbc) {
   }
 }
 
+static uint8_t* SidewaysImage(const BbcMachine* bbc, int slot, int virt) {
+  if (virt <= 0) {
+    return bbc->sideways[slot];
+  }
+  return bbc->sideways_page[slot][virt - 1];
+}
+
 static void MapRomsel(BbcMachine* bbc) {
   int slot;
+  int virt;
   bool andy;
   bool have;
+  uint8_t* image;
   if (bbc->ram == NULL) {
     return;
   }
   slot = bbc->romsel & 0x0f;
+  virt = (bbc->romsel >> 4) & 7;
   andy = bbc->master && (bbc->romsel & 0x80) != 0;
   if (!SidewaysActive(bbc)) {
     bbc->mapped_slot = slot;
+    bbc->mapped_virt = virt;
     bbc->andy_mapped = false;
     return;
   }
-  if (slot == bbc->mapped_slot && andy == bbc->andy_mapped) {
+  if (slot == bbc->mapped_slot && virt == bbc->mapped_virt && andy == bbc->andy_mapped) {
     return;
   }
   CommitSideways(bbc);
@@ -1827,12 +1851,18 @@ static void MapRomsel(BbcMachine* bbc) {
   }
   bbc->andy_mapped = andy;
   bbc->mapped_slot = slot;
-  have = bbc->sideways[slot] != NULL && (bbc->sideways_loaded[slot] || bbc->sideways_ram[slot]);
+  bbc->mapped_virt = virt;
+  image = SidewaysImage(bbc, slot, virt);
+  if (virt == 0) {
+    have = image != NULL && (bbc->sideways_loaded[slot] || bbc->sideways_ram[slot]);
+  } else {
+    have = image != NULL;
+  }
   if (have) {
     if (andy) {
-      memcpy(bbc->ram + 0x9000, bbc->sideways[slot] + 0x1000, 0x3000);
+      memcpy(bbc->ram + 0x9000, image + 0x1000, 0x3000);
     } else {
-      memcpy(bbc->ram + 0x8000, bbc->sideways[slot], 16384);
+      memcpy(bbc->ram + 0x8000, image, 16384);
     }
   } else if (andy) {
     memset(bbc->ram + 0x9000, 0xff, 0x3000);
@@ -4202,6 +4232,7 @@ static void PreferAdfsFilingSystem(BbcMachine* bbc) {
   if (bbc->mapped_slot == adfs || bbc->mapped_slot == dfs) {
     CommitSideways(bbc);
     bbc->mapped_slot = -1;
+    bbc->mapped_virt = -1;
   }
   image = bbc->sideways[adfs];
   loaded = bbc->sideways_loaded[adfs];
@@ -5636,8 +5667,9 @@ bool BbcMachineLoadSidewaysBytes(BbcMachine* bbc, int slot, const uint8_t* bytes
   NoteRomFiling(bbc, slot, NULL);
   // The new image is already in the buffer. Dropping the mapped slot skips
   // the write-back that would replace it with the old window.
-  if (bbc->ram != NULL && bbc->mapped_slot == slot) {
+  if (bbc->ram != NULL && bbc->mapped_slot == slot && bbc->mapped_virt == 0) {
     bbc->mapped_slot = -1;
+    bbc->mapped_virt = -1;
   }
   MapRomsel(bbc);
   FdcDetect(bbc);
@@ -5658,6 +5690,45 @@ bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path) {
     NoteRomFiling(bbc, slot, path);
   }
   return ok;
+}
+
+// Virtual images 1-7 share the socket with image 0 and are selected by
+// bits 4-6 of ROMSEL. They stay ROM, and they do not change which filing
+// system the socket claims.
+static bool LoadSidewaysVirtual(BbcMachine* bbc, int slot, int virt, const char* path) {
+  uint8_t* buf = NULL;
+  size_t length = 0;
+  uint8_t** image;
+  if (bbc == NULL || slot < 0 || slot > 15 || virt < 1 || virt > 7) {
+    return false;
+  }
+  if (!ReadWholeFile(path, &buf, &length)) {
+    fprintf(stderr, "Unable to read sideways ROM '%s'\n", path);
+    return false;
+  }
+  image = &bbc->sideways_page[slot][virt - 1];
+  if (*image == NULL) {
+    *image = malloc(16384);
+    if (*image == NULL) {
+      free(buf);
+      return false;
+    }
+  }
+  memset(*image, 0xff, 16384);
+  if (length > 0) {
+    if (length > 16384) {
+      length = 16384;
+    }
+    memcpy(*image, buf, length);
+  }
+  free(buf);
+  bbc->any_sideways = true;
+  if (bbc->ram != NULL && bbc->mapped_slot == slot && bbc->mapped_virt == virt) {
+    bbc->mapped_slot = -1;
+    bbc->mapped_virt = -1;
+  }
+  MapRomsel(bbc);
+  return true;
 }
 
 static bool DirectoryExists(const char* path) {
@@ -5693,8 +5764,9 @@ static bool EqualsIgnoreCase(const char* text, const char* other) {
 }
 
 // os.rom and os-<name>.rom are the MOS. <0-15>.rom and <0-15>-<name>.rom
-// are sideways sockets. Other .rom names are rejected.
-static int ClassifyRomName(const char* name, int* slot) {
+// are virtual image 0. <0-15>.<0-7>-<name>.rom is an image in that socket.
+// Other .rom names are rejected.
+static int ClassifyRomName(const char* name, int* slot, int* virt) {
   char stem[256];
   size_t length;
   size_t i;
@@ -5711,10 +5783,12 @@ static int ClassifyRomName(const char* name, int* slot) {
   stem[length - 4] = '\0';
   if (EqualsIgnoreCase(stem, "os")) {
     *slot = -1;
+    *virt = 0;
     return 1;
   }
   if (strncasecmp(stem, "os-", 3) == 0 && stem[3] != '\0') {
     *slot = -1;
+    *virt = 0;
     return 1;
   }
   if (!isdigit((unsigned char)stem[0])) {
@@ -5729,8 +5803,30 @@ static int ClassifyRomName(const char* name, int* slot) {
   if (isdigit((unsigned char)stem[i]) || value > 15) {
     return -1;
   }
+  if (stem[i] == '.') {
+    int virtual = 0;
+    int vdigits = 0;
+    i++;
+    if (!isdigit((unsigned char)stem[i])) {
+      return -1;
+    }
+    for (; isdigit((unsigned char)stem[i]) && vdigits < 2; i++) {
+      virtual = virtual * 10 + (stem[i] - '0');
+      vdigits++;
+    }
+    if (isdigit((unsigned char)stem[i]) || virtual > 7) {
+      return -1;
+    }
+    if (stem[i] != '-' || stem[i + 1] == '\0') {
+      return -1;
+    }
+    *slot = value;
+    *virt = virtual;
+    return 1;
+  }
   if (stem[i] == '\0' || (stem[i] == '-' && stem[i + 1] != '\0')) {
     *slot = value;
+    *virt = 0;
     return 1;
   }
   return -1;
@@ -5791,6 +5887,40 @@ static char* RomDirectoryBeside(const char* binary, const char* directory) {
   }
   if (DirectoryExists(candidate)) {
     return strdup(candidate);
+  }
+  // The executable of a Mac app lives in Something.app/Contents/MacOS.
+  // Socket directories may sit in Contents/Resources, or next to the .app.
+  {
+    const char* scan = folder;
+    const char* macos = NULL;
+    const char* hit;
+    while ((hit = strstr(scan, ".app/Contents/MacOS")) != NULL) {
+      macos = hit;
+      scan = hit + 1;
+    }
+    if (macos != NULL && macos[strlen(".app/Contents/MacOS")] == '\0') {
+      char app[PATH_MAX];
+      size_t app_len = (size_t)(macos - folder) + 4;
+      if (app_len < sizeof(app)) {
+        memcpy(app, folder, app_len);
+        app[app_len] = '\0';
+        snprintf(candidate, sizeof(candidate), "%s/Contents/Resources/%s", app, directory);
+        if (DirectoryExists(candidate)) {
+          return strdup(candidate);
+        }
+        slash = LastSeparator(app);
+        if (slash == app) {
+          snprintf(candidate, sizeof(candidate), "/%s", directory);
+        } else if (slash != NULL) {
+          snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)(slash - app), app, directory);
+        } else {
+          candidate[0] = '\0';
+        }
+        if (candidate[0] != '\0' && DirectoryExists(candidate)) {
+          return strdup(candidate);
+        }
+      }
+    }
   }
   return NULL;
 }
@@ -5931,6 +6061,7 @@ bool BbcMachineSetSidewaysRam(BbcMachine* bbc, const bool ram[16]) {
     }
   }
   bbc->mapped_slot = -1;
+  bbc->mapped_virt = -1;
   MapRomsel(bbc);
   return true;
 }
@@ -6127,6 +6258,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
   bool saw_os = false;
   bool saw_selected = false;
   bool saw_slot[16];
+  uint8_t saw_virt[16];
   int slot_kind[16];
   char* deferred_path[8];
   int deferred_kind[8];
@@ -6139,6 +6271,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
   }
   for (i = 0; i < 16; i++) {
     saw_slot[i] = false;
+    saw_virt[i] = 0;
     slot_kind[i] = BBC_FS_ANY;
   }
   handle = opendir(dir);
@@ -6148,10 +6281,11 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
   }
   while ((entry = readdir(handle)) != NULL) {
     int slot = 0;
+    int virt = 0;
     int kind;
     char* path;
     struct stat st;
-    kind = ClassifyRomName(entry->d_name, &slot);
+    kind = ClassifyRomName(entry->d_name, &slot, &virt);
     if (kind == 0) {
       continue;
     }
@@ -6165,7 +6299,9 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
       free(path);
       if (kind < 0) {
-        fprintf(stderr, "ROM file '%s' is not os[-name].rom or <socket>[-name].rom\n",
+        fprintf(stderr,
+                "ROM file '%s' is not os[-name].rom, <socket>[-name].rom, or "
+                "<socket>.<virtual>-<name>.rom\n",
                 entry->d_name);
         closedir(handle);
         FreeDeferredRomPaths(deferred_path, deferred);
@@ -6175,7 +6311,9 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
       continue;
     }
     if (kind < 0) {
-      fprintf(stderr, "ROM file '%s' is not os[-name].rom or <socket>[-name].rom\n",
+      fprintf(stderr,
+              "ROM file '%s' is not os[-name].rom, <socket>[-name].rom, or "
+              "<socket>.<virtual>-<name>.rom\n",
               entry->d_name);
       free(path);
       closedir(handle);
@@ -6192,7 +6330,18 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
       if (rom_kind == filing) {
         saw_selected = true;
       }
-      if (slot >= 0 && saw_slot[slot]) {
+      if (slot >= 0 && virt > 0) {
+        if ((saw_virt[slot] & (uint8_t)(1u << virt)) != 0) {
+          fprintf(stderr, "ROM directory '%s' has two images for socket %d virtual %d\n", dir,
+                  slot, virt);
+          free(path);
+          closedir(handle);
+          FreeDeferredRomPaths(deferred_path, deferred);
+          BbcRomFileFree(files, count);
+          return -1;
+        }
+        saw_virt[slot] = (uint8_t)(saw_virt[slot] | (uint8_t)(1u << virt));
+      } else if (slot >= 0 && saw_slot[slot]) {
         bool either_fs = (slot_kind[slot] == BBC_FS_DFS && rom_kind == BBC_FS_ADFS) ||
                          (slot_kind[slot] == BBC_FS_ADFS && rom_kind == BBC_FS_DFS);
         if (either_fs) {
@@ -6219,8 +6368,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
           BbcRomFileFree(files, count);
           return -1;
         }
-      }
-      if (slot >= 0) {
+      } else if (slot >= 0) {
         slot_kind[slot] = rom_kind;
       }
     }
@@ -6234,7 +6382,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
         return -1;
       }
       saw_os = true;
-    } else {
+    } else if (virt == 0) {
       saw_slot[slot] = true;
     }
     if (count >= capacity) {
@@ -6246,6 +6394,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
       return -1;
     }
     files[count].slot = slot;
+    files[count].virt = virt;
     files[count].path = path;
     count++;
   }
@@ -6273,6 +6422,7 @@ int BbcMachineListRomDirectory(const char* dir, BbcRomFile* files, int capacity,
     saw_slot[alt] = true;
     slot_kind[alt] = deferred_kind[i];
     files[count].slot = alt;
+    files[count].virt = 0;
     files[count].path = deferred_path[i];
     count++;
   }
@@ -6311,6 +6461,13 @@ bool BbcMachineLoadRomFiles(BbcMachine* bbc, const BbcRomFile* files, int count,
     if (skip_slot != NULL && skip_slot[slot]) {
       continue;
     }
+    if (files[i].virt > 0) {
+      fprintf(stderr, "ROM %d.%d: %s\n", slot, files[i].virt, files[i].path);
+      if (!LoadSidewaysVirtual(bbc, slot, files[i].virt, files[i].path)) {
+        return false;
+      }
+      continue;
+    }
     fprintf(stderr, "ROM %d: %s\n", slot, files[i].path);
     if (!BbcMachineLoadSideways(bbc, slot, files[i].path)) {
       return false;
@@ -6347,6 +6504,7 @@ BbcMachine* BbcMachineCreate(void) {
   bbc->jim_page = 0;
   bbc->fred[0xff] = 0;
   bbc->mapped_slot = -1;
+  bbc->mapped_virt = -1;
   bbc->model = BBC_MACHINE_B;
   ViaReset(&bbc->sys);
   ViaReset(&bbc->user);
@@ -6394,7 +6552,11 @@ void BbcMachineDestroy(BbcMachine* bbc) {
     return;
   }
   for (i = 0; i < 16; i++) {
+    int page;
     free(bbc->sideways[i]);
+    for (page = 0; page < 7; page++) {
+      free(bbc->sideways_page[i][page]);
+    }
   }
   TapeFlush(bbc);
   TapeClose(bbc);

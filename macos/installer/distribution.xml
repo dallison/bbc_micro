@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>BBC Micro</title>
+    <welcome file="welcome.txt" mime-type="text/plain"/>
+    <readme file="readme.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.txt" mime-type="text/plain"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="bbc"/>
+    </choices-outline>
+    <choice id="bbc" title="BBC Micro" description="The emulator, Cumana, the file server, the cassette player, and the disc tools.">
+        <pkg-ref id="com.github.dallison.bbc-micro"/>
+    </choice>
+    <pkg-ref id="com.github.dallison.bbc-micro" version="@PKG_VERSION@" auth="root">BBCMicroComponent.pkg</pkg-ref>
+</installer-gui-script>

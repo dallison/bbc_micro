@@ -47,11 +47,19 @@ bool BbcMachineLoadOs(BbcMachine* bbc, const char* path);
 // Master looks in bbc_master_rom_sockets. -roms names a directory instead.
 //   os.rom or os-<name>.rom           MOS, for example os-1.20.rom
 //   <socket>.rom or <socket>-<name>.rom
-//                                     sideways socket 0-15, for example
-//                                     15-basic2.rom
+//                                     sideways socket 0-15, virtual image 0,
+//                                     for example 15-basic2.rom. This is the
+//                                     image the MOS sees.
+//   <socket>.<virtual>-<name>.rom     virtual image 0-7 in that socket, for
+//                                     example 4.1-libc.rom. Image 0 is the
+//                                     same one as <socket>-<name>.rom. Bits
+//                                     4-6 of the ROM select register choose
+//                                     the image. Bit 7 stays the Master's
+//                                     ANDY overlay.
 #define BBC_B_ROM_DIRECTORY "bbc_b_rom_sockets"
 #define BBC_MASTER_ROM_DIRECTORY "bbc_master_rom_sockets"
-#define BBC_ROM_IMAGE_MAX 17
+// One OS image, plus eight images in each of the 16 sockets.
+#define BBC_ROM_IMAGE_MAX 129
 
 // BBC_MACHINE_B is the Model B. BBC_MACHINE_MASTER is the Master 128:
 // 65C02, WD1770, ACCCON, and sideways RAM in sockets 4-7. MASTER256 keeps
@@ -74,11 +82,13 @@ const char* BbcMachineRomDirectoryName(int model);
 
 typedef struct BbcRomFile {
   int slot;   // -1 is the OS image. 0-15 is a sideways socket.
+  int virt;   // 0-7. Bits 4-6 of ROMSEL. 0 is the image the MOS sees.
   char* path;
 } BbcRomFile;
 
 // malloc'd path of ./<directory>, or that directory beside the executable
-// or its parent. NULL when none of those directories exist.
+// or its parent. A Mac app also looks in Contents/Resources and in the
+// folder that contains the .app. NULL when none of those directories exist.
 char* BbcMachineFindRomDirectory(const char* argv0, const char* directory);
 // Which filing-system ROM to take from the socket directory. BBC_FS_ANY
 // loads every image. DFS and ADFS may share a socket; pass DFS or ADFS to

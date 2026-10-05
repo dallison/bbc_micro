@@ -31,6 +31,14 @@ static const char* TempPath(char* buf, size_t n, const char* name) {
   return buf;
 }
 
+static int MakeDir(const char* path) {
+#ifdef _WIN32
+  return _mkdir(path);
+#else
+  return mkdir(path, 0755);
+#endif
+}
+
 static char* MakeTempDir(char* templ) {
 #ifdef _WIN32
   return _mktemp(templ) != NULL && _mkdir(templ) == 0 ? templ : NULL;
@@ -1021,6 +1029,187 @@ static void TestRomDirectory(void) {
   snprintf(path, sizeof(path), "%s/4.rom", dir);
   remove(path);
   snprintf(path, sizeof(path), "%s/notes.txt", dir);
+  remove(path);
+  rmdir(dir);
+}
+
+// A Mac app keeps its executable in Contents/MacOS. The socket directory
+// may sit in Contents/Resources, or in the folder that contains the .app.
+static void TestRomDirectoryBesideApp(void) {
+  char root[512];
+  char path[512];
+  char bin[768];
+  char* found;
+  TempPath(root, sizeof(root), "bbc-app-roms-XXXXXX");
+  if (MakeTempDir(root) == NULL) {
+    EXPECT(0);
+    return;
+  }
+  snprintf(path, sizeof(path), "%s/Machine.app", root);
+  EXPECT(MakeDir(path) == 0);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents", root);
+  EXPECT(MakeDir(path) == 0);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/MacOS", root);
+  EXPECT(MakeDir(path) == 0);
+  snprintf(path, sizeof(path), "%s/pkgroms", root);
+  EXPECT(MakeDir(path) == 0);
+  snprintf(bin, sizeof(bin), "%s/Machine.app/Contents/MacOS/bbc", root);
+  found = BbcMachineFindRomDirectory(bin, "pkgroms");
+  snprintf(path, sizeof(path), "%s/pkgroms", root);
+  EXPECT(found != NULL && strcmp(found, path) == 0);
+  free(found);
+
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/Resources", root);
+  EXPECT(MakeDir(path) == 0);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/Resources/pkgroms", root);
+  EXPECT(MakeDir(path) == 0);
+  found = BbcMachineFindRomDirectory(bin, "pkgroms");
+  EXPECT(found != NULL && strcmp(found, path) == 0);
+  free(found);
+
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/Resources/pkgroms", root);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/Resources", root);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/pkgroms", root);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents/MacOS", root);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/Machine.app/Contents", root);
+  rmdir(path);
+  snprintf(path, sizeof(path), "%s/Machine.app", root);
+  rmdir(path);
+  rmdir(root);
+}
+
+static int FindVirt(const BbcRomFile* files, int count, int slot, int virt) {
+  int i;
+  for (i = 0; i < count; i++) {
+    if (files[i].slot == slot && files[i].virt == virt) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// <socket>.<virtual>-<name>.rom shares the socket. Bits 4-6 of ROMSEL
+// select that image. Bit 7 stays the Master's ANDY overlay.
+static void TestVirtualRoms(void) {
+  char dir[512];
+  char path[512];
+  BbcRomFile files[BBC_ROM_IMAGE_MAX];
+  int count;
+  uint8_t* ram;
+  BbcMachine* bbc;
+  bool banks[16];
+  bool skip[16];
+  TempPath(dir, sizeof(dir), "bbc-virt-roms-XXXXXX");
+  if (MakeTempDir(dir) == NULL) {
+    EXPECT(0);
+    return;
+  }
+  WriteNamed(dir, "os-1.20.rom", 0x01);
+  WriteNamed(dir, "4-main.rom", 0x11);
+  WriteNamed(dir, "4.1-libc.rom", 0x22);
+  WriteNamed(dir, "4.2-libm.rom", 0x33);
+  WriteNamed(dir, "5-base.rom", 0x44);
+  WriteNamed(dir, "5.1-lib.rom", 0x55);
+  WriteNamed(dir, "9-main.rom", 0x61);
+  WriteNamed(dir, "9.1-lib.rom", 0x62);
+  WriteNamed(dir, "notes.txt", 0x00);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
+  EXPECT(count == 8);
+  EXPECT(FindVirt(files, count, 4, 0) >= 0);
+  EXPECT(FindVirt(files, count, 4, 1) >= 0);
+  EXPECT(FindVirt(files, count, 4, 2) >= 0);
+  EXPECT(FindVirt(files, count, -1, 0) >= 0);
+  ram = calloc(65536, 1);
+  bbc = BbcMachineCreate();
+  EXPECT(ram != NULL && bbc != NULL);
+  if (ram != NULL && bbc != NULL) {
+    memset(skip, 0, sizeof(skip));
+    BbcMachineSetRam(bbc, ram);
+    EXPECT(BbcMachineLoadRomFiles(bbc, files, count, skip));
+    BbcMachineWrite(bbc, 0xfe30, 4);
+    EXPECT(BbcMachineRead(bbc, 0xfe30) == 4);
+    EXPECT(ram[0x8000] == 0x11);
+    BbcMachineWrite(bbc, 0xfe30, 0x14);
+    EXPECT(BbcMachineRead(bbc, 0xfe30) == 0x14);
+    EXPECT(ram[0x8000] == 0x22);
+    EXPECT(BbcMachineSidewaysRom(bbc, 0x8000));
+    BbcMachineWrite(bbc, 0xfe30, 0x24);
+    EXPECT(ram[0x8000] == 0x33);
+    BbcMachineWrite(bbc, 0xfe30, 0x34);
+    EXPECT(ram[0x8000] == 0xff);
+    BbcMachineWrite(bbc, 0xfe30, 4);
+    EXPECT(ram[0x8000] == 0x11);
+
+    memset(banks, 0, sizeof(banks));
+    banks[5] = true;
+    EXPECT(BbcMachineSetSidewaysRam(bbc, banks));
+    BbcMachineWrite(bbc, 0xfe30, 5);
+    EXPECT(ram[0x8000] == 0x44);
+    EXPECT(!BbcMachineSidewaysRom(bbc, 0x8000));
+    ram[0x8000] = 0xcd;
+    BbcMachineWrite(bbc, 0xfe30, 0x15);
+    EXPECT(ram[0x8000] == 0x55);
+    EXPECT(BbcMachineSidewaysRom(bbc, 0x8000));
+    ram[0x8000] = 0xee;
+    BbcMachineWrite(bbc, 0xfe30, 5);
+    EXPECT(ram[0x8000] == 0xcd);
+    BbcMachineWrite(bbc, 0xfe30, 0x15);
+    EXPECT(ram[0x8000] == 0x55);
+
+    EXPECT(BbcMachineSetModel(bbc, BBC_MACHINE_MASTER));
+    BbcMachineWrite(bbc, 0xfe30, 0x19);
+    EXPECT(ram[0x8000] == 0x62);
+    BbcMachineWrite(bbc, 0xfe30, 0x99);
+    EXPECT(BbcMachineRead(bbc, 0xfe30) == 0x99);
+    EXPECT(ram[0x8000] == 0x00);
+    EXPECT(ram[0x9000] == 0xff);
+    ram[0x8000] = 0x77;
+    BbcMachineWrite(bbc, 0xfe30, 0x19);
+    EXPECT(ram[0x8000] == 0x62);
+    BbcMachineWrite(bbc, 0xfe30, 0x99);
+    EXPECT(ram[0x8000] == 0x77);
+  }
+  BbcRomFileFree(files, count);
+  BbcMachineDestroy(bbc);
+  free(ram);
+
+  WriteNamed(dir, "4.8-nope.rom", 0x70);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
+  EXPECT(count < 0);
+  snprintf(path, sizeof(path), "%s/4.8-nope.rom", dir);
+  remove(path);
+  WriteNamed(dir, "4.1-again.rom", 0x71);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
+  EXPECT(count < 0);
+  snprintf(path, sizeof(path), "%s/4.1-again.rom", dir);
+  remove(path);
+  WriteNamed(dir, "4.1.rom", 0x72);
+  count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
+  EXPECT(count < 0);
+
+  snprintf(path, sizeof(path), "%s/os-1.20.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/4-main.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/4.1-libc.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/4.2-libm.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/5-base.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/5.1-lib.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/9-main.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/9.1-lib.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/notes.txt", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/4.1.rom", dir);
   remove(path);
   rmdir(dir);
 }
@@ -2220,6 +2409,8 @@ int main(void) {
     TestPeripherals();
     TestTeletextControls();
     TestRomDirectory();
+    TestRomDirectoryBesideApp();
+    TestVirtualRoms();
     TestMaster();
     TestEconet();
     TestEconetOtherProcess();

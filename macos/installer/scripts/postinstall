@@ -1,0 +1,12 @@
+#!/bin/bash
+# The socket folders have to be writable by the person at the keyboard,
+# so they can copy ROM images in after the installer finishes.
+
+DEST="/Applications/BBC Micro"
+CONSOLE_USER="$(stat -f '%Su' /dev/console 2>/dev/null || true)"
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ] && [ -d "$DEST" ]; then
+  chown -R "${CONSOLE_USER}:staff" \
+    "${DEST}/bbc_b_rom_sockets" \
+    "${DEST}/bbc_master_rom_sockets"
+fi
+exit 0

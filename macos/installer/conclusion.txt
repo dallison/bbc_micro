@@ -1,0 +1,3 @@
+BBC Micro is in /Applications/BBC Micro.
+
+Add your ROM images to bbc_b_rom_sockets and bbc_master_rom_sockets, then open BBC Micro.
