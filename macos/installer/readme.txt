@@ -6,6 +6,7 @@ BBC Micro.app is the machine. The other programs run from a terminal in /Applica
   ./6502
   ./blank_disc.py blank.ssd
   ./blank_tape.py blank.uef
+  ./copy_from_disc.py disc.ssd saved
   ./copy_to_hd.py disc.ssd disc.hd
   ./examine_disc.py disc.adl
 

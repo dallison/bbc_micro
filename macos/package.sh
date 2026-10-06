@@ -41,7 +41,7 @@ cp "${BUILD}/6502" "${STAGE}/6502"
 chmod 755 "${STAGE}/cumana" "${STAGE}/fileserver" "${STAGE}/cassette" "${STAGE}/6502"
 ln -s "BBC Micro.app/Contents/MacOS/bbc" "${STAGE}/bbc"
 
-for script in blank_disc.py blank_tape.py copy_to_hd.py examine_disc.py; do
+for script in blank_disc.py blank_tape.py copy_from_disc.py copy_to_hd.py examine_disc.py; do
   cp "${ROOT}/${script}" "${STAGE}/${script}"
   chmod 755 "${STAGE}/${script}"
 done
@@ -97,6 +97,7 @@ folder, ./bbc is the same program.
   ./6502
   ./blank_disc.py blank.ssd
   ./blank_tape.py blank.uef
+  ./copy_from_disc.py disc.ssd saved
   ./copy_to_hd.py disc.ssd disc.hd
   ./examine_disc.py disc.adl
 
