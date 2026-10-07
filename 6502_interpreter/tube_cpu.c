@@ -196,7 +196,13 @@ bool BbcMachineAttachTube(BbcMachine* bbc, int kind, const char* rom_path) {
   Parasite* parasite;
   TubeDev* dev;
   BbcTubeHooks hooks;
-  if (bbc == NULL || (kind != BBC_TUBE_6502 && kind != BBC_TUBE_65C02)) {
+  if (bbc == NULL) {
+    return false;
+  }
+  if (kind == BBC_TUBE_ARM) {
+    return BbcMachineAttachArmTube(bbc, rom_path);
+  }
+  if (kind != BBC_TUBE_6502 && kind != BBC_TUBE_65C02) {
     return false;
   }
   parasite = calloc(1, sizeof(*parasite));

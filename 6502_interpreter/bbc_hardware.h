@@ -170,12 +170,14 @@ bool BbcMachineMosRom(const BbcMachine* bbc, uint16_t addr);
 void BbcMachineBreak(BbcMachine* bbc);
 
 // The Tube ULA and the parasite CPU. bbc_hardware stores the hooks and does
-// not own the interpreter. kind is BBC_TUBE_6502 (3 MHz) or BBC_TUBE_65C02
-// (4 MHz). rom_path NULL uses the built-in client. A file is placed at the
-// top of the parasite's memory; its last six bytes are the vectors.
+// not own the interpreter. kind is BBC_TUBE_6502 (3 MHz), BBC_TUBE_65C02
+// (4 MHz), or BBC_TUBE_ARM (8 MHz ARM3, 4 MB). rom_path NULL uses the
+// built-in client. A 6502 file is placed at the top of memory and its last
+// six bytes are the vectors. An ARM file is copied to address 0.
 struct Tube;
 #define BBC_TUBE_6502 0
 #define BBC_TUBE_65C02 1
+#define BBC_TUBE_ARM 2
 typedef struct BbcTubeHooks {
   struct Tube* tube;
   void* parasite;
@@ -187,6 +189,7 @@ typedef struct BbcTubeHooks {
 } BbcTubeHooks;
 void BbcMachineSetTube(BbcMachine* bbc, const BbcTubeHooks* hooks);
 bool BbcMachineAttachTube(BbcMachine* bbc, int kind, const char* rom_path);
+bool BbcMachineAttachArmTube(BbcMachine* bbc, const char* rom_path);
 void BbcMachineRunParasite(BbcMachine* bbc, int host_cycles);
 uint8_t BbcMachineParasiteRead(const BbcMachine* bbc, uint16_t addr);
 uint16_t BbcMachineParasitePc(const BbcMachine* bbc);

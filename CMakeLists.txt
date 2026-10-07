@@ -89,6 +89,9 @@ add_library(6502_lib STATIC
   6502_interpreter/6502_interpreter.c
   6502_interpreter/6502_nmos.c
   6502_interpreter/bbc_hardware.c
+  6502_interpreter/arm3.c
+  6502_interpreter/arm_client.c
+  6502_interpreter/arm_tube.c
   6502_interpreter/tube.c
   6502_interpreter/tube_client.c
   6502_interpreter/tube_cpu.c
@@ -134,6 +137,9 @@ target_link_libraries(6502_nmos_test PRIVATE 6502_lib)
 
 add_executable(tube_test 6502_interpreter/tube_test.c)
 target_link_libraries(tube_test PRIVATE 6502_lib)
+
+add_executable(arm3_test 6502_interpreter/arm3_test.c)
+target_link_libraries(arm3_test PRIVATE 6502_lib)
 
 if(APPLE)
   enable_language(OBJC)
@@ -184,6 +190,7 @@ enable_testing()
 add_test(NAME bbc_hardware_test COMMAND bbc_hardware_test)
 add_test(NAME 6502_nmos_test COMMAND 6502_nmos_test)
 add_test(NAME tube_test COMMAND tube_test)
+add_test(NAME arm3_test COMMAND arm3_test)
 if(TARGET bbc)
   add_test(NAME bbc_selftest COMMAND bbc -selftest)
 endif()

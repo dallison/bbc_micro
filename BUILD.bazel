@@ -109,6 +109,9 @@ cc_library(
         "6502_interpreter/6502_disassembler.c",
         "6502_interpreter/6502_interpreter.c",
         "6502_interpreter/6502_nmos.c",
+        "6502_interpreter/arm3.c",
+        "6502_interpreter/arm_client.c",
+        "6502_interpreter/arm_tube.c",
         "6502_interpreter/bbc_hardware.c",
         "6502_interpreter/tube.c",
         "6502_interpreter/tube_client.c",
@@ -244,6 +247,14 @@ cc_test(
 cc_test(
     name = "tube_test",
     srcs = ["6502_interpreter/tube_test.c"],
+    copts = COMMON_COPTS + ["-Wall", "-Wextra"],
+    includes = COMMON_INCLUDES,
+    deps = [":6502_lib"],
+)
+
+cc_test(
+    name = "arm3_test",
+    srcs = ["6502_interpreter/arm3_test.c"],
     copts = COMMON_COPTS + ["-Wall", "-Wextra"],
     includes = COMMON_INCLUDES,
     deps = [":6502_lib"],
