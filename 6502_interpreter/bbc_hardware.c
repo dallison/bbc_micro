@@ -8,6 +8,7 @@
 #include "bbc_platform.h"
 #include "cassette.h"
 #include "cumana.h"
+#include "tube.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -148,6 +149,13 @@ struct BbcMachine {
   uint8_t adc_status;
   uint16_t adc[4];
   uint8_t tube_status;
+  struct Tube* tube;
+  void* parasite;
+  void (*parasite_run)(void* parasite, int host_cycles);
+  void (*parasite_reset)(void* parasite);
+  void (*parasite_destroy)(void* parasite);
+  uint8_t (*parasite_read)(void* parasite, uint16_t addr);
+  uint16_t (*parasite_pc)(void* parasite);
   struct {
     int kind;
     bool forced;
@@ -1947,6 +1955,9 @@ void BbcMachineBreak(BbcMachine* bbc) {
   bbc->romsel = 0;
   bbc->hd.phase = 0;
   MapRomsel(bbc);
+  if (bbc->parasite_reset != NULL) {
+    bbc->parasite_reset(bbc->parasite);
+  }
 }
 
 void BbcMachineCaptureMos(BbcMachine* bbc) {
@@ -3847,6 +3858,9 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
     return;
   }
   // &FEE0-&FEFF is the Tube. An empty socket does not echo the probe.
+  if (bbc->tube != NULL) {
+    TubeHostWrite(bbc->tube, page & 7, value);
+  }
 }
 
 static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
@@ -3921,6 +3935,9 @@ static uint8_t ReadSheila(BbcMachine* bbc, uint8_t page) {
   }
   if (page < 0xe0) {
     return AdcRead(bbc, page & 3);
+  }
+  if (bbc->tube != NULL) {
+    return TubeHostRead(bbc->tube, page & 7);
   }
   return 0xfe;
 }
@@ -4910,7 +4927,10 @@ bool BbcMachineIrqPending(const BbcMachine* bbc) {
   if (bbc->master && (bbc->acccon & 0x80) != 0) {
     return true;
   }
-  return ViaIrq(&bbc->sys) || ViaIrq(&bbc->user) || AcaiIrq(bbc) || HdIrqPending(bbc);
+  if (ViaIrq(&bbc->sys) || ViaIrq(&bbc->user) || AcaiIrq(bbc) || HdIrqPending(bbc)) {
+    return true;
+  }
+  return bbc->tube != NULL && TubeHostIrq(bbc->tube);
 }
 
 int BbcFrameWidth(const BbcMachine* bbc) { return bbc->frame_width; }
@@ -6546,11 +6566,62 @@ BbcMachine* BbcMachineCreate(void) {
   return bbc;
 }
 
+void BbcMachineSetTube(BbcMachine* bbc, const BbcTubeHooks* hooks) {
+  void (*destroy)(void*);
+  void* parasite;
+  if (bbc == NULL) {
+    return;
+  }
+  destroy = bbc->parasite_destroy;
+  parasite = bbc->parasite;
+  bbc->parasite_destroy = NULL;
+  bbc->parasite = NULL;
+  bbc->parasite_run = NULL;
+  bbc->parasite_reset = NULL;
+  bbc->parasite_read = NULL;
+  bbc->parasite_pc = NULL;
+  bbc->tube = NULL;
+  if (destroy != NULL) {
+    destroy(parasite);
+  }
+  if (hooks == NULL) {
+    return;
+  }
+  bbc->tube = hooks->tube;
+  bbc->parasite = hooks->parasite;
+  bbc->parasite_run = hooks->run;
+  bbc->parasite_reset = hooks->reset;
+  bbc->parasite_destroy = hooks->destroy;
+  bbc->parasite_read = hooks->read;
+  bbc->parasite_pc = hooks->pc;
+}
+
+void BbcMachineRunParasite(BbcMachine* bbc, int host_cycles) {
+  if (bbc != NULL && bbc->parasite_run != NULL && host_cycles > 0) {
+    bbc->parasite_run(bbc->parasite, host_cycles);
+  }
+}
+
+uint8_t BbcMachineParasiteRead(const BbcMachine* bbc, uint16_t addr) {
+  if (bbc == NULL || bbc->parasite_read == NULL) {
+    return 0;
+  }
+  return bbc->parasite_read(bbc->parasite, addr);
+}
+
+uint16_t BbcMachineParasitePc(const BbcMachine* bbc) {
+  if (bbc == NULL || bbc->parasite_pc == NULL) {
+    return 0;
+  }
+  return bbc->parasite_pc(bbc->parasite);
+}
+
 void BbcMachineDestroy(BbcMachine* bbc) {
   int i;
   if (bbc == NULL) {
     return;
   }
+  BbcMachineSetTube(bbc, NULL);
   for (i = 0; i < 16; i++) {
     int page;
     free(bbc->sideways[i]);

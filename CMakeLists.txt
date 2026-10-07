@@ -89,6 +89,9 @@ add_library(6502_lib STATIC
   6502_interpreter/6502_interpreter.c
   6502_interpreter/6502_nmos.c
   6502_interpreter/bbc_hardware.c
+  6502_interpreter/tube.c
+  6502_interpreter/tube_client.c
+  6502_interpreter/tube_cpu.c
 )
 target_include_directories(6502_lib PUBLIC ${BBC_INCLUDES})
 target_link_libraries(6502_lib PUBLIC
@@ -121,12 +124,16 @@ target_link_libraries(fileserver PRIVATE ${BBC_SOCKET_LIBS})
 add_executable(bbc_hardware_test
   6502_interpreter/bbc_hardware.c
   6502_interpreter/bbc_hardware_test.c
+  6502_interpreter/tube.c
 )
 target_include_directories(bbc_hardware_test PRIVATE ${BBC_INCLUDES})
 target_link_libraries(bbc_hardware_test PRIVATE Threads::Threads ${BBC_SOCKET_LIBS})
 
 add_executable(6502_nmos_test 6502_interpreter/6502_nmos_test.c)
 target_link_libraries(6502_nmos_test PRIVATE 6502_lib)
+
+add_executable(tube_test 6502_interpreter/tube_test.c)
+target_link_libraries(tube_test PRIVATE 6502_lib)
 
 if(APPLE)
   enable_language(OBJC)
@@ -176,6 +183,7 @@ endif()
 enable_testing()
 add_test(NAME bbc_hardware_test COMMAND bbc_hardware_test)
 add_test(NAME 6502_nmos_test COMMAND 6502_nmos_test)
+add_test(NAME tube_test COMMAND tube_test)
 if(TARGET bbc)
   add_test(NAME bbc_selftest COMMAND bbc -selftest)
 endif()

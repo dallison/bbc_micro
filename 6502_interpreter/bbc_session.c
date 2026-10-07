@@ -26,6 +26,7 @@ static void Usage(void) {
           "           [-disc file] [-disc0 file] [-disc1 file] [-disc-port n]\n"
           "           [-hd file]\n"
           "           [-fdc 8271|1770] [-fs dfs|adfs] [-65c02]\n"
+          "           [-tube [6502|65c02] [file]]\n"
           "           [-tape file] [-tape-port n]\n"
           "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
           "           [-keyboard uk|us]\n"
@@ -82,6 +83,11 @@ static void Usage(void) {
           "       times that size. The picture keeps its shape and the pixels\n"
           "       grow with the window.\n"
 #endif
+          "       -tube fits a second processor. 6502 is a 3 MHz NMOS chip and\n"
+          "       65c02 is a 4 MHz CMOS chip. A file replaces the built-in\n"
+          "       client ROM. It sits at the top of that processor's memory,\n"
+          "       and its last six bytes are the interrupt vectors. With no\n"
+          "       -tube the socket stays empty.\n"
           "       -econet n fits the Econet interface as station n (1-254).\n"
           "       That is the 68B54 at &FEA0, not the RS423 serial port.\n"
           "       Stations that use the same -econet-port share a wire. The\n"
@@ -133,6 +139,9 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   int fdc_kind = 0;
   int filing = BBC_FS_ANY;
   bool use_65c02 = false;
+  bool tube = false;
+  int tube_kind = BBC_TUBE_6502;
+  const char* tube_rom = NULL;
   int clock_mhz = 2;
   bool run_ahead = false;
   const char* tape_path = NULL;
@@ -320,6 +329,18 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
       roms_arg = argv[++i];
     } else if (strcmp(argv[i], "-65c02") == 0 || strcmp(argv[i], "-bbc-65c02") == 0) {
       use_65c02 = true;
+    } else if (strcmp(argv[i], "-tube") == 0) {
+      tube = true;
+      while (i + 1 < argc && argv[i + 1][0] != '-') {
+        const char* word = argv[++i];
+        if (strcmp(word, "6502") == 0) {
+          tube_kind = BBC_TUBE_6502;
+        } else if (strcmp(word, "65c02") == 0 || strcmp(word, "65C02") == 0) {
+          tube_kind = BBC_TUBE_65C02;
+        } else {
+          tube_rom = word;
+        }
+      }
     } else if (strcmp(argv[i], "-tape") == 0 || strcmp(argv[i], "-bbc-tape") == 0) {
       if (i + 1 >= argc) {
         Usage();
@@ -561,6 +582,13 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     if (bound < 0) {
       fprintf(stderr, "Econet socket is not available\n");
     }
+  }
+  if (tube) {
+    if (!BbcMachineAttachTube(g_cpu.bbc, tube_kind, tube_rom)) {
+      fprintf(stderr, "Unable to fit the Tube second processor\n");
+      goto fail;
+    }
+    fprintf(stderr, "Tube %s\n", tube_kind == BBC_TUBE_65C02 ? "65C02" : "6502");
   }
   if (!W65C02InterpreterPrepareBbc(&g_cpu)) {
     fprintf(stderr, "Unable to start the BBC Micro\n");

@@ -2,6 +2,7 @@
 #include "bbc_platform.h"
 #include "cassette.h"
 #include "cumana.h"
+#include "tube.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -2387,9 +2388,92 @@ static void TestHardDiscPrefersAdfs(void) {
   remove(path);
 }
 
+static void TestTubeUla(void) {
+  Tube* tube = TubeCreate();
+  int i;
+  EXPECT(tube != NULL);
+  if (tube == NULL) {
+    return;
+  }
+  EXPECT(!TubeParasiteHeld(tube));
+  EXPECT(!TubeHostIrq(tube));
+  EXPECT(!TubeParasiteNmi(tube));
+  EXPECT((TubeHostRead(tube, 4) & 0x80) != 0);
+  EXPECT(TubeHostRead(tube, 5) == 0x00);
+  EXPECT((TubeHostRead(tube, 4) & 0x80) == 0);
+  EXPECT((TubeHostRead(tube, 0) & 0x40) != 0);
+
+  TubeHostWrite(tube, 0, 0x81);
+  EXPECT((TubeHostRead(tube, 0) & 0x01) != 0);
+  EXPECT((TubeHostRead(tube, 0) & 0x40) != 0);
+  EXPECT(!TubeParasiteHeld(tube));
+  TubeHostWrite(tube, 0, 0xA0);
+  EXPECT(TubeParasiteHeld(tube));
+  TubeHostWrite(tube, 0, 0x20);
+  EXPECT(!TubeParasiteHeld(tube));
+
+  for (i = 0; i < 24; i++) {
+    TubeParasiteWrite(tube, 1, (uint8_t)(i + 1));
+  }
+  TubeParasiteWrite(tube, 1, 0x99);
+  EXPECT((TubeHostRead(tube, 0) & 0x80) != 0);
+  for (i = 0; i < 24; i++) {
+    EXPECT(TubeHostRead(tube, 1) == (uint8_t)(i + 1));
+  }
+  EXPECT((TubeHostRead(tube, 0) & 0x80) == 0);
+  EXPECT(TubeHostRead(tube, 1) == 24);
+
+  TubeParasiteWrite(tube, 7, 0x05);
+  EXPECT(TubeHostIrq(tube));
+  EXPECT(TubeHostRead(tube, 7) == 0x05);
+  EXPECT(!TubeHostIrq(tube));
+
+  TubeHostWrite(tube, 0, 0x82);
+  EXPECT(!TubeParasiteIrq(tube));
+  TubeHostWrite(tube, 1, 0x41);
+  EXPECT(TubeParasiteIrq(tube));
+  EXPECT(TubeParasiteRead(tube, 1) == 0x41);
+  EXPECT(!TubeParasiteIrq(tube));
+
+  TubeHardReset(tube);
+  TubeHostWrite(tube, 0, 0x88);
+  EXPECT(!TubeParasiteNmi(tube));
+  TubeHostWrite(tube, 5, 0x11);
+  EXPECT(TubeParasiteNmi(tube));
+  TubeParasiteNmiAck(tube);
+  EXPECT(!TubeParasiteNmi(tube));
+  EXPECT(TubeParasiteRead(tube, 5) == 0x11);
+
+  TubeHardReset(tube);
+  EXPECT(TubeHostRead(tube, 5) == 0x00);
+  EXPECT(!TubeParasiteNmi(tube));
+  TubeHostWrite(tube, 0, 0x88);
+  EXPECT(TubeParasiteNmi(tube));
+
+  TubeHardReset(tube);
+  TubeHostWrite(tube, 0, 0x98);
+  EXPECT((TubeHostRead(tube, 4) & 0x80) == 0);
+  TubeHostWrite(tube, 5, 0x01);
+  EXPECT(!TubeParasiteNmi(tube));
+  EXPECT((TubeParasiteRead(tube, 4) & 0x80) == 0);
+  TubeHostWrite(tube, 5, 0x02);
+  EXPECT(TubeParasiteNmi(tube));
+  EXPECT((TubeParasiteRead(tube, 4) & 0x80) != 0);
+  EXPECT(TubeParasiteRead(tube, 5) == 0x01);
+  EXPECT(TubeParasiteRead(tube, 5) == 0x02);
+
+  TubeHardReset(tube);
+  TubeParasiteWrite(tube, 7, 0x55);
+  TubeHostWrite(tube, 0, 0x40);
+  EXPECT((TubeHostRead(tube, 6) & 0x80) == 0);
+  EXPECT((TubeHostRead(tube, 4) & 0x80) != 0);
+  TubeDestroy(tube);
+}
+
 int main(void) {
   uint8_t* ram = calloc(65536, 1);
   BbcMachine* bbc = BbcMachineCreate();
+  TestTubeUla();
   EXPECT(ram != NULL && bbc != NULL);
   if (ram != NULL && bbc != NULL) {
     BbcMachineSetRam(bbc, ram);

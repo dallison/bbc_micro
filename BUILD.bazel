@@ -110,6 +110,9 @@ cc_library(
         "6502_interpreter/6502_interpreter.c",
         "6502_interpreter/6502_nmos.c",
         "6502_interpreter/bbc_hardware.c",
+        "6502_interpreter/tube.c",
+        "6502_interpreter/tube_client.c",
+        "6502_interpreter/tube_cpu.c",
     ],
     hdrs = glob(["6502_interpreter/*.h"]) + [
         "c_compiler/6502/6502_machine.h",
@@ -231,10 +234,19 @@ cc_test(
     srcs = [
         "6502_interpreter/bbc_hardware.c",
         "6502_interpreter/bbc_hardware_test.c",
+        "6502_interpreter/tube.c",
     ] + glob(["6502_interpreter/*.h"]),
     copts = COMMON_COPTS + ["-Wall", "-Wextra"],
     includes = COMMON_INCLUDES,
     linkopts = ["-lpthread"],
+)
+
+cc_test(
+    name = "tube_test",
+    srcs = ["6502_interpreter/tube_test.c"],
+    copts = COMMON_COPTS + ["-Wall", "-Wextra"],
+    includes = COMMON_INCLUDES,
+    deps = [":6502_lib"],
 )
 
 cc_test(

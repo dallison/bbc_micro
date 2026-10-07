@@ -7,7 +7,8 @@
 //  SHEILA (&FE00-&FEFF) CRTC, 6850 ACIA (the RS423 serial port), serial ULA,
 //                       video ULA, ROMSEL, the two 6522 VIAs, an 8271 or
 //                       WD1770 floppy controller, and the µPD7002 ADC. The
-//                       Tube reads as an empty socket. Econet is the 68B54
+//                       Tube reads as an empty socket until a second
+//                       processor is fitted. Econet is the 68B54
 //                       ADLC at &FEA0-&FEBF and the station links at
 //                       &FE18-&FE1F; both read as an empty socket until
 //                       BbcMachineOpenEconet fits the interface.
@@ -164,8 +165,31 @@ bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr);
 // read-track routine stores every byte at &FF00, and a write that sticks
 // there replaces the NMI vector.
 bool BbcMachineMosRom(const BbcMachine* bbc, uint16_t addr);
-// BREAK clears ROMSEL and, on a Master, ACCCON.
+// BREAK clears ROMSEL and, on a Master, ACCCON. A fitted second processor
+// is reset as well.
 void BbcMachineBreak(BbcMachine* bbc);
+
+// The Tube ULA and the parasite CPU. bbc_hardware stores the hooks and does
+// not own the interpreter. kind is BBC_TUBE_6502 (3 MHz) or BBC_TUBE_65C02
+// (4 MHz). rom_path NULL uses the built-in client. A file is placed at the
+// top of the parasite's memory; its last six bytes are the vectors.
+struct Tube;
+#define BBC_TUBE_6502 0
+#define BBC_TUBE_65C02 1
+typedef struct BbcTubeHooks {
+  struct Tube* tube;
+  void* parasite;
+  void (*run)(void* parasite, int host_cycles);
+  void (*reset)(void* parasite);
+  void (*destroy)(void* parasite);
+  uint8_t (*read)(void* parasite, uint16_t addr);
+  uint16_t (*pc)(void* parasite);
+} BbcTubeHooks;
+void BbcMachineSetTube(BbcMachine* bbc, const BbcTubeHooks* hooks);
+bool BbcMachineAttachTube(BbcMachine* bbc, int kind, const char* rom_path);
+void BbcMachineRunParasite(BbcMachine* bbc, int host_cycles);
+uint8_t BbcMachineParasiteRead(const BbcMachine* bbc, uint16_t addr);
+uint16_t BbcMachineParasitePc(const BbcMachine* bbc);
 // Remember &C000-&DFFF as the MOS image HAZEL will page out.
 void BbcMachineCaptureMos(BbcMachine* bbc);
 

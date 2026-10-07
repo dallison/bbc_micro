@@ -107,6 +107,15 @@ typedef struct W65C02Interpreter {
   int pace_cycles;
   int pace_busy;
   int turbo_owed;
+  // Optional interrupt sources for a processor that is not the BBC.
+  // A NULL function is absent. write_protect rejects stores at or above
+  // that address once no device has claimed the write. Zero leaves every
+  // store alone.
+  bool (*irq_pending)(void* ctx);
+  bool (*nmi_pending)(void* ctx);
+  void (*nmi_clear)(void* ctx);
+  void* irq_ctx;
+  uint16_t write_protect;
 } W65C02Interpreter;
 
 // Foreground reads and writes decide whether the guest is working or waiting.
@@ -144,6 +153,9 @@ bool W65C02InterpreterPrepareBbc(W65C02Interpreter* interpreter);
 bool W65C02InterpreterSetClockMhz(W65C02Interpreter* interpreter, int mhz);
 // Execute one instruction. Returns the CPU cycles it consumed.
 int W65C02InterpreterStep(W65C02Interpreter* interpreter);
+// One instruction with no wall-clock wait and no second processor. The
+// parasite uses this so the two CPUs cannot call each other.
+int W65C02InterpreterStepRaw(W65C02Interpreter* interpreter);
 void W65C02InterpreterResetCpu(W65C02Interpreter* interpreter);
 
 int W65C02InterpreterRun(W65C02Interpreter* interpreter, Loader* loader,

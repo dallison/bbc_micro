@@ -1841,6 +1841,20 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
     ChargeCycles(interpreter, cycle_accurate, 7);
     return 7;
   }
+  if (interpreter->nmi_pending != NULL && interpreter->nmi_pending(interpreter->irq_ctx)) {
+    if (interpreter->nmi_clear != NULL) {
+      interpreter->nmi_clear(interpreter->irq_ctx);
+    }
+    W65C02TakeNmi(interpreter);
+    ChargeCycles(interpreter, cycle_accurate, 7);
+    return 7;
+  }
+  if (!interpreter->flags.bits.i && interpreter->irq_pending != NULL &&
+      interpreter->irq_pending(interpreter->irq_ctx)) {
+    W65C02TakeIrq(interpreter);
+    ChargeCycles(interpreter, cycle_accurate, 7);
+    return 7;
+  }
   if (interpreter->trace) {
     W65C02DisassemblePc(interpreter);
   }
@@ -1997,11 +2011,23 @@ bool W65C02InterpreterPrepareBbc(W65C02Interpreter* interpreter) {
   return true;
 }
 
+int W65C02InterpreterStepRaw(W65C02Interpreter* interpreter) {
+  if (interpreter == NULL || !interpreter->running) {
+    return 0;
+  }
+  return StepOneInstruction(interpreter, false);
+}
+
 int W65C02InterpreterStep(W65C02Interpreter* interpreter) {
+  int cycles;
   if (!interpreter->running) {
     return 0;
   }
-  return StepOneInstruction(interpreter, true);
+  cycles = StepOneInstruction(interpreter, true);
+  if (cycles > 0 && interpreter->bbc != NULL) {
+    BbcMachineRunParasite(interpreter->bbc, cycles);
+  }
+  return cycles;
 }
 
 void W65C02InterpreterResetCpu(W65C02Interpreter* interpreter) {
@@ -2229,7 +2255,12 @@ int W65C02InterpreterRun(W65C02Interpreter* interpreter, Loader* loader,
       interpreter->running = false;
       break;
     }
-    StepOneInstruction(interpreter, true);
+    {
+      int step_cycles = StepOneInstruction(interpreter, true);
+      if (step_cycles > 0 && interpreter->bbc != NULL) {
+        BbcMachineRunParasite(interpreter->bbc, step_cycles);
+      }
+    }
     interpreter->bbc_steps++;
   }
   if (!W65C02GuestRunFiniArrays(loader, interpreter)) {
@@ -2393,6 +2424,9 @@ static void W65C02WriteByte(W65C02Interpreter* interpreter, uint16_t addr, uint8
       W65C02NoteStore(interpreter, addr);
       return;
     }
+  }
+  if (interpreter->write_protect != 0 && addr >= interpreter->write_protect) {
+    return;
   }
   if (!BbcMachineSidewaysRom(interpreter->bbc, addr) &&
       !BbcMachineMosRom(interpreter->bbc, addr)) {
