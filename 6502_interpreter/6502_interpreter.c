@@ -1817,6 +1817,24 @@ static inline bool W65C02MemIsIo(const W65C02Interpreter* interpreter, const uin
   return off >= W65C02_IO_START && off <= W65C02_IO_END;
 }
 
+// A guest that polls the system VIA interrupt flag has to observe the bit
+// the hardware just raised. The interrupt is taken after that instruction,
+// so the operating system's handler does not clear the flag first.
+static int MaybeTakeIrq(W65C02Interpreter* interpreter) {
+  if (interpreter->flags.bits.i) {
+    return 0;
+  }
+  if (interpreter->bbc != NULL && BbcMachineIrqPending(interpreter->bbc)) {
+    W65C02TakeIrq(interpreter);
+    return 7;
+  }
+  if (interpreter->irq_pending != NULL && interpreter->irq_pending(interpreter->irq_ctx)) {
+    W65C02TakeIrq(interpreter);
+    return 7;
+  }
+  return 0;
+}
+
 static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurate) {
   int cycles;
   interpreter->extra_cycles = 0;
@@ -1835,23 +1853,11 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
     ChargeCycles(interpreter, cycle_accurate, 7);
     return 7;
   }
-  if (interpreter->bbc != NULL && !interpreter->flags.bits.i &&
-      BbcMachineIrqPending(interpreter->bbc)) {
-    W65C02TakeIrq(interpreter);
-    ChargeCycles(interpreter, cycle_accurate, 7);
-    return 7;
-  }
   if (interpreter->nmi_pending != NULL && interpreter->nmi_pending(interpreter->irq_ctx)) {
     if (interpreter->nmi_clear != NULL) {
       interpreter->nmi_clear(interpreter->irq_ctx);
     }
     W65C02TakeNmi(interpreter);
-    ChargeCycles(interpreter, cycle_accurate, 7);
-    return 7;
-  }
-  if (!interpreter->flags.bits.i && interpreter->irq_pending != NULL &&
-      interpreter->irq_pending(interpreter->irq_ctx)) {
-    W65C02TakeIrq(interpreter);
     ChargeCycles(interpreter, cycle_accurate, 7);
     return 7;
   }
@@ -1916,6 +1922,7 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
     }
     if (nop_cycles != 0) {
       interpreter->pc = (uint16_t)(interpreter->pc + nop_bytes);
+      nop_cycles += MaybeTakeIrq(interpreter);
       ChargeCycles(interpreter, cycle_accurate, nop_cycles);
       return nop_cycles;
     }
@@ -1927,6 +1934,7 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
       if (cycles < 1) {
         cycles = 1;
       }
+      cycles += MaybeTakeIrq(interpreter);
       ChargeCycles(interpreter, cycle_accurate, cycles);
       return cycles;
     }
@@ -1938,6 +1946,7 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
   if (cycles < 1) {
     cycles = 1;
   }
+  cycles += MaybeTakeIrq(interpreter);
   ChargeCycles(interpreter, cycle_accurate, cycles);
   return cycles;
 }

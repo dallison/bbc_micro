@@ -1904,12 +1904,24 @@ static void AdfsNoteClearedMap(BbcMachine* bbc) {
   bbc->ram[0x0fff] = 0xff;
 }
 
+static void AdfsRepairBrokenMap(BbcMachine* bbc);
+
 void BbcMachineBeginInstruction(BbcMachine* bbc, uint16_t pc) {
   if (bbc == NULL) {
     return;
   }
   if (pc == 0x8498) {
     AdfsNoteClearedMap(bbc);
+  }
+  // ADFS 1.30 enters its map check here on a soft break. OS 1.20 has already
+  // wiped main RAM when the system VIA interrupt enable was clear, which a
+  // game does, and the break is still soft if Ctrl is up. The check would
+  // then report "Bad sum". The same site is the fall-through after a hard
+  // break has written a fresh map, and a matching sum is left alone.
+  if (pc == 0x9b10 && bbc->ram != NULL && bbc->ram[0x9b10] == 0x20 &&
+      bbc->ram[0x9b11] == 0x31 && bbc->ram[0x9b12] == 0xa7 && bbc->ram[0x9af6] == 0xad &&
+      bbc->ram[0x9af9] == 0xf0) {
+    AdfsRepairBrokenMap(bbc);
   }
   if (!bbc->master) {
     return;
@@ -1942,6 +1954,65 @@ static void WriteAcccon(BbcMachine* bbc, uint8_t value) {
   }
   if (((old ^ value) & 0x40) != 0) {
     ApplyTst(bbc, (value & 0x40) != 0);
+  }
+}
+
+// Sum of an ADFS free-space map. The ROM starts from &FD and adds bytes
+// &FD down to 0. The total is stored at offset &FE.
+static uint8_t AdfsMapSum(const uint8_t* page) {
+  int a = 0xfd;
+  int carry = 0;
+  int y;
+  for (y = 0xfd; y > 0; y--) {
+    int sum = a + page[y] + carry;
+    carry = sum >> 8;
+    a = sum & 0xff;
+  }
+  return (uint8_t)((a + page[0] + carry) & 0xff);
+}
+
+// Called as ADFS is about to accept or reject this map. A game that clears
+// the system VIA makes OS 1.20 wipe main RAM on Break and still call this
+// a soft break, so the page no longer sums and ADFS stops with "Bad sum".
+// Ctrl-Break has just written this blank map itself. Copy it when the
+// stored sum does not match. A page that still sums is left alone.
+static void AdfsRepairBrokenMap(BbcMachine* bbc) {
+  static const uint8_t kLoop[] = {0xc0, 0x1d, 0x90, 0x02, 0xa9, 0x00, 0x91,
+                                  0xba, 0xc8, 0xd0, 0xf2};
+  int slot;
+  if (bbc->ram == NULL) {
+    return;
+  }
+  for (slot = 0; slot < 16; slot++) {
+    const uint8_t* rom = bbc->sideways[slot];
+    uint8_t* page;
+    int page_no;
+    int i;
+    int origin;
+    if (!bbc->sideways_loaded[slot] || rom == NULL) {
+      continue;
+    }
+    origin = -1;
+    for (i = 3; i + (int)sizeof(kLoop) <= 16384; i++) {
+      if (rom[i - 3] == 0xb9 && memcmp(rom + i, kLoop, sizeof(kLoop)) == 0) {
+        origin = rom[i - 2] | (rom[i - 1] << 8);
+        break;
+      }
+    }
+    if (origin < 0x8000 || origin + 0x1d > 0xc000) {
+      continue;
+    }
+    page_no = bbc->ram[0x0df0 + slot];
+    if (page_no < 0x0e || page_no > 0x7f) {
+      continue;
+    }
+    page = bbc->ram + (size_t)page_no * 256;
+    if (AdfsMapSum(page) == page[0xfe]) {
+      continue;
+    }
+    memset(page, 0, 256);
+    memcpy(page, rom + (origin - 0x8000), 0x1d);
+    page[0xfe] = AdfsMapSum(page);
   }
 }
 

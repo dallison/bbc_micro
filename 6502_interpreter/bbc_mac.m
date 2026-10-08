@@ -400,8 +400,6 @@ static void PressHostKey(NSEvent* event) {
 @property(nonatomic) NSTimer* timer;
 @property(nonatomic) AudioQueueRef audioQueue;
 @property(nonatomic) uint8_t* frameCopy;
-@property(nonatomic) int sizedWidth;
-@property(nonatomic) int sizedHeight;
 @end
 
 @implementation BbcController
@@ -588,32 +586,11 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   self.view.pixels = copy;
   self.view.pixWidth = width;
   self.view.pixHeight = height;
-  // Bitmap pixels are twice as tall as they are wide. MODE 7 is already
-  // stored as two lines per character row, so those frames are square.
-  // Lock the shape so a resize stays looking like a monitor, and only
-  // refit when the mode itself changes. The beam height jitters by a line
-  // or two.
-  if (width != self.sizedWidth || abs(height - self.sizedHeight) > 8) {
-    int scale = height > 400 ? 1 : 2;
-    self.sizedWidth = width;
-    self.sizedHeight = height;
-    [self.window setContentAspectRatio:NSMakeSize(width, height * scale)];
-    NSRect frame = self.window.frame;
-    NSRect content = [self.window contentRectForFrameRect:frame];
-    CGFloat viewH = content.size.width * (CGFloat)(height * scale) / (CGFloat)width;
-    CGFloat delta = content.size.height - viewH;
-    if (delta < 0) {
-      delta = -delta;
-    }
-    if (delta > 1.0) {
-      NSRect next =
-          [self.window frameRectForContentRect:NSMakeRect(0, 0, content.size.width, viewH)];
-      CGFloat top = frame.origin.y + frame.size.height;
-      next.origin.x = frame.origin.x;
-      next.origin.y = top - next.size.height;
-      [self.window setFrame:next display:NO];
-    }
-  }
+  // The window size and 5:4 shape come from -scale at launch. Bitmap
+  // pixels are twice as tall as they are wide, and that stretch is the
+  // view filling the window. Refitting to the raw frame would drop the
+  // stretch for a tall MODE 7 picture and change the size the user asked
+  // for.
   [self.view setNeedsDisplay:YES];
 }
 
