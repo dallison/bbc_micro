@@ -155,6 +155,7 @@ if(APPLE)
     "-framework Cocoa"
     "-framework Carbon"
     "-framework AudioToolbox"
+    "-framework IOKit"
   )
 elseif(WIN32)
   # GDI, waveOut, and the timer are in every Windows install.

@@ -216,6 +216,8 @@ cc_binary(
             "Carbon",
             "-framework",
             "AudioToolbox",
+            "-framework",
+            "IOKit",
         ],
     }),
     deps = select({

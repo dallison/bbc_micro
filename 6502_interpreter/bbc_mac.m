@@ -7,6 +7,13 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <Carbon/Carbon.h>
 #import <Cocoa/Cocoa.h>
+#import <IOKit/hid/IOHIDProperties.h>
+#import <IOKit/hidsystem/IOHIDEventSystemClient.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
+#import <IOKit/hidsystem/IOHIDParameter.h>
+#import <IOKit/hidsystem/IOLLEvent.h>
+#import <IOKit/hidsystem/ev_keymap.h>
+#pragma clang diagnostic ignored "-Wnullability-completeness"
 
 #include "6502_interpreter.h"
 #include "bbc_hardware.h"
@@ -262,6 +269,14 @@ static void PressHostKey(NSEvent* event) {
   NSString* chars = event.characters;
   int slot;
   if (event.keyCode == 111) {
+    W65C02InterpreterResetCpu(&g_cpu);
+    return;
+  }
+  // The Kinesis Freestyle2 F12 key sends Command-Option-D until Fn is on.
+  // keyCode 2 is the D key.
+  if (event.keyCode == 2 && (event.modifierFlags & NSEventModifierFlagCommand) != 0 &&
+      (event.modifierFlags & NSEventModifierFlagOption) != 0) {
+    ApplyMomentaryModifiers(event.modifierFlags);
     W65C02InterpreterResetCpu(&g_cpu);
     return;
   }
@@ -594,70 +609,318 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   [self.view setNeedsDisplay:YES];
 }
 
-// macOS uses the top row as brightness and volume unless this preference is
-// on. Remember the user's value and turn the row into F1-F12 while the
-// emulator is the front application, then put the old value back.
-static bool g_fn_known = false;
-static bool g_fn_existed = false;
-static bool g_fn_was_on = false;
-static bool g_fn_overridden = false;
+// The live switch for an Apple keyboard's top row. 1 means the keys are
+// F1-F12. 0 means brightness, volume, and the other pictures on the keys.
+static int g_fkey_saved = -1;
+static bool g_fkey_overridden = false;
 
-static void RememberFnState(void) {
-  CFPropertyListRef value;
-  if (g_fn_known) {
-    return;
+static io_connect_t HidParamConnect(void) {
+  io_service_t service;
+  io_connect_t connect = MACH_PORT_NULL;
+  service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass));
+  if (service == IO_OBJECT_NULL) {
+    return MACH_PORT_NULL;
   }
-  value = CFPreferencesCopyAppValue(CFSTR("com.apple.keyboard.fnState"),
-                                    kCFPreferencesAnyApplication);
-  g_fn_known = true;
-  if (value == NULL) {
-    return;
+  if (IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType, &connect) != KERN_SUCCESS) {
+    connect = MACH_PORT_NULL;
   }
-  g_fn_existed = true;
-  if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
-    g_fn_was_on = CFBooleanGetValue((CFBooleanRef)value);
-  } else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
-    int number = 0;
-    CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &number);
-    g_fn_was_on = number != 0;
-  }
-  CFRelease(value);
+  IOObjectRelease(service);
+  return connect;
 }
 
-static void StoreFnState(CFPropertyListRef value) {
-  NSString* tool =
-      @"/System/Library/PrivateFrameworks/SystemAdministration.framework/Resources/activateSettings";
-  CFPreferencesSetValue(CFSTR("com.apple.keyboard.fnState"), value, kCFPreferencesAnyApplication,
-                        kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-  CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser,
-                           kCFPreferencesAnyHost);
-  if (![[NSFileManager defaultManager] isExecutableFileAtPath:tool]) {
+static int ReadFKeyMode(void) {
+  io_connect_t connect = HidParamConnect();
+  CFTypeRef value = NULL;
+  int mode = -1;
+  if (connect == MACH_PORT_NULL) {
+    return -1;
+  }
+  if (IOHIDCopyCFTypeParameter(connect, CFSTR(kIOHIDFKeyModeKey), &value) == KERN_SUCCESS &&
+      value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+    CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &mode);
+  }
+  if (value != NULL) {
+    CFRelease(value);
+  }
+  IOServiceClose(connect);
+  return mode;
+}
+
+static void WriteFKeyMode(int mode) {
+  io_connect_t connect = HidParamConnect();
+  CFNumberRef value;
+  if (connect == MACH_PORT_NULL || mode < 0) {
     return;
   }
-  NSTask* task = [[NSTask alloc] init];
-  NSError* error = nil;
-  task.executableURL = [NSURL fileURLWithPath:tool];
-  task.arguments = @[@"-u"];
-  task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
-  task.standardError = [NSFileHandle fileHandleWithNullDevice];
-  if ([task launchAndReturnError:&error]) {
-    [task waitUntilExit];
+  value = CFNumberCreate(NULL, kCFNumberIntType, &mode);
+  if (value != NULL) {
+    IOHIDSetCFTypeParameter(connect, CFSTR(kIOHIDFKeyModeKey), value);
+    CFRelease(value);
   }
+  IOServiceClose(connect);
+}
+
+// Consumer-page volume up is the key in the F12 position when that row is
+// the pictures (brightness, volume) rather than F1-F12. Turn it into a real
+// F12 while this window is in front, then put the previous mapping back.
+static const uint64_t kVolumeUpUsage = ((uint64_t)0x0c << 32) | 0x00e9;
+static const uint64_t kF12Usage = ((uint64_t)0x07 << 32) | 0x0045;
+static CFArrayRef g_key_map_saved = NULL;
+static bool g_key_map_overridden = false;
+
+static uint64_t MappingSource(CFDictionaryRef entry) {
+  CFTypeRef value = CFDictionaryGetValue(entry, CFSTR(kIOHIDKeyboardModifierMappingSrcKey));
+  uint64_t number = 0;
+  if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+    CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, &number);
+  }
+  return number;
+}
+
+static void UseVolumeUpAsBreak(bool enable) {
+  IOHIDEventSystemClientRef client = IOHIDEventSystemClientCreateSimpleClient(kCFAllocatorDefault);
+  CFTypeRef current;
+  CFArrayRef existing;
+  CFMutableArrayRef next;
+  CFIndex i;
+  CFIndex count;
+  CFNumberRef source;
+  CFNumberRef dest;
+  CFDictionaryRef entry;
+  const void* keys[2];
+  const void* values[2];
+  if (client == NULL) {
+    return;
+  }
+  if (enable && !g_key_map_overridden) {
+    current = IOHIDEventSystemClientCopyProperty(client, CFSTR(kIOHIDUserKeyUsageMapKey));
+    existing = (current != NULL && CFGetTypeID(current) == CFArrayGetTypeID()) ? (CFArrayRef)current : NULL;
+    count = existing != NULL ? CFArrayGetCount(existing) : 0;
+    for (i = 0; i < count; i++) {
+      CFTypeRef item = CFArrayGetValueAtIndex(existing, i);
+      if (CFGetTypeID(item) == CFDictionaryGetTypeID() && MappingSource((CFDictionaryRef)item) == kVolumeUpUsage) {
+        if (current != NULL) {
+          CFRelease(current);
+        }
+        CFRelease(client);
+        return;
+      }
+    }
+    g_key_map_saved = existing != NULL ? CFRetain(existing)
+                                      : CFArrayCreate(NULL, NULL, 0, &kCFTypeArrayCallBacks);
+    next = CFArrayCreateMutable(NULL, count + 1, &kCFTypeArrayCallBacks);
+    for (i = 0; i < count; i++) {
+      CFArrayAppendValue(next, CFArrayGetValueAtIndex(existing, i));
+    }
+    source = CFNumberCreate(NULL, kCFNumberSInt64Type, &kVolumeUpUsage);
+    dest = CFNumberCreate(NULL, kCFNumberSInt64Type, &kF12Usage);
+    keys[0] = CFSTR(kIOHIDKeyboardModifierMappingSrcKey);
+    keys[1] = CFSTR(kIOHIDKeyboardModifierMappingDstKey);
+    values[0] = source;
+    values[1] = dest;
+    entry = CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks,
+                              &kCFTypeDictionaryValueCallBacks);
+    CFArrayAppendValue(next, entry);
+    if (IOHIDEventSystemClientSetProperty(client, CFSTR(kIOHIDUserKeyUsageMapKey), next)) {
+      g_key_map_overridden = true;
+    } else if (g_key_map_saved != NULL) {
+      CFRelease(g_key_map_saved);
+      g_key_map_saved = NULL;
+    }
+    CFRelease(entry);
+    CFRelease(source);
+    CFRelease(dest);
+    CFRelease(next);
+    if (current != NULL) {
+      CFRelease(current);
+    }
+  } else if (!enable && g_key_map_overridden) {
+    IOHIDEventSystemClientSetProperty(client, CFSTR(kIOHIDUserKeyUsageMapKey), g_key_map_saved);
+    CFRelease(g_key_map_saved);
+    g_key_map_saved = NULL;
+    g_key_map_overridden = false;
+  }
+  CFRelease(client);
+}
+
+// The Kinesis F12 key sends Command-Option-D until Fn is on. macOS uses
+// that chord to hide the Dock and never delivers it to the window. Hot key
+// 52 is that shortcut: D, key code 2, command and option. Turn it off while
+// this window is in front, then put it back.
+extern CGError CGSSetSymbolicHotKeyEnabled(int hotKey, bool enabled);
+extern bool CGSIsSymbolicHotKeyEnabled(int hotKey);
+extern CGError CGSGetSymbolicHotKeyValue(int hotKey, uint32_t* character, uint32_t* keycode,
+                                        uint32_t* modifiers);
+
+static int g_dock_hotkey = -1;
+static bool g_dock_hotkey_was_on = false;
+
+static int DockHidingHotKey(void) {
+  int i;
+  for (i = 0; i < 256; i++) {
+    uint32_t character = 0;
+    uint32_t keycode = 0;
+    uint32_t modifiers = 0;
+    if (CGSGetSymbolicHotKeyValue(i, &character, &keycode, &modifiers) != 0) {
+      continue;
+    }
+    if (keycode == 2 && (modifiers & 0x1E0000u) == 0x180000u) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static bool DockShortcutShouldBeOn(int hotkey) {
+  CFDictionaryRef all;
+  CFStringRef name;
+  CFDictionaryRef entry;
+  CFTypeRef enabled;
+  bool should = true;
+  all = CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"), CFSTR("com.apple.symbolichotkeys"));
+  if (all == NULL || CFGetTypeID(all) != CFDictionaryGetTypeID()) {
+    if (all != NULL) {
+      CFRelease(all);
+    }
+    return true;
+  }
+  name = CFStringCreateWithFormat(NULL, NULL, CFSTR("%d"), hotkey);
+  entry = CFDictionaryGetValue(all, name);
+  CFRelease(name);
+  if (entry != NULL && CFGetTypeID(entry) == CFDictionaryGetTypeID()) {
+    enabled = CFDictionaryGetValue(entry, CFSTR("enabled"));
+    if (enabled != NULL && CFGetTypeID(enabled) == CFBooleanGetTypeID() && !CFBooleanGetValue(enabled)) {
+      should = false;
+    }
+  }
+  CFRelease(all);
+  return should;
+}
+
+static void UseDockKeyAsBreak(bool enable) {
+  int hotkey;
+  if (enable) {
+    if (g_dock_hotkey >= 0) {
+      return;
+    }
+    hotkey = DockHidingHotKey();
+    if (hotkey < 0 || !DockShortcutShouldBeOn(hotkey)) {
+      return;
+    }
+    g_dock_hotkey = hotkey;
+    g_dock_hotkey_was_on = true;
+    if (CGSIsSymbolicHotKeyEnabled(hotkey)) {
+      CGSSetSymbolicHotKeyEnabled(hotkey, false);
+    }
+    return;
+  }
+  if (g_dock_hotkey < 0) {
+    return;
+  }
+  if (g_dock_hotkey_was_on) {
+    CGSSetSymbolicHotKeyEnabled(g_dock_hotkey, true);
+  }
+  g_dock_hotkey = -1;
+  g_dock_hotkey_was_on = false;
 }
 
 static void UseHostFunctionKeys(bool enable) {
-  RememberFnState();
-  if (g_fn_was_on) {
-    return;
+  int mode;
+  UseVolumeUpAsBreak(enable);
+  if (enable && !g_fkey_overridden) {
+    mode = ReadFKeyMode();
+    if (mode != 0) {
+      return;
+    }
+    g_fkey_saved = mode;
+    WriteFKeyMode(1);
+    g_fkey_overridden = true;
+  } else if (!enable && g_fkey_overridden) {
+    WriteFKeyMode(g_fkey_saved);
+    g_fkey_overridden = false;
   }
-  if (enable && !g_fn_overridden) {
-    StoreFnState(kCFBooleanTrue);
-    g_fn_overridden = true;
-  } else if (!enable && g_fn_overridden) {
-    StoreFnState(g_fn_existed ? (CFPropertyListRef)(g_fn_was_on ? kCFBooleanTrue : kCFBooleanFalse)
-                             : NULL);
-    g_fn_overridden = false;
+}
+
+// A keyboard that ignores the switch still sends the picture on the key.
+// On an Apple row the last key is volume up, which is where F12 sits.
+static bool SpecialIsBreak(int type) { return type == NX_KEYTYPE_SOUND_UP; }
+
+static bool SpecialBbcKey(int type, int* column, int* row) {
+  switch (type) {
+    case NX_KEYTYPE_BRIGHTNESS_DOWN:
+      *column = 1;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_BRIGHTNESS_UP:
+      *column = 2;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_LAUNCH_PANEL:
+      *column = 3;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_ILLUMINATION_DOWN:
+      *column = 4;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_ILLUMINATION_UP:
+      *column = 5;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_PREVIOUS:
+    case NX_KEYTYPE_REWIND:
+      *column = 6;
+      *row = 1;
+      return true;
+    case NX_KEYTYPE_PLAY:
+      *column = 6;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_NEXT:
+    case NX_KEYTYPE_FAST:
+      *column = 7;
+      *row = 7;
+      return true;
+    case NX_KEYTYPE_MUTE:
+      *column = 0;
+      *row = 2;
+      return true;
+    default:
+      return false;
   }
+}
+
+static NSEvent* _Nullable SpecialKeyEvent(NSEvent* event) {
+  int type;
+  int flags;
+  int state;
+  int column = 0;
+  int row = 0;
+  if (!g_ready || event.type != NSEventTypeSystemDefined ||
+      event.subtype != NX_SUBTYPE_AUX_CONTROL_BUTTONS) {
+    return event;
+  }
+  type = (int)((event.data1 & 0xFFFF0000) >> 16);
+  flags = (int)(event.data1 & 0xFFFF);
+  if ((flags & 1) != 0 && (SpecialIsBreak(type) || SpecialBbcKey(type, &column, &row))) {
+    return nil;
+  }
+  state = (flags & 0xFF00) >> 8;
+  if (state != 0x0A && state != 0x0B) {
+    return event;
+  }
+  ApplyMomentaryModifiers(event.modifierFlags);
+  if (SpecialIsBreak(type)) {
+    if (state == 0x0A) {
+      W65C02InterpreterResetCpu(&g_cpu);
+    }
+    return nil;
+  }
+  if (!SpecialBbcKey(type, &column, &row) || g_cpu.bbc == NULL) {
+    return event;
+  }
+  BbcMachineSetKey(g_cpu.bbc, column, row, state == 0x0A);
+  return nil;
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
@@ -696,22 +959,45 @@ static void UseHostFunctionKeys(bool enable) {
   [NSApp activateIgnoringOtherApps:YES];
   RememberCapsFlag();
   UseHostFunctionKeys(true);
+  UseDockKeyAsBreak(true);
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                       handler:^NSEvent* _Nullable(NSEvent* event) {
+                                         bool dock_key =
+                                             event.keyCode == 2 &&
+                                             (event.modifierFlags & NSEventModifierFlagCommand) != 0 &&
+                                             (event.modifierFlags & NSEventModifierFlagOption) != 0;
+                                         if (!g_ready || (!dock_key && event.keyCode != 111)) {
+                                           return event;
+                                         }
+                                         if (!event.isARepeat) {
+                                           ApplyMomentaryModifiers(event.modifierFlags);
+                                           W65C02InterpreterResetCpu(&g_cpu);
+                                         }
+                                         return nil;
+                                       }];
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskSystemDefined
+                                       handler:^NSEvent* _Nullable(NSEvent* event) {
+                                         return SpecialKeyEvent(event);
+                                       }];
 }
 
 - (void)applicationDidBecomeActive:(NSNotification*)notification {
   (void)notification;
   UseHostFunctionKeys(true);
+  UseDockKeyAsBreak(true);
 }
 
 - (void)applicationDidResignActive:(NSNotification*)notification {
   (void)notification;
   ReleaseStuckKeys();
   UseHostFunctionKeys(false);
+  UseDockKeyAsBreak(false);
 }
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
   (void)notification;
   UseHostFunctionKeys(false);
+  UseDockKeyAsBreak(false);
   [self.timer invalidate];
   if (self.audioQueue != NULL) {
     AudioQueueStop(self.audioQueue, true);

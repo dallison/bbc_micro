@@ -44,7 +44,8 @@ static void Usage(void) {
           "       and the davecc $EF syscall. F1 to F9 are the BBC keys f1 to f9,\n"
           "       and F10 is f0. F12 resets the machine.\n"
 #ifdef __APPLE__
-          "       While this window is in front, that row is the BBC keys.\n"
+          "       While this window is in front, F12 resets the machine. So does\n"
+          "       the key that hides the Dock, which is what F12 sends until Fn is on.\n"
 #endif
           "       DFS and ADFS ROMs are both fitted. The drive follows the one\n"
           "       the OS calls. -fs dfs or -fs adfs loads only that filing\n"
