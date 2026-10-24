@@ -396,9 +396,7 @@ static void BlitFrame(void) {
   if (g_cpu.bbc == NULL) {
     return;
   }
-  if (g_cpu.turbo || BbcMachineCompletedFrames(g_cpu.bbc) == 0) {
-    BbcMachineRender(g_cpu.bbc);
-  }
+  BbcMachinePresentFrame(g_cpu.bbc, g_cpu.turbo);
   width = BbcFrameWidth(g_cpu.bbc);
   height = BbcFrameHeight(g_cpu.bbc);
   if (width <= 0 || height <= 0 || width > BBC_FB_WIDTH || height > BBC_FB_HEIGHT) {
@@ -508,7 +506,7 @@ static void KeepAspect(WPARAM edge, RECT* r) {
 
 static void ReadHostInput(void) {
   POINT p;
-  if (g_cpu.bbc == NULL) {
+  if (g_cpu.bbc == NULL || BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
     return;
   }
   if (GetForegroundWindow() == g_win) {

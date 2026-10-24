@@ -4,7 +4,7 @@
 //
 //  A BBC Micro has a 6502, not a 65C02. The interpreter stays a 65C02
 //  unless the BBC machine asks for the NMOS behaviour. -65c02 leaves the
-//  CMOS opcodes, including the davecc syscall, in place.
+//  CMOS opcodes in place.
 //
 
 #ifndef W65C02_nmos_h

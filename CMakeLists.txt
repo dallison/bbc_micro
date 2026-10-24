@@ -84,11 +84,11 @@ target_link_libraries(loader PUBLIC elf utils)
 
 add_library(6502_lib STATIC
   6502_interpreter/6502_debugger.c
-  6502_interpreter/6502_devices.c
   6502_interpreter/6502_disassembler.c
   6502_interpreter/6502_interpreter.c
   6502_interpreter/6502_nmos.c
   6502_interpreter/bbc_hardware.c
+  6502_interpreter/bbc_beam_ula.c
   6502_interpreter/arm3.c
   6502_interpreter/arm_client.c
   6502_interpreter/arm_tube.c
@@ -98,11 +98,6 @@ add_library(6502_lib STATIC
 )
 target_include_directories(6502_lib PUBLIC ${BBC_INCLUDES})
 target_link_libraries(6502_lib PUBLIC
-  elf
-  chrono_host
-  filesystem_host
-  random_host
-  loader
   utils
   Threads::Threads
   ${BBC_SOCKET_LIBS}
@@ -120,12 +115,20 @@ add_executable(cassette 6502_interpreter/cassette.c)
 target_include_directories(cassette PRIVATE ${BBC_INCLUDES})
 target_link_libraries(cassette PRIVATE ${BBC_SOCKET_LIBS})
 
+if(APPLE)
+  add_executable(joystick 6502_interpreter/joystick_host_mac.m)
+  target_include_directories(joystick PRIVATE ${BBC_INCLUDES})
+  target_compile_options(joystick PRIVATE -fobjc-arc)
+  target_link_libraries(joystick PRIVATE ${BBC_SOCKET_LIBS} "-framework AppKit")
+endif()
+
 add_executable(fileserver 6502_interpreter/fileserver.c)
 target_include_directories(fileserver PRIVATE ${BBC_INCLUDES})
 target_link_libraries(fileserver PRIVATE ${BBC_SOCKET_LIBS})
 
 add_executable(bbc_hardware_test
   6502_interpreter/bbc_hardware.c
+  6502_interpreter/bbc_beam_ula.c
   6502_interpreter/bbc_hardware_test.c
   6502_interpreter/tube.c
 )
@@ -134,6 +137,9 @@ target_link_libraries(bbc_hardware_test PRIVATE Threads::Threads ${BBC_SOCKET_LI
 
 add_executable(6502_nmos_test 6502_interpreter/6502_nmos_test.c)
 target_link_libraries(6502_nmos_test PRIVATE 6502_lib)
+
+add_executable(revs_capture 6502_interpreter/revs_capture.c)
+target_link_libraries(revs_capture PRIVATE 6502_lib)
 
 add_executable(tube_test 6502_interpreter/tube_test.c)
 target_link_libraries(tube_test PRIVATE 6502_lib)

@@ -3,6 +3,7 @@
 #include "bbc_hardware.h"
 #include "cassette.h"
 #include "cumana.h"
+#include "joystick.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +28,7 @@ static void Usage(void) {
           "           [-hd file]\n"
           "           [-fdc 8271|1770] [-fs dfs|adfs] [-65c02]\n"
           "           [-tube [6502|65c02|arm] [file]]\n"
-          "           [-tape file] [-tape-port n]\n"
+          "           [-tape file] [-tape-port n] [-joystick-port n]\n"
           "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
           "           [-keyboard uk|us]\n"
           "           [-econet station] [-econet-port n]\n"
@@ -40,8 +41,8 @@ static void Usage(void) {
           "       sideways socket 0-15, virtual image 0. <socket>.<virtual>-<name>.rom\n"
           "       is image 0-7 in that socket, chosen by bits 4-6 of the ROM\n"
           "       select register. -os and -rom replace one of those files.\n"
-          "       The Model B CPU is the NMOS 6502. -65c02 keeps the CMOS opcodes\n"
-          "       and the davecc $EF syscall. F1 to F9 are the BBC keys f1 to f9,\n"
+          "       The Model B CPU is the NMOS 6502. -65c02 keeps the CMOS opcodes.\n"
+          "       F1 to F9 are the BBC keys f1 to f9,\n"
           "       and F10 is f0. F12 resets the machine.\n"
 #ifdef __APPLE__
           "       While this window is in front, F12 resets the machine. So does\n"
@@ -61,6 +62,11 @@ static void Usage(void) {
           "       cassette inserts a tape and records guest saves back into\n"
           "       the file. It connects to 127.0.0.1:8178. -tape-port 0 closes\n"
           "       that socket. -tape still loads a tape before startup.\n"
+          "       joystick connects to 127.0.0.1:8180 (default) and drives the\n"
+          "       analogue port with the mouse. -joystick-port n is the TCP port\n"
+          "       number; 0 closes the socket. Ports below 1024 need root.\n"
+          "       While joystick is connected, the bbc window does not read\n"
+          "       the mouse as a stick.\n"
           "       The CPU runs at 2 MHz, in step with the timers and the video.\n"
           "       -mhz n selects another fixed rate, from 1 to 16. -2mhz is\n"
           "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
@@ -138,6 +144,8 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   bool disc_socket = true;
   int tape_port = CASSETTE_PORT;
   bool tape_socket = true;
+  int joystick_port = JOYSTICK_PORT;
+  bool joystick_socket = true;
   int fdc_kind = 0;
   int filing = BBC_FS_ANY;
   bool use_65c02 = false;
@@ -273,6 +281,25 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         tape_socket = false;
       } else {
         tape_port = (int)value;
+      }
+    } else if (strcmp(argv[i], "-joystick-port") == 0) {
+      char* end = NULL;
+      long value;
+      if (i + 1 >= argc) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      value = strtol(argv[++i], &end, 10);
+      if (end == argv[i] || *end != '\0' || value < 0 || value > 65535) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      if (value == 0) {
+        joystick_socket = false;
+      } else {
+        joystick_port = (int)value;
       }
     } else if (strcmp(argv[i], "-fs") == 0 || strcmp(argv[i], "-bbc-fs") == 0) {
       if (i + 1 >= argc) {
@@ -514,7 +541,7 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     *status = 1;
     return false;
   }
-  W65C02InterpreterInit(&g_cpu, false, true, false, NULL);
+  W65C02InterpreterInit(&g_cpu, false, true, false);
   cpu_inited = true;
   if (!run_ahead && !W65C02InterpreterSetClockMhz(&g_cpu, clock_mhz)) {
     Usage();
@@ -561,6 +588,21 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
       fprintf(stderr, "Tape socket is not available\n");
     } else {
       fprintf(stderr, "Tape socket: 127.0.0.1:%d\n", bound);
+    }
+  }
+  if (joystick_socket) {
+    int bound = BbcMachineListenJoystick(g_cpu.bbc, joystick_port);
+    if (bound < 0) {
+      if (joystick_port > 0 && joystick_port < 1024) {
+        fprintf(stderr,
+                "Joystick needs a port of 1024 or higher, or omit -joystick-port "
+                "for %d.\n",
+                JOYSTICK_PORT);
+      } else {
+        fprintf(stderr, "Joystick socket is not available\n");
+      }
+    } else {
+      fprintf(stderr, "Joystick socket: 127.0.0.1:%d\n", bound);
     }
   }
   if (fdc_kind != 0) {

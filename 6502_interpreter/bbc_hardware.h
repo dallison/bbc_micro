@@ -23,6 +23,7 @@
 #define bbc_hardware_h
 
 #include "6502_devices.h"
+#include "bbc_beam_ula.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -136,6 +137,9 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port);
 // the bound port, or -1 when the socket cannot be opened. One tape is
 // inserted at a time. Closing the connection ejects it.
 int BbcMachineListenTapes(BbcMachine* bbc, int port);
+// Joystick socket on 127.0.0.1 (default JOYSTICK_PORT in joystick.h).
+int BbcMachineListenJoystick(BbcMachine* bbc, int port);
+bool BbcMachineJoystickRemoteActive(const BbcMachine* bbc);
 // Fit the Econet interface as station 1-254 and join the virtual wire on
 // this UDP port. Every emulator using the same port shares one network.
 // The default port is BBC_ECONET_PORT. Returns that port, or -1 when the
@@ -208,8 +212,19 @@ void BbcMachineSetFast(BbcMachine* bbc, bool fast);
 // partway down the frame stays on the scanlines after the change. Vsync
 // comes from the CRTC and sets the system VIA CA1 flag.
 void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles);
+// Called when the user VIA timer 1 expires mid-frame so split-screen IRQ
+// handlers (Revs, Elite) can reprogram the ULA before the beam reaches them.
+void BbcMachineSetIrqSync(BbcMachine* bbc, void (*fn)(void* ctx), void* ctx);
+bool BbcMachineUserViaT1Pending(const BbcMachine* bbc);
+bool BbcMachineSysViaT1Pending(const BbcMachine* bbc);
+// When true, defer VIA timer-1 IRQs to the cycle-accurate video path.
+bool BbcMachineDeferUserViaT1Irq(const BbcMachine* bbc);
+void BbcMachineSetVideoIrqDispatch(BbcMachine* bbc, bool active);
+bool BbcMachineNeedsVideoIrqSync(const BbcMachine* bbc);
 // Frames the beam has completed. Zero until the CRTC has reached vsync.
 int BbcMachineCompletedFrames(const BbcMachine* bbc);
+// True when the ULA is drawing a bitmap mode rather than MODE 7 teletext.
+bool BbcMachineBitmapDisplay(const BbcMachine* bbc);
 bool BbcMachineIrqPending(const BbcMachine* bbc);
 
 // CRTC memory-address to guest RAM, including the Model B hardware scroll.
@@ -220,6 +235,8 @@ void BbcMachineSetKey(BbcMachine* bbc, int column, int row, bool down);
 // Channel 0-3, value 0-65535. Fire buttons are active when down.
 void BbcMachineSetAnalogue(BbcMachine* bbc, int channel, int value);
 void BbcMachineSetFire(BbcMachine* bbc, int button, bool down);
+// User-port digital stick: JOYSTICK_DIGITAL_* bits, active low on PB0–PB3.
+void BbcMachineSetDigitalJoystick(BbcMachine* bbc, uint8_t mask);
 // MODE 7 punctuation. UK is the BBC's SAA5050 set, where { and } are the
 // fraction signs. US draws the braces, brackets, and the other ASCII marks.
 #define BBC_KEYBOARD_UK 0
@@ -243,6 +260,10 @@ void BbcMachineSetVolume(BbcMachine* bbc, int volume);
 int BbcMachineReadAudio(BbcMachine* bbc, int16_t* dst, int max_samples);
 
 void BbcMachineRender(BbcMachine* bbc);
+// Prepare bbc->fb for the host window. Real-time bitmap modes keep the last
+// completed beam field so mid-frame CRTC and beam-ULA profiles stay correct.
+// Turbo repaints from RAM at most once per emulated field.
+void BbcMachinePresentFrame(BbcMachine* bbc, bool turbo);
 int BbcFrameWidth(const BbcMachine* bbc);
 int BbcFrameHeight(const BbcMachine* bbc);
 // RGB8, row-major, BBC_FB_WIDTH stride. Valid after a completed beam

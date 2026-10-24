@@ -481,7 +481,8 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
   if ([NSApp isActive]) {
     ApplyMomentaryModifiers([NSEvent modifierFlags]);
   }
-  if (g_cpu.bbc != NULL && self.view != nil && self.window != nil) {
+  if (g_cpu.bbc != NULL && self.view != nil && self.window != nil &&
+      !BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
     NSPoint loc = [self.view convertPoint:[self.window mouseLocationOutsideOfEventStream]
                                   fromView:nil];
     NSRect bounds = self.view.bounds;
@@ -575,12 +576,7 @@ static void AudioCallback(void* user, AudioQueueRef queue, AudioQueueBufferRef b
       shown = stamp;
     }
   }
-  // Real time paints the beam as the CPU runs. Running ahead skips the beam,
-  // so snapshot the screen. Otherwise a stretch that never waits, such as the
-  // clock face being drawn, keeps showing the previous picture.
-  if (g_cpu.turbo || BbcMachineCompletedFrames(g_cpu.bbc) == 0) {
-    BbcMachineRender(g_cpu.bbc);
-  }
+  BbcMachinePresentFrame(g_cpu.bbc, g_cpu.turbo);
   int width = BbcFrameWidth(g_cpu.bbc);
   int height = BbcFrameHeight(g_cpu.bbc);
   if (width <= 0 || height <= 0) {

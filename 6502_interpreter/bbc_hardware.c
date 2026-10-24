@@ -4,6 +4,9 @@
 //
 
 #include "bbc_hardware.h"
+#include "bbc_beam_ula.h"
+#include "bbc_beam_ula_hw.h"
+#include "joystick.h"
 #include "bbc_font.h"
 #include "bbc_platform.h"
 #include "cassette.h"
@@ -121,6 +124,8 @@ struct BbcMachine {
   char* printer_path;
   int printer_ack;
   bool fire[2];
+  uint8_t digital_joy;
+  bool joystick_remote;
   uint16_t analogue[4];
   int adc_delay;
   bool adc_busy;
@@ -256,6 +261,22 @@ struct BbcMachine {
   int beam_y;
   int beam_width;
   int beam_frames;
+  // Per-row MA and ULA captured during the last completed beam field. Revs and
+  // Elite reload R12/R13 or change mode mid-frame; a flat snapshot from R12/R13
+  // scrambles the top of the picture.
+  uint16_t snap_ready_ma[128];
+  uint8_t snap_ready_ula[128];
+  int snap_ready_count;
+  int snap_ready_frame;
+  uint16_t snap_row_ma[128];
+  uint8_t snap_row_ula[128];
+  int snap_row_count;
+  int present_frame;
+  void (*irq_sync)(void* ctx);
+  void* irq_sync_ctx;
+  bool video_irq_dispatch;
+  int beam_ula_band;
+  bool beam_ula_lock_guest;
   int disp_x;
   int tt_fg;
   int tt_bg;
@@ -328,6 +349,13 @@ struct BbcMachine {
   struct TapePending* tape_pending;
   int tape_attention;
   int tape_watch_acc;
+  int joystick_listen_fd;
+  int joystick_listen_port;
+  int joystick_client_fd;
+  bool joystick_listen_started;
+  bool joystick_listen_stop;
+  pthread_t joystick_listen_thread;
+  pthread_mutex_t joystick_mu;
   // Combined disc and Econet NMI. The 6502 latches one edge.
   bool nmi_line;
   bool nmi_edge;
@@ -434,29 +462,27 @@ static void ViaShiftBit(BbcVia* via) {
   }
 }
 
-static void ViaAdvance(BbcVia* via, int cycles) {
+// One 6522 bus tick (every two CPU cycles). Returns true when timer 1 expires.
+static bool ViaAdvanceOne(BbcVia* via) {
   int mode;
-  int i;
+  bool t1 = false;
   if (via->t1_running) {
-    if (cycles >= via->t1_counter) {
+    if (via->t1_counter <= 1) {
       via->ifr |= 0x40;
+      t1 = true;
       if (via->acr & 0x40) {
         int period = ((via->t1l_h << 8) | via->t1l_l) + 1;
-        int extra = cycles - via->t1_counter;
-        via->t1_counter = period - (extra % period);
-        if (via->t1_counter == 0) {
-          via->t1_counter = period;
-        }
+        via->t1_counter = period;
       } else {
         via->t1_running = false;
         via->t1_counter = 0;
       }
     } else {
-      via->t1_counter -= cycles;
+      via->t1_counter--;
     }
   }
   if (via->t2_running) {
-    if (cycles >= via->t2_counter) {
+    if (via->t2_counter <= 1) {
       via->ifr |= 0x20;
       mode = (via->acr >> 2) & 7;
       if (via->sr_active && (mode == 1 || mode == 4 || mode == 5)) {
@@ -470,14 +496,68 @@ static void ViaAdvance(BbcVia* via, int cycles) {
         via->t2_counter = 0;
       }
     } else {
-      via->t2_counter -= cycles;
+      via->t2_counter--;
     }
   }
   mode = (via->acr >> 2) & 7;
   if (via->sr_active && (mode == 2 || mode == 6)) {
-    for (i = 0; i < cycles; i++) {
-      ViaShiftBit(via);
+    ViaShiftBit(via);
+  }
+  return t1;
+}
+
+static void ViaAdvance(BbcVia* via, int cycles) {
+  int i;
+  for (i = 0; i < cycles; i++) {
+    (void)ViaAdvanceOne(via);
+  }
+}
+
+static void UserPrinterAck(BbcMachine* bbc);
+static void VideoAdvance(BbcMachine* bbc, int cpu_cycles);
+static void WriteControl(BbcMachine* bbc, uint8_t value);
+static void WritePalette(BbcMachine* bbc, uint8_t value);
+static bool Teletext(const BbcMachine* bbc);
+
+static bool VideoNeedsIrqSync(const BbcMachine* bbc) {
+  (void)bbc;
+  // Mid-frame ULA profiles are applied on the beam from beam_y. Inline timer
+  // IRQ sync still runs ahead of or behind the raster without a cycle-exact
+  // 6502 and makes split bands drift and tear.
+  return false;
+}
+
+static void BbcMaybeSyncVideoIrq(BbcMachine* bbc) {
+  if (bbc->video_irq_dispatch || bbc->irq_sync == NULL || !VideoNeedsIrqSync(bbc)) {
+    return;
+  }
+  if (!BbcMachineUserViaT1Pending(bbc) && !BbcMachineSysViaT1Pending(bbc)) {
+    return;
+  }
+  bbc->irq_sync(bbc->irq_sync_ctx);
+}
+
+static void AdvanceCpuCycle(BbcMachine* bbc) {
+  bool t1 = false;
+  bbc->via_phase++;
+  if (bbc->via_phase >= 2) {
+    bbc->via_phase = 0;
+    if (ViaAdvanceOne(&bbc->sys)) {
+      t1 = true;
     }
+    if (ViaAdvanceOne(&bbc->user)) {
+      t1 = true;
+    }
+    if (bbc->printer_ack > 0) {
+      bbc->printer_ack--;
+      if (bbc->printer_ack == 0) {
+        UserPrinterAck(bbc);
+      }
+    }
+  }
+  VideoAdvance(bbc, 1);
+  if (t1) {
+    BbcMaybeSyncVideoIrq(bbc);
   }
 }
 
@@ -706,6 +786,20 @@ static uint8_t ViaRead(BbcMachine* bbc, BbcVia* via, bool system, int reg) {
         if ((via->ddrb & 0x20) == 0 && bbc->fire[1]) {
           pins = (uint8_t)(pins & (uint8_t)~0x20);
         }
+      } else if ((via->ddrb & 0x0f) == 0) {
+        // Digital sticks use the user VIA low nibble, active low.
+        if (bbc->digital_joy & JOYSTICK_DIGITAL_RIGHT) {
+          pins = (uint8_t)(pins & (uint8_t)~0x01);
+        }
+        if (bbc->digital_joy & JOYSTICK_DIGITAL_LEFT) {
+          pins = (uint8_t)(pins & (uint8_t)~0x02);
+        }
+        if (bbc->digital_joy & JOYSTICK_DIGITAL_DOWN) {
+          pins = (uint8_t)(pins & (uint8_t)~0x04);
+        }
+        if (bbc->digital_joy & JOYSTICK_DIGITAL_UP) {
+          pins = (uint8_t)(pins & (uint8_t)~0x08);
+        }
       }
       return pins;
     }
@@ -930,10 +1024,16 @@ static bool ViaIrq(const BbcVia* via) {
 }
 
 static void WriteControl(BbcMachine* bbc, uint8_t value) {
+  if (bbc->beam_ula_lock_guest) {
+    return;
+  }
   bbc->ula_control = value;
 }
 
 static void WritePalette(BbcMachine* bbc, uint8_t value) {
+  if (bbc->beam_ula_lock_guest) {
+    return;
+  }
   bbc->ula_pal[(value >> 4) & 0x0f] = (uint8_t)(value & 0x0f);
 }
 
@@ -1381,28 +1481,45 @@ static void DrawBitmap(BbcMachine* bbc, int cols, int rows, int scanlines, int p
   int cursor_end = bbc->crtc[11] & 0x1f;
   bool cursor_blink = CursorBlinkOn(bbc);
   uint16_t ma = (uint16_t)(((bbc->crtc[12] << 8) | bbc->crtc[13]) & 0x3fff);
+  bool use_snap =
+      bbc->snap_ready_frame == bbc->beam_frames && bbc->snap_ready_count > 0;
   int row;
   int y = 0;
   for (row = 0; row < rows; row++) {
     int ra;
-    uint16_t row_ma = ma;
+    int row_ula = ula;
+    int row_ppc = ppc;
+    uint16_t row_ma;
+    if (use_snap && row < bbc->snap_ready_count) {
+      row_ma = bbc->snap_ready_ma[row];
+      row_ula = (bbc->snap_ready_ula[row] >> 2) & 3;
+      row_ppc = (bbc->snap_ready_ula[row] & 0x10) ? 8 : 16;
+    } else {
+      row_ma = ma;
+      ma = (uint16_t)((ma + cols) & 0x3fff);
+    }
     for (ra = 0; ra < scanlines; ra++) {
       ma = row_ma;
       int col;
       int x = 0;
+      if (BbcMachineBeamUlaOverride(bbc)) {
+        BbcMachineBeamUlaApplyAtScanline(bbc, y);
+      }
       for (col = 0; col < cols; col++) {
         int pix;
         bool cursor_on = cursor_blink && ma == cursor && ra >= cursor_start &&
                          ra <= cursor_end;
-        if (ra >= 8) {
-          for (pix = 0; pix < ppc; pix++) {
+        // Bitmap modes blank every other group of eight scanlines in a row,
+        // matching scan_disp in the beam renderer. Revs uses a tall R9.
+        if ((ra >> 3) & 1) {
+          for (pix = 0; pix < row_ppc; pix++) {
             PutPixel(bbc, x + pix, y, kBlack);
           }
         } else {
-          uint8_t byte = VideoByte(bbc, ma, (uint8_t)ra);
-          for (pix = 0; pix < ppc; pix++) {
+          uint8_t byte = VideoByte(bbc, ma, (uint8_t)(ra & 7));
+          for (pix = 0; pix < row_ppc; pix++) {
             uint8_t rgb[3];
-            PaletteRgb(bbc, PixelIndex(ula, byte, pix), rgb);
+            PaletteRgb(bbc, PixelIndex(row_ula, byte, pix), rgb);
             if (cursor_on) {
               rgb[0] = (uint8_t)~rgb[0];
               rgb[1] = (uint8_t)~rgb[1];
@@ -1411,7 +1528,7 @@ static void DrawBitmap(BbcMachine* bbc, int cols, int rows, int scanlines, int p
             PutPixel(bbc, x + pix, y, rgb);
           }
         }
-        x += ppc;
+        x += row_ppc;
         ma = (uint16_t)((ma + 1) & 0x3fff);
       }
       y++;
@@ -1425,6 +1542,9 @@ static void DrawBitmap(BbcMachine* bbc, int cols, int rows, int scanlines, int p
 void BbcMachineRender(BbcMachine* bbc) {
   int cols = bbc->crtc[1];
   int rows = bbc->crtc[6];
+  if (bbc->beam_started && BbcMachineBeamUlaOverride(bbc)) {
+    return;
+  }
   int scanlines = DisplayScanlines(bbc);
   int ppc = PixelsPerChar(bbc);
   memset(bbc->fb, 0, (size_t)BBC_FB_WIDTH * BBC_FB_HEIGHT * 3);
@@ -3189,6 +3309,7 @@ static void FdcWrite(BbcMachine* bbc, uint8_t reg, uint8_t value) {
 static void TapeFlush(BbcMachine* bbc);
 static void TapeClose(BbcMachine* bbc);
 static void TapeStop(BbcMachine* bbc);
+static void JoystickStop(BbcMachine* bbc);
 
 // The 68B54 ADLC. Econet is this chip, not the RS423 6850 at &FE08.
 // A byte on a 200 kHz network clock is 80 CPU cycles at 2 MHz.
@@ -3836,6 +3957,7 @@ static void WriteSheila(BbcMachine* bbc, uint8_t page, uint8_t value) {
       bbc->crtc_addr = value & 0x1f;
     } else if (bbc->crtc_addr < 32) {
       bbc->crtc[bbc->crtc_addr] = value;
+      BbcMachineBeamUlaRefresh(bbc);
     }
     return;
   }
@@ -4603,10 +4725,30 @@ static void VideoFlyback(BbcMachine* bbc) {
     bbc->frames++;
     return;
   }
+  if (bbc->snap_row_count > 0) {
+    int n = bbc->snap_row_count;
+    if (n > 128) {
+      n = 128;
+    }
+    memcpy(bbc->snap_ready_ma, bbc->snap_row_ma, (size_t)n * sizeof(uint16_t));
+    memcpy(bbc->snap_ready_ula, bbc->snap_row_ula, (size_t)n);
+    bbc->snap_ready_count = n;
+  }
+  bbc->snap_row_count = 0;
+  BbcMachineBeamUlaFlyback(bbc);
   shown = bbc->fb;
   height = bbc->beam_y;
   if (height < 1) {
     height = 1;
+  }
+  {
+    int rows = bbc->crtc[6] & 0x7f;
+    int sl = DisplayScanlines(bbc);
+    int scale = Teletext(bbc) ? 2 : 1;
+    int max_h = rows * sl * scale;
+    if (max_h > 0 && height > max_h) {
+      height = max_h;
+    }
   }
   if (height > BBC_FB_HEIGHT) {
     height = BBC_FB_HEIGHT;
@@ -4628,6 +4770,9 @@ static void VideoFlyback(BbcMachine* bbc) {
   bbc->line_drawn = false;
   bbc->beam_frames++;
   bbc->frames++;
+  if (bbc->snap_ready_count > 0) {
+    bbc->snap_ready_frame = bbc->beam_frames;
+  }
 }
 
 static void VideoEndCharacterRow(BbcMachine* bbc) {
@@ -4727,7 +4872,10 @@ static void VideoEndScanline(BbcMachine* bbc) {
     bbc->in_vert_adjust = false;
     // Interlace inserts one dummy scanline on odd frames so the field is
     // 312.5 lines. Elite's split timer is counted from that vsync spacing.
-    if ((bbc->crtc[8] & 1) && (bbc->video_frames & 1)) {
+    // Elite-style half-field deferral applies to full interlace (R8 bits 0-1 =
+    // %11). Some custom modes use R8=%00000001; deferring odd fields there flickers.
+    if (!BbcMachineBeamUlaStableCrtcVsync(bbc) && (bbc->crtc[8] & 3) == 3 &&
+        (bbc->video_frames & 1)) {
       bbc->end_of_frame_latched = true;
     } else {
       end_of_frame = true;
@@ -4750,6 +4898,9 @@ static void VideoClock(BbcMachine* bbc) {
   bool interlace_sync = (bbc->crtc[8] & 1) != 0;
   bool half_hit = bbc->h_count == (((bbc->crtc[0] & 0xff) + 1) >> 1);
   bool vsync_point = !interlace_sync || !bbc->do_even_frame || half_hit;
+  if (BbcMachineBeamUlaStableCrtcVsync(bbc)) {
+    vsync_point = true;
+  }
   bool vsync_ending = false;
   bool vsync_starting = false;
   bool drawing;
@@ -4782,6 +4933,9 @@ static void VideoClock(BbcMachine* bbc) {
     VideoSetVsyncPin(bbc, bbc->in_vsync);
   }
   drawing = bbc->h_disp && bbc->v_disp && skew >= 0 && bbc->beam_y < BBC_FB_HEIGHT;
+  if (bbc->v_disp) {
+    BbcMachineBeamUlaFieldBegin(bbc);
+  }
   if (drawing) {
     uint16_t ma = (uint16_t)((bbc->vaddr - (uint16_t)skew) & 0x3fff);
     static const uint8_t kBlack[3] = {0, 0, 0};
@@ -4798,6 +4952,15 @@ static void VideoClock(BbcMachine* bbc) {
       MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y, width, ma, bbc->scanline);
       MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y + 1, width, ma, bbc->scanline);
     } else {
+      if (BbcMachineBeamUlaOverride(bbc)) {
+        BbcMachineBeamUlaPreparePixelRow(bbc, bbc->beam_y);
+      }
+      if (bbc->scanline == 0 && bbc->v_disp && bbc->disp_x == 0 &&
+          bbc->snap_row_count < 128) {
+        bbc->snap_row_ma[bbc->snap_row_count] = bbc->line_start;
+        bbc->snap_row_ula[bbc->snap_row_count] = bbc->ula_control;
+        bbc->snap_row_count++;
+      }
       DrawBeamBitmap(bbc, bbc->disp_x, bbc->beam_y, ma, bbc->scanline);
     }
     bbc->disp_x += width;
@@ -4945,20 +5108,6 @@ void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles) {
   if (cpu_cycles <= 0) {
     return;
   }
-  // The 6522s sit on the 1 MHz bus, so their timers tick once per two CPU cycles.
-  bbc->via_phase += cpu_cycles;
-  via_ticks = bbc->via_phase / 2;
-  ViaAdvance(&bbc->sys, via_ticks);
-  ViaAdvance(&bbc->user, via_ticks);
-  if (bbc->printer_ack > 0) {
-    if (via_ticks >= bbc->printer_ack) {
-      bbc->printer_ack = 0;
-      UserPrinterAck(bbc);
-    } else {
-      bbc->printer_ack -= via_ticks;
-    }
-  }
-  bbc->via_phase &= 1;
   AcaiAdvance(bbc, cpu_cycles);
   AdcAdvance(bbc, cpu_cycles);
   FdcAdvance(bbc, cpu_cycles);
@@ -4973,6 +5122,19 @@ void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles) {
   // While the CPU runs ahead, keep the timers and the disc in step but do not
   // paint every pixel. An unprogrammed CRTC has no beam either.
   if (bbc->fast_clock || bbc->crtc[0] == 0) {
+    bbc->via_phase += cpu_cycles;
+    via_ticks = bbc->via_phase / 2;
+    ViaAdvance(&bbc->sys, via_ticks);
+    ViaAdvance(&bbc->user, via_ticks);
+    if (bbc->printer_ack > 0) {
+      if (via_ticks >= bbc->printer_ack) {
+        bbc->printer_ack = 0;
+        UserPrinterAck(bbc);
+      } else {
+        bbc->printer_ack -= via_ticks;
+      }
+    }
+    bbc->via_phase &= 1;
     bbc->cycle_acc += cpu_cycles;
     while (bbc->cycle_acc >= BBC_CPU_CYCLES_PER_FRAME) {
       bbc->cycle_acc -= BBC_CPU_CYCLES_PER_FRAME;
@@ -4986,11 +5148,185 @@ void BbcMachineAdvance(BbcMachine* bbc, int cpu_cycles) {
     }
     return;
   }
+  if (VideoNeedsIrqSync(bbc)) {
+    int c;
+    for (c = 0; c < cpu_cycles; c++) {
+      AdvanceCpuCycle(bbc);
+    }
+    return;
+  }
+  // The 6522s sit on the 1 MHz bus, so their timers tick once per two CPU cycles.
+  bbc->via_phase += cpu_cycles;
+  via_ticks = bbc->via_phase / 2;
+  ViaAdvance(&bbc->sys, via_ticks);
+  ViaAdvance(&bbc->user, via_ticks);
+  if (bbc->printer_ack > 0) {
+    if (via_ticks >= bbc->printer_ack) {
+      bbc->printer_ack = 0;
+      UserPrinterAck(bbc);
+    } else {
+      bbc->printer_ack -= via_ticks;
+    }
+  }
+  bbc->via_phase &= 1;
   VideoAdvance(bbc, cpu_cycles);
+}
+
+void BbcMachineSetIrqSync(BbcMachine* bbc, void (*fn)(void* ctx), void* ctx) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->irq_sync = fn;
+  bbc->irq_sync_ctx = ctx;
+}
+
+bool BbcMachineUserViaT1Pending(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return (bbc->user.ifr & 0x40) != 0 && (bbc->user.ier & 0x40) != 0;
+}
+
+bool BbcMachineSysViaT1Pending(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return (bbc->sys.ifr & 0x40) != 0 && (bbc->sys.ier & 0x40) != 0;
+}
+
+bool BbcMachineDeferUserViaT1Irq(const BbcMachine* bbc) {
+  if (bbc == NULL || !VideoNeedsIrqSync(bbc)) {
+    return false;
+  }
+  if (!BbcMachineUserViaT1Pending(bbc) && !BbcMachineSysViaT1Pending(bbc)) {
+    return false;
+  }
+  if (bbc->master && (bbc->acccon & 0x80) != 0) {
+    return false;
+  }
+  if (ViaIrq(&bbc->sys) || AcaiIrq(bbc) || HdIrqPending(bbc)) {
+    return false;
+  }
+  if (bbc->tube != NULL && TubeHostIrq(bbc->tube)) {
+    return false;
+  }
+  if ((bbc->user.ifr & bbc->user.ier & (uint8_t)~0x40) != 0) {
+    return false;
+  }
+  return true;
+}
+
+void BbcMachineSetVideoIrqDispatch(BbcMachine* bbc, bool active) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->video_irq_dispatch = active;
+}
+
+bool BbcMachineNeedsVideoIrqSync(const BbcMachine* bbc) {
+  if (bbc == NULL || bbc->fast_clock || bbc->crtc[0] == 0) {
+    return false;
+  }
+  return VideoNeedsIrqSync(bbc);
+}
+
+bool BbcHwTeletext(const BbcMachine* bbc) {
+  return bbc != NULL && Teletext(bbc);
+}
+
+uint8_t BbcHwCrtc(const BbcMachine* bbc, int reg) {
+  if (bbc == NULL || reg < 0 || reg > 31) {
+    return 0;
+  }
+  return bbc->crtc[reg];
+}
+
+bool BbcHwUserViaT1Chained(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return bbc->user.t1_running && (bbc->user.ier & 0x40) != 0 && (bbc->user.acr & 0x40) != 0;
+}
+
+bool BbcHwSysViaT1Chained(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return bbc->sys.t1_running && (bbc->sys.ier & 0x40) != 0 && (bbc->sys.acr & 0x40) != 0;
+}
+
+void BbcHwForceUlaControl(BbcMachine* bbc, uint8_t value) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->ula_control = value;
+}
+
+void BbcHwForceUlaPalette(BbcMachine* bbc, uint8_t value) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->ula_pal[(value >> 4) & 0x0f] = (uint8_t)(value & 0x0f);
+}
+
+void BbcHwBeamUlaSetBand(BbcMachine* bbc, int band) {
+  if (bbc != NULL) {
+    bbc->beam_ula_band = band;
+  }
+}
+
+int BbcHwBeamUlaBand(const BbcMachine* bbc) {
+  return bbc == NULL ? -1 : bbc->beam_ula_band;
+}
+
+void BbcHwBeamUlaSetLockGuest(BbcMachine* bbc, bool lock) {
+  if (bbc != NULL) {
+    bbc->beam_ula_lock_guest = lock;
+  }
+}
+
+bool BbcHwBeamUlaLockGuest(const BbcMachine* bbc) {
+  return bbc != NULL && bbc->beam_ula_lock_guest;
 }
 
 int BbcMachineCompletedFrames(const BbcMachine* bbc) {
   return bbc->beam_frames;
+}
+
+bool BbcMachineBitmapDisplay(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return (bbc->ula_control & 0x02) == 0;
+}
+
+void BbcMachinePresentFrame(BbcMachine* bbc, bool turbo) {
+  int bf;
+  if (bbc == NULL) {
+    return;
+  }
+  bf = bbc->beam_frames;
+  if (turbo && BbcMachineBitmapDisplay(bbc)) {
+    if (bbc->present_frame != bf) {
+      BbcMachineRender(bbc);
+      bbc->present_frame = bf;
+    }
+    return;
+  }
+  // Real-time bitmap modes paint into the beam buffer. Snapshotting RAM into
+  // fb on every host refresh looks like the picture crawling up the window.
+  if (BbcMachineBitmapDisplay(bbc) && bbc->beam_started) {
+    bbc->present_frame = bf;
+    return;
+  }
+  if (!BbcMachineBitmapDisplay(bbc)) {
+    bbc->present_frame = bf;
+    return;
+  }
+  if (bf == 0) {
+    BbcMachineRender(bbc);
+    bbc->present_frame = bf;
+  }
 }
 
 bool BbcMachineIrqPending(const BbcMachine* bbc) {
@@ -6612,6 +6948,8 @@ BbcMachine* BbcMachineCreate(void) {
   bbc->noise_lfsr = 0x8000;
   bbc->do_even_frame = true;
   bbc->first_scanline = true;
+  bbc->beam_ula_band = -1;
+  bbc->beam_ula_lock_guest = false;
   bbc->tt_fg = 7;
   for (i = 0; i < 4; i++) {
     bbc->tone_vol[i] = 15;
@@ -6630,6 +6968,8 @@ BbcMachine* BbcMachineCreate(void) {
   bbc->tape_fd = -1;
   bbc->tape_listen_fd = -1;
   bbc->tape_handshake_fd = -1;
+  bbc->joystick_listen_fd = -1;
+  bbc->joystick_client_fd = -1;
   for (i = 0; i < 2; i++) {
     bbc->fdc.disc[i].fd = -1;
     bbc->fdc.extra[i].fd = -1;
@@ -6703,6 +7043,7 @@ void BbcMachineDestroy(BbcMachine* bbc) {
   TapeFlush(bbc);
   TapeClose(bbc);
   TapeStop(bbc);
+  JoystickStop(bbc);
   EconetClose(bbc);
   DiscStop(bbc);
   HdRelease(bbc);
@@ -7320,6 +7661,244 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
     return -1;
   }
   return bbc->tape_listen_port;
+}
+
+static void JoystickReset(BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->analogue[0] = 0x8000;
+  bbc->analogue[1] = 0x8000;
+  bbc->fire[0] = false;
+  bbc->fire[1] = false;
+  bbc->digital_joy = 0;
+  bbc->joystick_remote = false;
+}
+
+static void JoystickApply(BbcMachine* bbc, const JoystickPacket* packet) {
+  if (bbc == NULL || packet == NULL) {
+    return;
+  }
+  BbcMachineSetAnalogue(bbc, 0, packet->x);
+  BbcMachineSetAnalogue(bbc, 1, packet->y);
+  BbcMachineSetFire(bbc, 0, packet->fire0 != 0);
+  BbcMachineSetFire(bbc, 1, packet->fire1 != 0);
+  bbc->digital_joy = packet->digital;
+  bbc->joystick_remote = true;
+}
+
+static int JoystickServeClient(BbcMachine* bbc, int fd) {
+  char magic[JOYSTICK_MAGIC_LEN];
+  uint32_t version;
+  uint32_t reply;
+  JoystickPacket packet;
+  if (JoystickReadAll(fd, magic, sizeof(magic)) != 0 ||
+      memcmp(magic, JOYSTICK_MAGIC, JOYSTICK_MAGIC_LEN) != 0) {
+    reply = JOYSTICK_ERR;
+    JoystickSendAll(fd, &reply, sizeof(reply));
+    return -1;
+  }
+  if (JoystickReadAll(fd, &version, sizeof(version)) != 0 || version != JOYSTICK_VERSION) {
+    reply = JOYSTICK_ERR;
+    JoystickSendAll(fd, &reply, sizeof(reply));
+    return -1;
+  }
+  reply = JOYSTICK_OK;
+  if (JoystickSendAll(fd, &reply, sizeof(reply)) != 0) {
+    return -1;
+  }
+  pthread_mutex_lock(&bbc->joystick_mu);
+  bbc->analogue[0] = 0x8000;
+  bbc->analogue[1] = 0x8000;
+  bbc->fire[0] = false;
+  bbc->fire[1] = false;
+  bbc->digital_joy = 0;
+  bbc->joystick_remote = true;
+  pthread_mutex_unlock(&bbc->joystick_mu);
+  for (;;) {
+    if (JoystickReadAll(fd, &packet, sizeof(packet)) != 0) {
+      return -1;
+    }
+    pthread_mutex_lock(&bbc->joystick_mu);
+    JoystickApply(bbc, &packet);
+    pthread_mutex_unlock(&bbc->joystick_mu);
+  }
+}
+
+static void* JoystickListenMain(void* arg) {
+  BbcMachine* bbc = (BbcMachine*)arg;
+  for (;;) {
+    struct sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    int fd;
+    bool stop;
+    pthread_mutex_lock(&bbc->joystick_mu);
+    stop = bbc->joystick_listen_stop;
+    pthread_mutex_unlock(&bbc->joystick_mu);
+    if (stop) {
+      break;
+    }
+    {
+      struct pollfd listen_pfd;
+      int ready;
+      listen_pfd.fd = bbc->joystick_listen_fd;
+      listen_pfd.events = POLLIN;
+      ready = SocketPoll(&listen_pfd, 1, 200);
+      if (ready < 0) {
+        if (SocketInterrupted()) {
+          continue;
+        }
+        break;
+      }
+      if (ready == 0) {
+        continue;
+      }
+    }
+    fd = (int)accept(bbc->joystick_listen_fd, (struct sockaddr*)&addr, &len);
+    if (fd < 0) {
+      if (SocketWouldBlock()) {
+        continue;
+      }
+      pthread_mutex_lock(&bbc->joystick_mu);
+      stop = bbc->joystick_listen_stop;
+      pthread_mutex_unlock(&bbc->joystick_mu);
+      if (stop) {
+        break;
+      }
+      continue;
+    }
+    {
+      int one = 1;
+#ifdef SO_NOSIGPIPE
+      setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+    }
+    pthread_mutex_lock(&bbc->joystick_mu);
+    if (bbc->joystick_client_fd >= 0) {
+      SocketClose(bbc->joystick_client_fd);
+    }
+    bbc->joystick_client_fd = fd;
+    pthread_mutex_unlock(&bbc->joystick_mu);
+    if (JoystickServeClient(bbc, fd) != 0) {
+      pthread_mutex_lock(&bbc->joystick_mu);
+      JoystickReset(bbc);
+      if (bbc->joystick_client_fd == fd) {
+        bbc->joystick_client_fd = -1;
+      }
+      pthread_mutex_unlock(&bbc->joystick_mu);
+      SocketClose(fd);
+    }
+  }
+  return NULL;
+}
+
+static void JoystickStop(BbcMachine* bbc) {
+  int client;
+  if (bbc == NULL || !bbc->joystick_listen_started) {
+    return;
+  }
+  pthread_mutex_lock(&bbc->joystick_mu);
+  bbc->joystick_listen_stop = true;
+  client = bbc->joystick_client_fd;
+  pthread_mutex_unlock(&bbc->joystick_mu);
+  if (bbc->joystick_listen_fd >= 0) {
+    shutdown(bbc->joystick_listen_fd, SHUT_RDWR);
+  }
+  if (client >= 0) {
+    shutdown(client, SHUT_RDWR);
+  }
+  pthread_join(bbc->joystick_listen_thread, NULL);
+  if (bbc->joystick_listen_fd >= 0) {
+    SocketClose(bbc->joystick_listen_fd);
+    bbc->joystick_listen_fd = -1;
+  }
+  if (client >= 0) {
+    SocketClose(client);
+  }
+  pthread_mutex_lock(&bbc->joystick_mu);
+  JoystickReset(bbc);
+  bbc->joystick_client_fd = -1;
+  pthread_mutex_unlock(&bbc->joystick_mu);
+  pthread_mutex_destroy(&bbc->joystick_mu);
+  bbc->joystick_listen_started = false;
+}
+
+int BbcMachineListenJoystick(BbcMachine* bbc, int port) {
+  struct sockaddr_in addr;
+  socklen_t len;
+  int fd;
+  int one = 1;
+  if (bbc == NULL || bbc->joystick_listen_started || port < 0 || port > 65535) {
+    return -1;
+  }
+  if (!SocketStartup()) {
+    return -1;
+  }
+  fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+#ifdef _WIN32
+  setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&one, sizeof(one));
+#else
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
+#ifdef SO_NOSIGPIPE
+  setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+    fprintf(stderr, "Joystick socket bind on 127.0.0.1:%d failed: %s\n", port,
+            strerror(errno));
+    SocketClose(fd);
+    return -1;
+  }
+  if (listen(fd, 2) != 0) {
+    fprintf(stderr, "Joystick socket listen failed: %s\n", strerror(errno));
+    SocketClose(fd);
+    return -1;
+  }
+  len = sizeof(addr);
+  if (getsockname(fd, (struct sockaddr*)&addr, &len) != 0) {
+    SocketClose(fd);
+    return -1;
+  }
+  if (pthread_mutex_init(&bbc->joystick_mu, NULL) != 0) {
+    SocketClose(fd);
+    return -1;
+  }
+  bbc->joystick_listen_fd = fd;
+  bbc->joystick_listen_port = ntohs(addr.sin_port);
+  bbc->joystick_client_fd = -1;
+  bbc->joystick_listen_stop = false;
+  bbc->joystick_listen_started = true;
+  if (pthread_create(&bbc->joystick_listen_thread, NULL, JoystickListenMain, bbc) != 0) {
+    fprintf(stderr, "Joystick socket thread failed: %s\n", strerror(errno));
+    bbc->joystick_listen_started = false;
+    pthread_mutex_destroy(&bbc->joystick_mu);
+    SocketClose(fd);
+    bbc->joystick_listen_fd = -1;
+    return -1;
+  }
+  return bbc->joystick_listen_port;
+}
+
+bool BbcMachineJoystickRemoteActive(const BbcMachine* bbc) {
+  if (bbc == NULL) {
+    return false;
+  }
+  return bbc->joystick_remote;
+}
+
+void BbcMachineSetDigitalJoystick(BbcMachine* bbc, uint8_t mask) {
+  if (bbc == NULL) {
+    return;
+  }
+  bbc->digital_joy = mask;
 }
 
 void BbcMachineSetKey(BbcMachine* bbc, int column, int row, bool down) {

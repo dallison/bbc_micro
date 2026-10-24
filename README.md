@@ -1,6 +1,6 @@
 # bbc_micro
 
-A BBC Micro emulator: Model B and Master 128 / 256. The CPU is an NMOS 6502 on the Model B, a 65C02 when asked, and the Master's G65SC12. It also loads davecc 65C02 ELF programs and serves their `$EF` syscalls on the host.
+A BBC Micro emulator: Model B and Master 128 / 256. The CPU is an NMOS 6502 on the Model B, a 65C02 when asked, and the Master's G65SC12.
 
 MOS and sideways ROM images are not in this repository. Put your own copies in the socket directories below.
 
@@ -31,7 +31,7 @@ sudo apt install build-essential cmake libx11-dev libasound2-dev
 
 On Windows `bbc.exe` uses GDI and waveOut, which every install has. It builds with MinGW-w64 under MSYS2, or on Linux with a cross compiler, and runs there under Wine. Both are in [WINDOWS.md](WINDOWS.md).
 
-`6502` is the headless interpreter and is the program davecc uses to run a 65C02 executable. On the command line it is still named `6502`.
+`6502` is the same machine without a window. On the command line it is still named `6502`.
 
 ## ROMs
 
@@ -46,7 +46,7 @@ bazel-bin/bbc -machine master -disc blank.adf
 
 `-machine` is `b`, `master`, `master128`, or `master256`. `master` and `master128` use a 65SC12, a WD1770, and sideways RAM in sockets 4–7. `master256` makes every socket RAM. `-sram 4`, `8`, `16`, or a list such as `4-7` replaces that set.
 
-The Model B is an NMOS 6502. `-65c02` keeps the CMOS opcodes and the davecc `$EF` syscall on that machine. The Master's `$EF` is a one-byte NOP.
+The Model B is an NMOS 6502. `-65c02` keeps the CMOS opcodes. The Master's unused opcodes, including `$EF`, are one-byte NOPs.
 
 ## Discs
 
@@ -87,16 +87,21 @@ cassette -ro hello.uef
 
 `-tape-port 0` closes the socket. `-tape` still loads a tape before the machine starts, and a guest `*SAVE` is written back into that file when the cassette motor stops. Inside the emulator, `*TAPE` then `*SAVE` records onto whichever tape is inserted.
 
+## Joystick
+
+The BBC analogue port uses µPD7002 channels 0 and 1 for X and Y. Fire buttons are on the system VIA. Many digital sticks use the user VIA low nibble (right, left, down, up), active low.
+
+`bbc` listens on `127.0.0.1:8180` (8179 is Econet). On a Mac, run `joystick` in another window: move the mouse in that window for X/Y, left and right clicks for the fire buttons, and arrow keys or WASD for a digital stick. While `joystick` is connected, the `bbc` window does not also read the mouse as a stick.
+
+In Revs, press Shift+F2 in the game to select the joystick.
+
+```
+./build/bbc -disc ~/bbc_games/Disc015-Revs.ssd
+./build/joystick
+```
+
+`-joystick-port 0` closes the socket. `-joystick-port n` picks another port.
+
 ## Econet
 
 Econet is the 68B54 at `&FEA0`, not the RS423 serial port. How to run two stations is in [ECONET.md](ECONET.md).
-
-## davecc
-
-A davecc 65C02 program runs under `6502`. The interpreter looks for the davecc runtime ROM at `DAVECC_6502_ROM`, under `DAVECC_ROOT`, or beside the `6502` binary as `6502rom.exe`. Pass `-rom file` to name it yourself.
-
-```
-6502 -rom /path/to/6502rom.exe program.exe
-```
-
-`6502 -bbc` and `bbc -65c02` are the same machine with the BBC memory map, so a davecc program can be the thing that machine runs. The Master CPU does not use `$EF` as a syscall.

@@ -1,4 +1,5 @@
 #include "bbc_hardware.h"
+#include "joystick.h"
 #include "bbc_platform.h"
 #include "cassette.h"
 #include "cumana.h"
@@ -325,6 +326,57 @@ static void TestAddressRupture(void) {
   WriteCrtc(bbc, 7, 3);
   AdvanceUntilFrame(bbc);
   EXPECT(BbcMachineCompletedFrames(bbc) == 1);
+  for (y = 0; y < BbcFrameHeight(bbc); y++) {
+    BbcPixel(bbc, 0, y, rgb);
+    if (!RgbEq(rgb, top[0], top[1], top[2])) {
+      split = y;
+      break;
+    }
+  }
+  EXPECT(split > 8);
+  if (split > 8) {
+    BbcPixel(bbc, 0, split, rgb);
+    EXPECT(RgbEq(rgb, bottom[0], bottom[1], bottom[2]));
+  }
+  BbcMachineDestroy(bbc);
+  free(ram);
+}
+
+// The Mac host snapshots bitmap frames for games that redraw in RAM. That path
+// has to honour the same per-row MA as the beam after an address rupture.
+static void TestAddressRuptureSnapshot(void) {
+  uint8_t* ram = calloc(65536, 1);
+  BbcMachine* bbc = BbcMachineCreate();
+  uint8_t top[3];
+  uint8_t bottom[3];
+  uint8_t rgb[3];
+  int y;
+  int split = -1;
+  EXPECT(ram != NULL && bbc != NULL);
+  if (ram == NULL || bbc == NULL) {
+    BbcMachineDestroy(bbc);
+    free(ram);
+    return;
+  }
+  BbcMachineSetRam(bbc, ram);
+  memset(ram + 0x3c00, 0xff, 0x400);
+  BbcMachineSelectMode(bbc, 4);
+  BbcMachineRender(bbc);
+  BbcPixel(bbc, 0, 0, top);
+  WriteCrtc(bbc, 12, 0x30);
+  WriteCrtc(bbc, 13, 0x00);
+  BbcMachineRender(bbc);
+  BbcPixel(bbc, 0, 0, bottom);
+  EXPECT(!RgbEq(top, bottom[0], bottom[1], bottom[2]));
+  BbcMachineSelectMode(bbc, 4);
+  BbcMachineAdvance(bbc, 4 * 8 * 128);
+  WriteCrtc(bbc, 12, 0x30);
+  WriteCrtc(bbc, 13, 0x00);
+  WriteCrtc(bbc, 4, 4);
+  WriteCrtc(bbc, 7, 3);
+  AdvanceUntilFrame(bbc);
+  EXPECT(BbcMachineCompletedFrames(bbc) == 1);
+  BbcMachineRender(bbc);
   for (y = 0; y < BbcFrameHeight(bbc); y++) {
     BbcPixel(bbc, 0, y, rgb);
     if (!RgbEq(rgb, top[0], top[1], top[2])) {
@@ -729,6 +781,12 @@ static void TestPeripherals(void) {
   BbcMachineSetFire(bbc, 0, true);
   EXPECT((BbcMachineRead(bbc, 0xfe40) & 0x10) == 0);
   EXPECT((BbcMachineRead(bbc, 0xfe40) & 0xc0) == 0xc0);
+
+  BbcMachineWrite(bbc, 0xfe62, 0x00);
+  BbcMachineSetDigitalJoystick(bbc, JOYSTICK_DIGITAL_RIGHT | JOYSTICK_DIGITAL_UP);
+  EXPECT((BbcMachineRead(bbc, 0xfe60) & 0x0f) == 0x06);
+  BbcMachineSetDigitalJoystick(bbc, 0);
+  EXPECT((BbcMachineRead(bbc, 0xfe60) & 0x0f) == 0x0f);
 
   BbcMachineWrite(bbc, 0xfe63, 0xff);
   BbcMachineWrite(bbc, 0xfe61, 0x5a);
@@ -2483,6 +2541,7 @@ int main(void) {
     TestKeyboardAndSound(bbc);
     TestUlaSplit();
     TestAddressRupture();
+    TestAddressRuptureSnapshot();
     TestTeletextBeam();
     TestKeyboardGlyphs();
     TestDisc();

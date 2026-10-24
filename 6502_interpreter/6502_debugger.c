@@ -8,7 +8,6 @@
 
 #include "6502_debugger.h"
 #include "6502_interpreter.h"
-#include <inttypes.h>
 
 enum DebugCommand {
   kDbgNone,
@@ -74,14 +73,10 @@ static void Help() {
   printf("%-20s Single step\n", "s");
   printf("%-20s Single step over\n", "n");
   printf("%-20s Switch tracing on or off\n", "trace on|off");
-  printf("%-20s Print value of symbol\n", "p sym");
-  printf("%-20s Print value of symbol\n", "print sym");
+  printf("%-20s Print a register or a memory byte\n", "p a|x|y|s|pc|addr");
+  printf("%-20s Print a register or a memory byte\n", "print a|x|y|s|pc|addr");
   printf("%-20s Return from current subroutine\n", "finish");
   printf("%-20s Return from current subroutine\n", "fin");
-}
-
-static int FindSymbolAddress(W65C02Interpreter* interpreter, const char* name) {
-  return (int)LoaderLookupSymbol(interpreter->loader, name);
 }
 
 static enum DebugCommand ParseCommand(const char** cmd) {
@@ -149,28 +144,8 @@ static void DumpMemory(W65C02Interpreter* interpreter, const char* tail) {
     *p++ = *tail++;
   }
   *p = '\0';
-  bool named_reg = false;
-  if (buf[0] == '$') {
-    bool is_addr;
-    int reglen;
-    named_reg = NamedReg(buf, &start, &reglen, &is_addr);
-    if (named_reg) {
-      if (is_addr) {
-        start = *(uint16_t*)&interpreter->memory[start];
-        len = 32;
-      } else {
-        len = reglen;
-      }
-    }
-  }
-  if (!named_reg) {
-    if (isalpha(buf[0]) || *buf == '_') {
-      // Symbol.
-      start = FindSymbolAddress(interpreter, buf);
-    }
-    if (start == 0) {
-      start = (int)strtoll(buf, NULL, 16);    // Hex
-    }
+  if (buf[0] != '\0') {
+    start = (int)strtoll(buf, NULL, 16);
     while (isspace(*tail)) {
       tail++;
     }
@@ -299,60 +274,42 @@ static void CreateWatchpoint(W65C02Interpreter* interpreter, int addr, int span,
   }
 }
 
+static int ParseAddress(const char** tail) {
+  char* end = NULL;
+  const char* text = *tail;
+  unsigned long addr;
+  if (*text == '*') {
+    text++;
+  }
+  addr = strtoul(text, &end, 16);
+  if (end == text || addr > 0xffff) {
+    return -1;
+  }
+  *tail = end;
+  return (int)addr;
+}
+
 static void SetBreakpoint(W65C02Interpreter* interpreter, const char* tail) {
+  int addr;
   while (isspace(*tail)) {
     tail++;
   }
-  if (*tail == '*') {
-    // By address.
-    tail++;
-    uint64_t addr = strtoull(tail, NULL, 16);
-    if (addr == 0) {
-      printf("Invalid breakpoint address\n");
-      return;
-    }
-    CreateBreakpoint(interpreter, (int)addr, false);
+  addr = ParseAddress(&tail);
+  if (addr < 0) {
+    printf("Invalid breakpoint address\n");
     return;
   }
-  char symbol_name[256];
-  char* s = symbol_name;
-  while (*tail != '\0' && !isspace(*tail)) {
-    *s++ = *tail++;
-  }
-  *s = 0;
-  int addr = FindSymbolAddress(interpreter, symbol_name);
-  if (addr == 0) {
-    printf("Unknown symbol %s\n", symbol_name);
-    return;
-  }
-  CreateBreakpoint(interpreter, (int)addr, false);;
+  CreateBreakpoint(interpreter, addr, false);
 }
 
 static void SetWatchpoint(W65C02Interpreter* interpreter, char* tail) {
   while (isspace(*tail)) {
     tail++;
   }
-  int addr;
-  if (*tail == '*') {
-    // By address.
-    tail++;
-    addr = (int)strtoul(tail, &tail, 16);
-    if (addr == 0) {
-      printf("Invalid watchpoint address\n");
-      return;
-    }
-  } else {
-    char symbol_name[256];
-    char* s = symbol_name;
-    while (*tail != '\0' && !isspace(*tail)) {
-      *s++ = *tail++;
-    }
-    *s = 0;
-    addr = FindSymbolAddress(interpreter, symbol_name);
-    if (addr == 0) {
-      printf("Unknown symbol %s\n", symbol_name);
-      return;
-    }
+  int addr = ParseAddress((const char**)&tail);
+  if (addr < 0) {
+    printf("Invalid watchpoint address\n");
+    return;
   }
   while (isspace(*tail)) {
     tail++;
@@ -478,15 +435,7 @@ static void Step(W65C02Interpreter* interpreter, const char* tail) {
 static void StepOver(W65C02Interpreter* interpreter, const char* tail) {
   if (interpreter->memory[interpreter->pc] == 0x20) {
     // JSR instruction.
-    uint16_t subroutine = interpreter->memory[interpreter->pc+1] |
-    interpreter->memory[interpreter->pc+2] << 8;
-    uint16_t next;
-    if (subroutine == interpreter->enter_func ||
-        subroutine == interpreter->enter_leaf_func) {
-      next = interpreter->pc + 6;       // Space for the reg save mask.
-    } else {
-      next = interpreter->pc + 3;
-    }
+    uint16_t next = interpreter->pc + 3;
     // Create temp breakpoint at next address (after JSR).
     CreateBreakpoint(interpreter, next, true);
     interpreter->stop_at_next_instruction = false;
@@ -508,8 +457,10 @@ static void Continue(W65C02Interpreter* interpreter, const char* tail) {
 }
 
 static void Print(W65C02Interpreter* interpreter, const char* tail) {
-  char symbol_name[256];
-  char* s = symbol_name;
+  char name[256];
+  char* s = name;
+  char* end = NULL;
+  unsigned long addr;
   while (*tail != '\0' && isspace(*tail)) {
     tail++;
   }
@@ -517,57 +468,37 @@ static void Print(W65C02Interpreter* interpreter, const char* tail) {
     *s++ = *tail++;
   }
   *s = 0;
-  if (symbol_name[0] == '$') {
-    int addr, len;
-    bool is_addr;
-    if (NamedReg(symbol_name, &addr, &len, &is_addr)) {
-      switch (len) {
-        case 1: {
-          uint8_t value = *(uint8_t*)&interpreter->memory[addr];
-          printf("%s: 0x%x (%d)\n", symbol_name, value, value);
-          break;
-        }
-        case 2: {
-          uint16_t value = *(uint16_t*)&interpreter->memory[addr];
-          printf("%s: 0x%x (%d)\n", symbol_name, value, value);
-          break;
-        }
-        case 4: {
-          uint32_t value = *(uint32_t*)&interpreter->memory[addr];
-          printf("%s: 0x%x (%d)\n", symbol_name, value, value);
-          break;
-        }
-        case 8: {
-          uint64_t value = *(uint64_t*)&interpreter->memory[addr];
-          printf("%s: 0x%" PRIx64 " (%" PRId64 ")\n", symbol_name, value, value);
-          break;
-        }
-        default:
-          printf("Bad reg length %d\n", len);
-      }
-      return;
-    }
+  if (strcmp(name, "a") == 0) {
+    printf("A: 0x%02x (%d)\n", interpreter->a, interpreter->a);
+    return;
   }
-  int addr = FindSymbolAddress(interpreter, symbol_name);
-  if (addr == 0) {
-    printf("Unknown symbol %s\n", symbol_name);
-  } else {
-    printf("%s: 0x%x (%d)\n", symbol_name, addr, addr);
+  if (strcmp(name, "x") == 0) {
+    printf("X: 0x%02x (%d)\n", interpreter->x, interpreter->x);
+    return;
   }
+  if (strcmp(name, "y") == 0) {
+    printf("Y: 0x%02x (%d)\n", interpreter->y, interpreter->y);
+    return;
+  }
+  if (strcmp(name, "s") == 0) {
+    printf("S: 0x%02x (%d)\n", interpreter->s, interpreter->s);
+    return;
+  }
+  if (strcmp(name, "pc") == 0) {
+    printf("PC: 0x%04x (%d)\n", interpreter->pc, interpreter->pc);
+    return;
+  }
+  addr = strtoul(name, &end, 16);
+  if (name[0] == '\0' || end == name || *end != '\0' || addr > 0xffff) {
+    printf("Unknown value %s\n", name);
+    return;
+  }
+  printf("0x%04lx: 0x%02x (%d)\n", addr, interpreter->memory[addr], interpreter->memory[addr]);
 }
 
 static bool Run(W65C02Interpreter* interpreter, const char* tail) {
-  if (interpreter->pc < 0xc000) {
-    printf("Run from beginning (y/n)?");
-    fflush(stdout);
-    char ch = fgetc(stdin);
-    if (ch == 'y' || ch == 'Y') {
-      W65C02Reset(interpreter);
-      return true;
-    }
-    return false;
-  }
-  W65C02Reset(interpreter);
+  (void)tail;
+  W65C02InterpreterResetCpu(interpreter);
   return true;
 }
 
@@ -605,8 +536,7 @@ static void Disassemble(W65C02Interpreter* interpreter, const char* tail) {
       BreakpointUninstall(interpreter, bp);
     }
     unsigned char* curr = &interpreter->memory[addr];
-    void* next = Disassemble6502Instruction(interpreter->loader, interpreter->current_symbol, addr,
-                              curr, stdout);
+    void* next = Disassemble6502Instruction(addr, curr, stdout);
     addr += (unsigned char*)next - curr;
     if (bp != NULL) {
       BreakpointInstall(interpreter, bp);

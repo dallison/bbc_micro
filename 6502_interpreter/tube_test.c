@@ -29,7 +29,7 @@ static void TestBanner(void) {
   int cycles = 0;
   const char* banner = "\nAcorn TUBE 6502 64K\n\n\r";
   size_t banner_len = strlen(banner);
-  W65C02InterpreterInit(&cpu, false, false, false, NULL);
+  W65C02InterpreterInit(&cpu, false, false, false);
   W65C02InterpreterUseBbc(&cpu, 7, NULL, NULL);
   EXPECT(cpu.bbc != NULL);
   if (cpu.bbc == NULL || !BbcMachineAttachTube(cpu.bbc, BBC_TUBE_6502, NULL)) {
@@ -227,7 +227,7 @@ static void TestBoot(const char* argv0) {
     return;
   }
   memset(&cpu, 0, sizeof(cpu));
-  W65C02InterpreterInit(&cpu, false, false, false, NULL);
+  W65C02InterpreterInit(&cpu, false, false, false);
   W65C02InterpreterUseBbc(&cpu, -1, NULL, os_path);
   memset(skip_slot, 0, sizeof(skip_slot));
   if (cpu.bbc == NULL || !BbcMachineLoadRomFiles(cpu.bbc, files, count, skip_slot) ||

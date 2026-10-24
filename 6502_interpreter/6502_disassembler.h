@@ -11,10 +11,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include "6502_machine.h"
-#include "loader.h"
 
-void* Disassemble6502Instruction(Loader* loader, SymbolScope* current_symbol, uint16_t addr, void* p, FILE* fp);
-bool NamedReg(const char* name, int* value, int* size, bool* is_addr);
+void* Disassemble6502Instruction(uint16_t addr, void* p, FILE* fp);
 
 #endif /* W65C02_disassembler_h */

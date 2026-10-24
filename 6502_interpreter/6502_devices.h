@@ -18,12 +18,4 @@ typedef struct Device {
   int (*read)(struct Device* dev, uint16_t addr);
 } Device;
 
-typedef struct {
-  Device device;
-  uint16_t csr_addr;
-  uint16_t data_addr;
-} ACIADevice;
-
-Device* ConsoleInit(void);
-
 #endif /* _502_devices_h */

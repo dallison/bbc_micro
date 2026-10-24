@@ -4,14 +4,10 @@
 //  development files were present at build time.
 //
 
-// The loader uses the name Region, and so does Xutil.h. Rename the X11
-// typedef for this file; none of the calls below use an X region.
-#define Region X11Region
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
-#undef Region
 
 #include "bbc_session.h"
 #include "bbc_hardware.h"
@@ -463,9 +459,7 @@ static void BlitFrame(void) {
   if (g_cpu.bbc == NULL || g_image == NULL) {
     return;
   }
-  if (g_cpu.turbo || BbcMachineCompletedFrames(g_cpu.bbc) == 0) {
-    BbcMachineRender(g_cpu.bbc);
-  }
+  BbcMachinePresentFrame(g_cpu.bbc, g_cpu.turbo);
   width = BbcFrameWidth(g_cpu.bbc);
   height = BbcFrameHeight(g_cpu.bbc);
   if (width <= 0 || height <= 0) {
@@ -588,7 +582,7 @@ static void ReadPointer(void) {
   int x;
   int y;
   unsigned mask;
-  if (g_cpu.bbc == NULL) {
+  if (g_cpu.bbc == NULL || BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
     return;
   }
   if (!XQueryPointer(g_dpy, g_win, &root, &child, &rx, &ry, &x, &y, &mask)) {

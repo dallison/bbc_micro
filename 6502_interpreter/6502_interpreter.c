@@ -7,35 +7,25 @@
 //
 
 #include "6502_interpreter.h"
-#include "elf.h"
-#include "chrono_host.h"
-#include "filesystem_host.h"
-#include "random_host.h"
-#include "loader_lifecycle.h"
 #include <stdio.h>
-#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include "6502_disassembler.h"
 #include "6502_devices.h"
 #include "bbc_hardware.h"
 #include "6502_nmos.h"
 #include <time.h>
-#include <sys/time.h>
-#include <errno.h>
 
 #ifdef __MACH__
 #include <mach/mach_time.h> /* mach_absolute_time */
 #endif
 
+static void BbcSyncIrqFromVideo(void* ctx);
+static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurate);
+
 #define W65C02_instruction_decl(x) static void Interpret_##x(W65C02Interpreter*);
 #define W65C02_instruction_def(x) static void Interpret_##x(W65C02Interpreter* interpreter)
 #define W65C02_instruction(x) Interpret_##x
-
-#define W65C02_GUEST_ARGV_START 0x500
-#define W65C02_GUEST_ARGV_END 0x800
 
 typedef struct {
   void (*func)(W65C02Interpreter*);
@@ -297,8 +287,6 @@ W65C02_instruction_decl(xba)
 W65C02_instruction_decl(cpx_abs)
 W65C02_instruction_decl(sbc_abs)
 W65C02_instruction_decl(inc_abs)
-W65C02_instruction_decl(sbrk)
-
 W65C02_instruction_decl(beq)
 W65C02_instruction_decl(sbc_zp_indirect_y)
 W65C02_instruction_decl(sbc_zp_indirect)
@@ -588,7 +576,7 @@ static Instruction instructions[256] = {
   {W65C02_instruction(cpx_abs), 3, 4},
   {W65C02_instruction(sbc_abs), 3, 4},
   {W65C02_instruction(inc_abs), 3, 6},
-  {W65C02_instruction(sbrk), 1, 2},
+  {W65C02_instruction(nop), 1, 2},
   
   // f0 -> ff
   {W65C02_instruction(beq), 1, 2},
@@ -610,27 +598,18 @@ static Instruction instructions[256] = {
 };
 
 void W65C02InterpreterInit(W65C02Interpreter* interpreter, bool debug,
-                           bool cycle_accurate, bool trace, const char* rom_filename) {
+                           bool cycle_accurate, bool trace) {
   memset(interpreter, 0, sizeof(W65C02Interpreter));
   interpreter->debug = debug;
   interpreter->current_bp = NULL;
   interpreter->next_bp_num = 1;
   interpreter->trace = trace;
-  StringInit(&interpreter->rom_filename, rom_filename);
   interpreter->cycle_accurate = cycle_accurate;
   interpreter->allow_turbo = true;
   VectorInit(&interpreter->breakpoints);
   VectorInit(&interpreter->watchpoints);
-
   VectorInit(&interpreter->devices);
-  VectorAppend(&interpreter->devices, ConsoleInit());
   interpreter->bbc_initial_mode = -1;
-  for (int i = 0; i < W65C02_MAX_OPEN_FILES; i++) {
-    interpreter->open_files[i] = -1;
-  }
-  interpreter->open_files[0] = STDIN_FILENO;
-  interpreter->open_files[1] = STDOUT_FILENO;
-  interpreter->open_files[2] = STDERR_FILENO;
 }
 
 void W65C02InterpreterUseBbc(W65C02Interpreter* interpreter, int initial_mode,
@@ -652,6 +631,7 @@ void W65C02InterpreterUseBbc(W65C02Interpreter* interpreter, int initial_mode,
     if (sheila != NULL) {
       VectorAppend(&interpreter->devices, sheila);
     }
+    BbcMachineSetIrqSync(interpreter->bbc, BbcSyncIrqFromVideo, interpreter);
   }
 }
 
@@ -694,870 +674,12 @@ Device* PollForDevice(W65C02Interpreter* interpreter, uint8_t* addr) {
   return NULL;
 }
 
-#if 0
-// These are used when there is no ROM.
-// Reset handler, invoked on 6502 reset.
-static char reset_handler[] = {
-  // We have the entry address in 0,1. Jump indirect via 0x00.
-  0x78,              // SEI
-  0xa2, 0xff,        // LDX #0xff
-  0x9a,              // TXS
-  0x58,              // CLI
-  0x6c, 0x00,        // JMP (0x00)
-};
-
-// 6502 instructions executed on IRQ or BRK
-// Entered with interrupt flag set.  On stack we have
-// s+1: P
-// s+2: PC lo
-// s+3: PC hi
-// Use RTI to return.
-// Uses 0xfd, 0xfe and 0xff as scratch.
-// Jumps to BRK vector at 0xfd00
-static char irq_handler[] = {
-  0x85, 0xfd,         // STA $fd
-  0x68,               // PLA
-  0x48,               // PHA
-  0x29, 0x10,         // AND #$10
-  0xd0, 0x03,         // BNE $060b
-  0xa5, 0xfd,         // LDA $fd
-  0x40,               // RTI
-  0x8a,               // TXA
-  0x48,               // PHA
-  0xba,               // TSX
-  0xbd, 0x03, 0x01,   // LDA $0103,X
-  0xd8,               // CLD
-  0x38,               // SEC
-  0xe9, 0x01,         // SBC #$01
-  0x85, 0xfe,         // STA $fe
-  0xbd, 0x04, 0x01,   // LDA $0104,X
-  0xe9, 0x00,         // SBC #$00
-  0x85, 0xff,         // STA $ff
-  0xb2, 0xfe,         // LDA ($fe)
-  0x20, 0x00, 0xfd,   // JSR 0xfd00
-  0x68,               // PLA
-  0xaa,               // TAX
-  0xa5, 0xfd,         // LDA $fd
-  0x40,               // RTI
-};
-#endif
-
-
-// NOTE: keep this in step with the actual SP offset in zero page.
-#define REG_SP 0x78
-#define REG_I0 0x08
-
-#define W65C02_INT_EXIT 1
-#define W65C02_INT_EXIT_CLEAN 22
-#define W65C02_GUEST_CALL_RETURN 0x0002
-#define W65C02_GUEST_STACK_BOTTOM 0xc000
-#define W65C02_REG_SP REG_SP
-#define W65C02_INT_OPEN 2
-#define W65C02_INT_CLOSE 3
-#define W65C02_INT_WRITE 4
-#define W65C02_INT_READ 5
-#define W65C02_INT_LSEEK 7
-#define W65C02_INT_ABORT 8
-#define W65C02_INT_TIME 13
-#define W65C02_INT_CLOCK 14
-#define W65C02_INT_MONOTONIC_TIME 24
-#define W65C02_INT_REALTIME_TIME 30
-#define W65C02_INT_FS_STATUS 31
-#define W65C02_INT_FS_OPEN_DIRECTORY 32
-#define W65C02_INT_FS_READ_DIRECTORY 33
-#define W65C02_INT_FS_CLOSE_DIRECTORY 34
-#define W65C02_INT_FS_CREATE_DIRECTORY 35
-#define W65C02_INT_FS_REMOVE 36
-#define W65C02_INT_FS_RENAME 37
-#define W65C02_INT_FS_CURRENT_PATH 38
-#define W65C02_INT_FS_SET_CURRENT_PATH 39
-#define W65C02_INT_FS_READ_SYMLINK 40
-#define W65C02_INT_FS_CREATE_SYMLINK 41
-#define W65C02_INT_FS_CREATE_HARD_LINK 42
-#define W65C02_INT_FS_SET_PERMISSIONS 43
-#define W65C02_INT_FS_RESIZE 44
-#define W65C02_INT_FS_SET_MODIFICATION_TIME 45
-#define W65C02_INT_FS_SPACE 46
-#define W65C02_INT_FS_COPY_FILE 47
-#define W65C02_INT_FS_CANONICAL 48
-#define W65C02_INT_TZDB_VERSION 49
-#define W65C02_INT_TZDB_GENERATION 50
-#define W65C02_INT_TZDB_RELOAD 51
-#define W65C02_INT_TZDB_CURRENT_ZONE 52
-#define W65C02_INT_TZDB_ZONE_COUNT 53
-#define W65C02_INT_TZDB_ZONE_NAME 54
-#define W65C02_INT_TZDB_LOCATE_ZONE 55
-#define W65C02_INT_TZDB_SYS_INFO 56
-#define W65C02_INT_TZDB_LOCAL_INFO 57
-#define W65C02_INT_TZDB_LEAP_COUNT 58
-#define W65C02_INT_TZDB_LEAP_INFO 59
-#define W65C02_INT_RANDOM_BYTES 60
-
-static int Open(W65C02Interpreter* interpreter, const char* filename, int flags, int mode) {
-  int index = 0;
-  while (index < W65C02_MAX_OPEN_FILES) {
-    if (interpreter->open_files[index] == -1) {
-      break;
-    }
-    index++;
-  }
-  if (index == W65C02_MAX_OPEN_FILES) {
-    return -1;
-  }
-  int fd = open(filename, flags, mode);
-  if (fd == -1) {
-    return -1;
-  }
-  interpreter->open_files[index] = fd;
-  return index;
-}
-
-static int Close(W65C02Interpreter* interpreter, int fd_index) {
-  if (fd_index < 0 || fd_index >= W65C02_MAX_OPEN_FILES) {
-    return -1;
-  }
-  if (interpreter->open_files[fd_index] == -1) {
-    return -1;
-  }
-  int e = close(interpreter->open_files[fd_index]);
-  if (e == 0) {
-    interpreter->open_files[fd_index] = -1;
-    return 0;
-  }
-  return -1;
-}
-
-static off_t Lseek(W65C02Interpreter* interpreter, int fd_index, off_t offset, int whence) {
-  if (fd_index < 0 || fd_index >= W65C02_MAX_OPEN_FILES) {
-    return -1;
-  }
-  if (interpreter->open_files[fd_index] == -1) {
-    return -1;
-  }
-  return lseek(interpreter->open_files[fd_index], offset, whence);
-}
-
-
-static ssize_t Write(W65C02Interpreter* interpreter, int fd_index, const char* buffer, size_t length) {
-  if (fd_index < 0 || fd_index >= W65C02_MAX_OPEN_FILES) {
-    return -1;
-  }
-  if (interpreter->open_files[fd_index] == -1) {
-    return -1;
-  }
-  return write(interpreter->open_files[fd_index], buffer, length);
-}
-
-static ssize_t Read(W65C02Interpreter* interpreter, int fd_index, char* buffer, size_t length) {
-  if (fd_index < 0 || fd_index >= W65C02_MAX_OPEN_FILES) {
-    return -1;
-  }
-  if (interpreter->open_files[fd_index] == -1) {
-    return -1;
-  }
-  return read(interpreter->open_files[fd_index], buffer, length);
-}
-
-// These come from fcntl.h
-#define W65C02_O_RDONLY 00000000
-#define W65C02_O_WRONLY 00000001
-#define W65C02_O_RDWR 00000002
-#define W65C02_O_ACCMODE 00000003
-#define W65C02_O_CREAT 00000100
-#define W65C02_O_EXCL 00000200
-#define W65C02_O_NOCTTY 00000400
-#define W65C02_O_TRUNC 00001000
-#define W65C02_O_APPEND 00002000
-#define W65C02_O_NONBLOCK 00004000
-#define W65C02_O_SYNC 00010000
-#define W65C02_FASYNC 00020000
-#define W65C02_O_DIRECT 00040000
-#define W65C02_O_LARGEFILE 00100000
-#define W65C02_O_DIRECTORY 00200000
-#define W65C02_O_NOFOLLOW 00400000
-#define W65C02_O_NOATIME 01000000
-#define W65C02_O_NDELAY W65C02_O_NONBLOCK
-
-#define CVTFLAG(f) if ((in_flags & W65C02_##f) != 0) out_flags |= f;
-
-// Convert the 6502 flags into those for the OS.
-static int ConvertOpenFlags(int in_flags) {
-  int out_flags = 0;
-  if ((in_flags & W65C02_O_ACCMODE) == W65C02_O_RDWR) {
-    out_flags |= O_RDWR;
-  } else {
-    CVTFLAG(O_WRONLY);
-  }
-  CVTFLAG(O_CREAT);
-  CVTFLAG(O_EXCL);
-#if defined(O_NOCTTY)
-  CVTFLAG(O_NOCTTY);
-#endif
-  CVTFLAG(O_TRUNC);
-  CVTFLAG(O_APPEND);
-#if defined(O_NONBLOCK)
-  CVTFLAG(O_NONBLOCK)
-#endif
-#if defined(O_SYNC)
-  CVTFLAG(O_SYNC);
-#endif
-#if defined(FASYNC)
-  CVTFLAG(FASYNC);
-#endif
-#if defined(O_DIRECT)
-  CVTFLAG(O_DIRECT);
-#endif
-#if defined(O_LARGEFILE)
-  CVTFLAG(O_LARGEFILE);
-#endif
-#if defined(O_DIRECTORY)
-  CVTFLAG(O_DIRECTORY);
-#endif
-#if defined(O_NOFOLLOW)
-  CVTFLAG(O_NOFOLLOW);
-#endif
-#if defined(O_NOATIME)
-  CVTFLAG(O_NOATIME);
-#endif
-
-  return out_flags;
-}
-#undef CVTFLAG
-
-// These are from <errno.h>.
-#define W65C02_EDOM 200
-#define W65C02_EILSEQ 201
-
-#define W65C02_ENOENT          1       /* No such file or directory */
-#define W65C02_ENOMEM          2       /* Out of memory */
-#define W65C02_EACCES          3       /* Permission denied */
-#define W65C02_ENODEV          4       /* No such device */
-#define W65C02_EMFILE          5       /* Too many open files */
-#define W65C02_EBUSY           6       /* Device or resource busy */
-#define W65C02_EINVAL          7       /* Invalid argument */
-#define W65C02_ENOSPC          8       /* No space left on device */
-#define W65C02_EEXIST          9       /* File exists */
-#define W65C02_EAGAIN          10      /* Try again */
-#define W65C02_EIO             11      /* I/O error */
-#define W65C02_EINTR           12      /* Interrupted system call */
-#define W65C02_ENOSYS          13      /* Function not implemented */
-#define W65C02_ESPIPE          14      /* Illegal seek */
-#define W65C02_ERANGE          15      /* Range error */
-#define W65C02_EBADF           16      /* Bad file number */
-#define W65C02_ENOEXEC         17      /* Exec format error */
-#define W65C02_EUNKNOWN        18      /* Unknown OS specific error */
-
-#define X_ERRNO(e) W65C02_##e
-
-int TranslateErrno(int errnum) {
-  switch (errnum) {
-    case EDOM: return X_ERRNO(EDOM);
-    case EILSEQ: return X_ERRNO(EILSEQ);
-
-    case ENOENT: return X_ERRNO(ENOENT);
-    case ENOMEM: return X_ERRNO(ENOMEM);
-    case EACCES: return X_ERRNO(EACCES);
-    case ENODEV: return X_ERRNO(ENODEV);
-    case EMFILE: return X_ERRNO(EMFILE);
-    case EBUSY: return  X_ERRNO(EBUSY);
-    case EINVAL: return X_ERRNO(EINVAL);
-    case ENOSPC: return X_ERRNO(ENOSPC);
-    case EEXIST: return X_ERRNO(EEXIST);
-    case EAGAIN: return X_ERRNO(EAGAIN);
-    case EIO: return X_ERRNO(EIO);
-    case EINTR: return  X_ERRNO(EINTR);
-    case ENOSYS: return X_ERRNO(ENOSYS);
-    case ESPIPE: return X_ERRNO(ESPIPE);
-    case ERANGE: return  X_ERRNO(ERANGE);
-    case EBADF: return  X_ERRNO(EBADF);
-    case ENOEXEC: return  X_ERRNO(ENOEXEC);
-#ifdef EUNKNOWN
-    case EUNKNOWN: return  X_ERRNO(EUNKNOWN);
-#endif
-    default:
-      return errnum;
-  }
-}
-
-#define ERRNO_ADDR 0x3d6
-static void SetErrno(W65C02Interpreter* interpreter) {
-  *(int16_t*)&interpreter->memory[ERRNO_ADDR] = TranslateErrno(errno);
-}
-
-typedef struct {
-  uint16_t pc;
-  uint8_t a;
-  uint8_t x;
-  uint8_t y;
-  uint8_t s;
-  int8_t flags;
-  uint16_t guest_call_return_pc;
-} W65C02SavedState;
-
-static int StepOneInstruction(W65C02Interpreter* interpreter,
-                              bool cycle_accurate);
-
-static void W65C02SaveState(W65C02Interpreter* interpreter,
-                            W65C02SavedState* saved) {
-  saved->pc = interpreter->pc;
-  saved->a = interpreter->a;
-  saved->x = interpreter->x;
-  saved->y = interpreter->y;
-  saved->s = interpreter->s;
-  saved->flags = interpreter->flags.value;
-  saved->guest_call_return_pc = interpreter->guest_call_return_pc;
-}
-
-static void W65C02RestoreState(W65C02Interpreter* interpreter,
-                               const W65C02SavedState* saved) {
-  interpreter->pc = saved->pc;
-  interpreter->a = saved->a;
-  interpreter->x = saved->x;
-  interpreter->y = saved->y;
-  interpreter->s = saved->s;
-  interpreter->flags.value = saved->flags;
-  interpreter->guest_call_return_pc = saved->guest_call_return_pc;
-}
-
-static void W65C02SetupGuestStartupStack(W65C02Interpreter* interpreter) {
-  interpreter->memory[W65C02_REG_SP] = W65C02_GUEST_STACK_BOTTOM & 0xff;
-  interpreter->memory[W65C02_REG_SP + 1] = W65C02_GUEST_STACK_BOTTOM >> 8;
-  interpreter->memory[W65C02_REG_SP + 2] = W65C02_GUEST_STACK_BOTTOM & 0xff;
-  interpreter->memory[W65C02_REG_SP + 3] = W65C02_GUEST_STACK_BOTTOM >> 8;
-  interpreter->s = 0xff;
-}
-
-bool W65C02GuestAddressExecutable(Loader* loader, uint16_t addr) {
-  if (loader == NULL) {
-    return false;
-  }
-  if (addr == 0) {
-    return true;
-  }
-  for (size_t i = 1; i < loader->regions.length; i++) {
-    Region* region = loader->regions.value.p[i];
-    for (size_t section_index = 0; section_index < region->sections.length;
-         section_index++) {
-      ELFReaderSection* section = region->sections.value.p[section_index];
-      if ((section->header->flags & SHF(execinstr)) == 0) {
-        continue;
-      }
-      uint16_t start = (uint16_t)section->header->addr;
-      uint16_t end = start + (uint16_t)section->header->size;
-      if (addr >= start && addr < end) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-static void W65C02PushGuestReturnAddress(W65C02Interpreter* interpreter,
-                                         uint16_t return_pc) {
-  uint16_t pushed = (uint16_t)(return_pc - 1);
-  interpreter->memory[0x100 + interpreter->s--] = pushed >> 8;
-  interpreter->memory[0x100 + interpreter->s--] = pushed & 0xff;
-}
-
-void W65C02GuestCallVoidFunction(W65C02Interpreter* interpreter, uint16_t fn) {
-  if (interpreter == NULL || fn == 0) {
-    return;
-  }
-  W65C02SavedState saved;
-  W65C02SaveState(interpreter, &saved);
-  W65C02PushGuestReturnAddress(interpreter, W65C02_GUEST_CALL_RETURN);
-  interpreter->guest_call_return_pc = W65C02_GUEST_CALL_RETURN;
-  interpreter->pc = fn;
-  while (interpreter->pc != interpreter->guest_call_return_pc) {
-    StepOneInstruction(interpreter, false);
-  }
-  W65C02RestoreState(interpreter, &saved);
-}
-
-static bool W65C02LifecycleCallback(void* context, LoadedDynamicLibrary* image,
-                                    uint64_t function,
-                                    LoaderLifecyclePhase phase) {
-  (void)image;
-  (void)phase;
-  typedef struct {
-    Loader* loader;
-    W65C02Interpreter* interpreter;
-  } W65C02LifecycleContext;
-  W65C02LifecycleContext* ctx = context;
-  if (function > 0xffff ||
-      !W65C02GuestAddressExecutable(ctx->loader, (uint16_t)function)) {
-    LoaderError("Function array entry 0x%llx is not executable\n",
-                (unsigned long long)function);
-    return false;
-  }
-  W65C02GuestCallVoidFunction(ctx->interpreter, (uint16_t)function);
-  return true;
-}
-
-static bool RunGuestLifecyclePhase(Loader* loader,
-                                   W65C02Interpreter* interpreter,
-                                   LoaderLifecyclePhase phase) {
-  typedef struct {
-    Loader* loader;
-    W65C02Interpreter* interpreter;
-  } W65C02LifecycleContext;
-  W65C02LifecycleContext ctx = {loader, interpreter};
-  return LoaderLifecycleRunPhase(loader, loader->lifecycle, phase,
-                                 W65C02LifecycleCallback, &ctx);
-}
-
-bool W65C02GuestRunInitArrays(Loader* loader,
-                              W65C02Interpreter* interpreter) {
-  if (interpreter->init_arrays_done) {
-    return true;
-  }
-  if (!RunGuestLifecyclePhase(loader, interpreter, kLoaderLifecyclePreinit) ||
-      !RunGuestLifecyclePhase(loader, interpreter, kLoaderLifecycleInit)) {
-    return false;
-  }
-  interpreter->init_arrays_done = true;
-  return true;
-}
-
-bool W65C02GuestRunFiniArrays(Loader* loader,
-                              W65C02Interpreter* interpreter) {
-  return RunGuestLifecyclePhase(loader, interpreter, kLoaderLifecycleFini);
-}
-
-static uint16_t GuestRead16(const void* pointer) {
-  uint16_t value;
-  memcpy(&value, pointer, sizeof(value));
-  return value;
-}
-
-static int32_t GuestRead32(const void* pointer) {
-  int32_t value;
-  memcpy(&value, pointer, sizeof(value));
-  return value;
-}
-
-static void* GuestPointer(W65C02Interpreter* interpreter, uint16_t address,
-                          size_t size) {
-  if (size > 0x10000u || (size_t)address + size > 0x10000u) {
-    return NULL;
-  }
-  return interpreter->memory + address;
-}
-
-static const char* GuestString(W65C02Interpreter* interpreter,
-                               uint16_t address) {
-  const char* value = GuestPointer(interpreter, address, 1);
-  if (value == NULL ||
-      memchr(value, '\0', 0x10000u - (size_t)address) == NULL) {
-    return NULL;
-  }
-  return value;
-}
-
-static void SetSyscallResult(W65C02Interpreter* interpreter,
-                             uint16_t result_address, int64_t result) {
-  int32_t narrowed = (int32_t)result;
-  void* destination =
-      GuestPointer(interpreter, result_address, sizeof(narrowed));
-  if (destination != NULL) {
-    memcpy(destination, &narrowed, sizeof(narrowed));
-  }
-  interpreter->x = narrowed & 0xff;
-  interpreter->y = (narrowed >> 8) & 0xff;
-}
-
-static int64_t GuestClockMicroseconds(W65C02Interpreter* interpreter,
-                                     uint16_t result_address,
-                                     clockid_t clock_id) {
-  int64_t* destination =
-      GuestPointer(interpreter, result_address, sizeof(int64_t));
-  struct timespec now;
-  if (destination == NULL || clock_gettime(clock_id, &now) != 0) {
-    return -DAVE_HOST_EINVAL;
-  }
-  int64_t value = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
-  memcpy(destination, &value, sizeof(value));
-  return 0;
-}
-
-// This is entered from the interpreter's custom software-break instruction.
-// sp+0 is the address of the four-byte long result and sp+2 starts the packed
-// 65C02 arguments (all pointers and int/size_t arguments are two bytes).
-static void BrkHandler(W65C02Interpreter* interpreter, int8_t code) {
-  uint16_t guest_sp = GuestRead16(&interpreter->memory[REG_SP]);
-  uint8_t* sp = GuestPointer(interpreter, guest_sp, 2);
-  if (sp == NULL) {
-    interpreter->exit_code = 1;
-    interpreter->running = false;
-    return;
-  }
-  uint16_t result_address = GuestRead16(sp);
-  int64_t result = 0;
-
-#define ARG16(offset) GuestRead16(sp + 2 + (offset))
-#define ARG_PTR(offset, size) \
-  GuestPointer(interpreter, ARG16(offset), (size))
-#define ARG_STRING(offset) GuestString(interpreter, ARG16(offset))
-
-  switch (code) {
-    case W65C02_INT_EXIT:
-      exit((int16_t)ARG16(0));
-    case W65C02_INT_EXIT_CLEAN:
-      interpreter->exit_code = (int16_t)ARG16(0);
-      LoaderLifecycleMarkExecutableFiniComplete(interpreter->loader,
-                                                interpreter->loader->lifecycle);
-      interpreter->running = false;
-      return;
-    case W65C02_INT_ABORT:
-      fprintf(stderr, "guest abort at pc=0x%04x sp=0x%04x s=0x%02x stack:",
-              interpreter->pc, guest_sp, interpreter->s);
-      for (int i = 1; i <= 16; ++i) {
-        fprintf(stderr, " %02x",
-                interpreter->memory[0x100 + (uint8_t)(interpreter->s + i)]);
-      }
-      fprintf(stderr, "\n");
-      abort();
-    case W65C02_INT_OPEN: {
-      const char* filename = ARG_STRING(0);
-      if (filename == NULL) {
-        result = -1;
-        errno = EINVAL;
-      } else {
-        result = Open(interpreter, filename, ConvertOpenFlags(ARG16(2)),
-                      ARG16(4));
-      }
-      break;
-    }
-    case W65C02_INT_CLOSE:
-      result = Close(interpreter, (int16_t)ARG16(0));
-      break;
-    case W65C02_INT_LSEEK:
-      result = Lseek(interpreter, (int16_t)ARG16(0),
-                     (off_t)GuestRead32(sp + 4), (int16_t)ARG16(6));
-      break;
-    case W65C02_INT_WRITE: {
-      size_t length = ARG16(4);
-      const char* buffer = ARG_PTR(2, length);
-      result = buffer == NULL
-                   ? -1
-                   : Write(interpreter, (int16_t)ARG16(0), buffer, length);
-      if (buffer == NULL) errno = EINVAL;
-      break;
-    }
-    case W65C02_INT_READ: {
-      size_t length = ARG16(4);
-      char* buffer = ARG_PTR(2, length);
-      result = buffer == NULL
-                   ? -1
-                   : Read(interpreter, (int16_t)ARG16(0), buffer, length);
-      if (buffer == NULL) errno = EINVAL;
-      break;
-    }
-    case W65C02_INT_TIME:
-      result = (int64_t)time(NULL);
-      break;
-    case W65C02_INT_CLOCK: {
-      struct timespec now;
-      result = clock_gettime(CLOCK_MONOTONIC, &now) == 0
-                   ? (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000
-                   : -1;
-      break;
-    }
-    case W65C02_INT_MONOTONIC_TIME:
-      result = GuestClockMicroseconds(interpreter, ARG16(0),
-                                      CLOCK_MONOTONIC);
-      break;
-    case W65C02_INT_REALTIME_TIME:
-      result =
-          GuestClockMicroseconds(interpreter, ARG16(0), CLOCK_REALTIME);
-      break;
-    case W65C02_INT_FS_STATUS: {
-      DaveHostFilesystemStat host_result;
-      DaveHostFilesystemStat* guest_result = ARG_PTR(4, sizeof(host_result));
-      const char* path = ARG_STRING(0);
-      if (path == NULL || guest_result == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        result =
-            DaveHostFilesystemGetStatus(path, ARG16(2), &host_result);
-        if (result == 0) {
-          memcpy(guest_result, &host_result, sizeof(host_result));
-        }
-      }
-      break;
-    }
-    case W65C02_INT_FS_OPEN_DIRECTORY: {
-      const char* path = ARG_STRING(0);
-      result = path == NULL ? -DAVE_HOST_EINVAL
-                            : DaveHostFilesystemOpenDirectory(path);
-      break;
-    }
-    case W65C02_INT_FS_READ_DIRECTORY: {
-      DaveHostFilesystemDirectoryEntry host_result;
-      DaveHostFilesystemDirectoryEntry* guest_result =
-          ARG_PTR(2, sizeof(host_result));
-      if (guest_result == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        result = DaveHostFilesystemReadDirectory((int16_t)ARG16(0),
-                                                 &host_result);
-        if (result > 0) {
-          memcpy(guest_result, &host_result, sizeof(host_result));
-        }
-      }
-      break;
-    }
-    case W65C02_INT_FS_CLOSE_DIRECTORY:
-      result = DaveHostFilesystemCloseDirectory((int16_t)ARG16(0));
-      break;
-    case W65C02_INT_FS_CREATE_DIRECTORY: {
-      const char* path = ARG_STRING(0);
-      result = path == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostFilesystemCreateDirectory(path, ARG16(2));
-      break;
-    }
-    case W65C02_INT_FS_REMOVE: {
-      const char* path = ARG_STRING(0);
-      result = path == NULL ? -DAVE_HOST_EINVAL
-                            : DaveHostFilesystemRemove(path);
-      break;
-    }
-    case W65C02_INT_FS_RENAME: {
-      const char* old_path = ARG_STRING(0);
-      const char* new_path = ARG_STRING(2);
-      result = old_path == NULL || new_path == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostFilesystemRename(old_path, new_path);
-      break;
-    }
-    case W65C02_INT_FS_CURRENT_PATH: {
-      size_t capacity = ARG16(2);
-      char* buffer = ARG_PTR(0, capacity);
-      result = buffer == NULL ? -DAVE_HOST_EINVAL
-                              : DaveHostFilesystemCurrentPath(buffer,
-                                                              capacity);
-      break;
-    }
-    case W65C02_INT_FS_SET_CURRENT_PATH: {
-      const char* path = ARG_STRING(0);
-      result = path == NULL ? -DAVE_HOST_EINVAL
-                            : DaveHostFilesystemSetCurrentPath(path);
-      break;
-    }
-    case W65C02_INT_FS_READ_SYMLINK:
-    case W65C02_INT_FS_CANONICAL: {
-      const char* path = ARG_STRING(0);
-      size_t capacity = ARG16(4);
-      char* buffer = ARG_PTR(2, capacity);
-      if (path == NULL || buffer == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else if (code == W65C02_INT_FS_READ_SYMLINK) {
-        result = DaveHostFilesystemReadSymlink(path, buffer, capacity);
-      } else {
-        result = DaveHostFilesystemCanonical(path, buffer, capacity);
-      }
-      break;
-    }
-    case W65C02_INT_FS_CREATE_SYMLINK:
-    case W65C02_INT_FS_CREATE_HARD_LINK: {
-      const char* target = ARG_STRING(0);
-      const char* link = ARG_STRING(2);
-      if (target == NULL || link == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else if (code == W65C02_INT_FS_CREATE_SYMLINK) {
-        result = DaveHostFilesystemCreateSymlink(target, link);
-      } else {
-        result = DaveHostFilesystemCreateHardLink(target, link);
-      }
-      break;
-    }
-    case W65C02_INT_FS_SET_PERMISSIONS: {
-      const char* path = ARG_STRING(0);
-      result = path == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostFilesystemSetPermissions(path, ARG16(2),
-                                                      ARG16(4));
-      break;
-    }
-    case W65C02_INT_FS_RESIZE: {
-      const char* path = ARG_STRING(0);
-      const uint64_t* size = ARG_PTR(2, sizeof(uint64_t));
-      uint64_t value;
-      if (path == NULL || size == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        memcpy(&value, size, sizeof(value));
-        result = DaveHostFilesystemResize(path, value);
-      }
-      break;
-    }
-    case W65C02_INT_FS_SET_MODIFICATION_TIME: {
-      const char* path = ARG_STRING(0);
-      const int64_t* nanoseconds = ARG_PTR(2, sizeof(int64_t));
-      int64_t value;
-      if (path == NULL || nanoseconds == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        memcpy(&value, nanoseconds, sizeof(value));
-        result = DaveHostFilesystemSetModificationTime(path, value);
-      }
-      break;
-    }
-    case W65C02_INT_FS_SPACE: {
-      DaveHostFilesystemSpace host_result;
-      DaveHostFilesystemSpace* guest_result =
-          ARG_PTR(2, sizeof(host_result));
-      const char* path = ARG_STRING(0);
-      if (path == NULL || guest_result == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        result = DaveHostFilesystemQuerySpace(path, &host_result);
-        if (result == 0) {
-          memcpy(guest_result, &host_result, sizeof(host_result));
-        }
-      }
-      break;
-    }
-    case W65C02_INT_FS_COPY_FILE: {
-      const char* source = ARG_STRING(0);
-      const char* destination = ARG_STRING(2);
-      result = source == NULL || destination == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostFilesystemCopyFile(source, destination,
-                                                ARG16(4));
-      break;
-    }
-    case W65C02_INT_TZDB_VERSION: {
-      size_t capacity = ARG16(2);
-      char* buffer = ARG_PTR(0, capacity);
-      result = buffer == NULL ? -DAVE_HOST_EINVAL
-                              : DaveHostChronoTzdbVersion(buffer, capacity);
-      break;
-    }
-    case W65C02_INT_TZDB_GENERATION: {
-      uint64_t* generation = ARG_PTR(0, sizeof(uint64_t));
-      result = generation == NULL ? -DAVE_HOST_EINVAL
-                                  : DaveHostChronoGeneration(generation);
-      break;
-    }
-    case W65C02_INT_TZDB_RELOAD: {
-      uint64_t* generation = ARG_PTR(0, sizeof(uint64_t));
-      result = DaveHostChronoReload(generation);
-      break;
-    }
-    case W65C02_INT_TZDB_CURRENT_ZONE: {
-      size_t capacity = ARG16(2);
-      char* buffer = ARG_PTR(0, capacity);
-      result = buffer == NULL ? -DAVE_HOST_EINVAL
-                              : DaveHostChronoCurrentZone(buffer, capacity);
-      break;
-    }
-    case W65C02_INT_TZDB_ZONE_COUNT: {
-      uint32_t* count = ARG_PTR(0, sizeof(uint32_t));
-      result = count == NULL ? -DAVE_HOST_EINVAL
-                             : DaveHostChronoZoneCount(count);
-      break;
-    }
-    case W65C02_INT_TZDB_ZONE_NAME: {
-      size_t capacity = ARG16(4);
-      char* buffer = ARG_PTR(2, capacity);
-      result = buffer == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostChronoZoneName((uint32_t)ARG16(0), buffer, capacity);
-      break;
-    }
-    case W65C02_INT_TZDB_LOCATE_ZONE: {
-      const char* name = ARG_STRING(0);
-      size_t capacity = ARG16(4);
-      char* buffer = ARG_PTR(2, capacity);
-      uint32_t* index = ARG_PTR(6, sizeof(uint32_t));
-      result = name == NULL || buffer == NULL || index == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostChronoLocateZone(name, buffer, capacity, index);
-      break;
-    }
-    case W65C02_INT_TZDB_SYS_INFO: {
-      const char* zone = ARG_STRING(0);
-      int64_t* seconds = (int64_t*)ARG_PTR(2, 8);
-      DaveHostChronoSysInfoWire* info =
-          (DaveHostChronoSysInfoWire*)ARG_PTR(4, sizeof(DaveHostChronoSysInfoWire));
-      size_t capacity = ARG16(8);
-      char* abbrev = ARG_PTR(6, capacity);
-      if (zone == NULL || seconds == NULL || info == NULL || abbrev == NULL) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        int64_t value = 0;
-        memcpy(&value, seconds, sizeof(value));
-        result = DaveHostChronoSysInfo(zone, value, info, abbrev, capacity);
-      }
-      break;
-    }
-    case W65C02_INT_TZDB_LOCAL_INFO: {
-      const char* zone = ARG_STRING(0);
-      int64_t* seconds = (int64_t*)ARG_PTR(2, 8);
-      DaveHostChronoLocalInfoWire* info =
-          (DaveHostChronoLocalInfoWire*)ARG_PTR(4, sizeof(DaveHostChronoLocalInfoWire));
-      size_t capacity = ARG16(8);
-      char* abbrev = ARG_PTR(6, capacity * 2);
-      if (zone == NULL || seconds == NULL || info == NULL || abbrev == NULL ||
-          capacity == 0) {
-        result = -DAVE_HOST_EINVAL;
-      } else {
-        int64_t value = 0;
-        memcpy(&value, seconds, sizeof(value));
-        result = DaveHostChronoLocalInfo(zone, value, info, abbrev, capacity,
-                                         abbrev + capacity, capacity);
-      }
-      break;
-    }
-    case W65C02_INT_TZDB_LEAP_COUNT: {
-      uint32_t* count = ARG_PTR(0, sizeof(uint32_t));
-      result = count == NULL ? -DAVE_HOST_EINVAL
-                             : DaveHostChronoLeapCount(count);
-      break;
-    }
-    case W65C02_INT_TZDB_LEAP_INFO: {
-      DaveHostChronoLeapSecond* leap =
-          ARG_PTR(2, sizeof(DaveHostChronoLeapSecond));
-      result = leap == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostChronoLeapInfo((uint32_t)ARG16(0), leap);
-      break;
-    }
-    case W65C02_INT_RANDOM_BYTES: {
-      size_t size = ARG16(2);
-      void* buffer = size == 0 ? NULL : ARG_PTR(0, size);
-      result = size != 0 && buffer == NULL
-                   ? -DAVE_HOST_EINVAL
-                   : DaveHostRandomBytes(buffer, size);
-      break;
-    }
-    default:
-      result = -DAVE_HOST_ENOSYS;
-      break;
-  }
-
-  if (result == -1) {
-    SetErrno(interpreter);
-  }
-  SetSyscallResult(interpreter, result_address, result);
-
-#undef ARG16
-#undef ARG_PTR
-#undef ARG_STRING
-}
-
-
 void W65C02DisassemblePc(W65C02Interpreter* interpreter) {
-  interpreter->current_symbol =
-      LoaderFindSymbolAndCacheResult(interpreter->loader, interpreter->pc);
   Breakpoint* bp = FindBreakpoint(interpreter, interpreter->pc);
   if (bp != NULL) {
     BreakpointUninstall(interpreter, bp);
   }
-  Disassemble6502Instruction(interpreter->loader, interpreter->current_symbol, interpreter->pc,
-                            &interpreter->memory[interpreter->pc], stdout);
+  Disassemble6502Instruction(interpreter->pc, &interpreter->memory[interpreter->pc], stdout);
   if (bp != NULL) {
     BreakpointInstall(interpreter, bp);
   }
@@ -1622,8 +744,22 @@ static void UpdatePace(W65C02Interpreter* interpreter, int cycles) {
   if (interpreter->pace_cycles < 8192) {
     return;
   }
-  waiting = !interpreter->flags.bits.i && interpreter->pace_stores < 48 &&
-            (interpreter->pace_watch > 0 || interpreter->pace_sheila == 0);
+  // Split-screen and beam-ULA games keep timer 1 aligned with the raster. Turbo
+  // skips the beam and breaks that, which shows as scrolling HUD garbage.
+  if (BbcMachineNeedsRealtimeVideo(interpreter->bbc)) {
+    interpreter->turbo = false;
+    interpreter->pace_busy = 0;
+    interpreter->pace_cycles = 0;
+    interpreter->pace_stores = 0;
+    interpreter->pace_sheila = 0;
+    interpreter->pace_watch = 0;
+    return;
+  }
+  // A game that writes the screen every pass still polls the CRTC or the
+  // system VIA for vsync. Do not run ahead in that window or the MOS keyboard
+  // scan and split-screen games such as Revs lose time with the hardware.
+  waiting = !interpreter->flags.bits.i &&
+            (interpreter->pace_watch > 0 || interpreter->pace_stores < 48);
   // A cursor blink or one disc poll looks like work for a single window.
   // Drop to real time immediately, and only run ahead after the guest has
   // stayed busy, so the frame size does not flap.
@@ -1676,6 +812,11 @@ static void ChargeCycles(W65C02Interpreter* interpreter, bool cycle_accurate, in
       } else {
         due -= interpreter->turbo_owed;
       }
+    }
+    if (fast && BbcMachineNeedsRealtimeVideo(interpreter->bbc)) {
+      fast = false;
+      interpreter->turbo = false;
+      interpreter->pace_busy = 0;
     }
     if (fast && due > step_cycles && interpreter->turbo_owed + step_cycles < 1024) {
       interpreter->turbo_owed += step_cycles;
@@ -1825,6 +966,9 @@ static int MaybeTakeIrq(W65C02Interpreter* interpreter) {
     return 0;
   }
   if (interpreter->bbc != NULL && BbcMachineIrqPending(interpreter->bbc)) {
+    if (BbcMachineDeferUserViaT1Irq(interpreter->bbc)) {
+      return 0;
+    }
     W65C02TakeIrq(interpreter);
     return 7;
   }
@@ -1833,6 +977,30 @@ static int MaybeTakeIrq(W65C02Interpreter* interpreter) {
     return 7;
   }
   return 0;
+}
+
+static void BbcSyncIrqFromVideo(void* ctx) {
+  W65C02Interpreter* interpreter = ctx;
+  BbcMachine* bbc;
+  int guard;
+  int depth;
+  if (interpreter == NULL || interpreter->bbc == NULL || interpreter->flags.bits.i) {
+    return;
+  }
+  bbc = interpreter->bbc;
+  if (!BbcMachineUserViaT1Pending(bbc) && !BbcMachineSysViaT1Pending(bbc)) {
+    return;
+  }
+  W65C02TakeIrq(interpreter);
+  depth = interpreter->in_irq;
+  BbcMachineSetVideoIrqDispatch(bbc, true);
+  for (guard = 0; guard < 4096; guard++) {
+    if (interpreter->in_irq < depth) {
+      break;
+    }
+    StepOneInstruction(interpreter, true);
+  }
+  BbcMachineSetVideoIrqDispatch(bbc, false);
 }
 
 static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurate) {
@@ -1872,8 +1040,8 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
   }
   uint8_t opcode = interpreter->memory[interpreter->pc];
   // Columns x3, x7, xB and xF are one-byte, one-cycle NOPs on the G65SC12.
-  // The other unused opcodes are multi-byte NOPs. Rockwell BBR/RMB and the
-  // davecc $EF syscall are not part of this CPU.
+  // The other unused opcodes are multi-byte NOPs. Rockwell BBR/RMB are not
+  // part of this CPU.
   if (interpreter->sc12 && !(interpreter->debug && opcode == 0xff)) {
     int nop_bytes = 0;
     int nop_cycles = 0;
@@ -2016,7 +1184,6 @@ bool W65C02InterpreterPrepareBbc(W65C02Interpreter* interpreter) {
   interpreter->pc = (uint16_t)(interpreter->memory[0xfffc] |
                                (interpreter->memory[0xfffd] << 8));
   interpreter->running = true;
-  interpreter->exit_code = 0;
   return true;
 }
 
@@ -2072,268 +1239,6 @@ void W65C02InterpreterBbcUse65C02(W65C02Interpreter* interpreter, bool enable) {
     interpreter->nmos = false;
     interpreter->jammed = false;
   }
-}
-
-void W65C02Reset(W65C02Interpreter* interpreter) {
-  // Write entry address into zero page 0,1
-  interpreter->memory[0] = interpreter->entry_address & 0xff;
-  interpreter->memory[1] = (interpreter->entry_address >> 8) & 0xff;
-
-  // Start execution at the reset handler.
-  interpreter->pc = interpreter->memory[0xfffc] | interpreter->memory[0xfffd] << 8;
-  
-  interpreter->stop_at_next_instruction = false;
-}
-
-#define RESET_HANDLER 0xff00
-#define IRQ_HANDLER 0xff80
-
-#define VECTOR_RAM 0xfd00
-
-static bool W65C02CopyGuestArgv(W65C02Interpreter* interpreter, int argc,
-                                char** argv, int first_arg,
-                                int* guest_argc_out) {
-  if (argv == NULL || first_arg <= 0 || first_arg > argc) {
-    return false;
-  }
-
-  int guest_argc = argc - first_arg + 1;
-  size_t pointer_bytes = (size_t)(guest_argc + 1) * 2;
-  size_t argv_capacity = W65C02_GUEST_ARGV_END - W65C02_GUEST_ARGV_START;
-  if (pointer_bytes > argv_capacity) {
-    return false;
-  }
-  size_t string_bytes = 0;
-  for (int i = first_arg - 1; i < argc; ++i) {
-    size_t len = strlen(argv[i]) + 1;
-    if (len > argv_capacity - pointer_bytes - string_bytes) {
-      return false;
-    }
-    string_bytes += len;
-  }
-
-  uint16_t string_address =
-      (uint16_t)(W65C02_GUEST_ARGV_START + pointer_bytes);
-  for (int i = 0; i < guest_argc; ++i) {
-    int host_index = first_arg - 1 + i;
-    size_t len = strlen(argv[host_index]) + 1;
-    uint16_t pointer_address =
-        (uint16_t)(W65C02_GUEST_ARGV_START + i * 2);
-    interpreter->memory[pointer_address] = string_address & 0xff;
-    interpreter->memory[pointer_address + 1] = string_address >> 8;
-    memcpy(interpreter->memory + string_address, argv[host_index], len);
-    string_address = (uint16_t)(string_address + len);
-  }
-  uint16_t terminator =
-      (uint16_t)(W65C02_GUEST_ARGV_START + guest_argc * 2);
-  interpreter->memory[terminator] = 0;
-  interpreter->memory[terminator + 1] = 0;
-  *guest_argc_out = guest_argc;
-  return true;
-}
-
-int W65C02InterpreterRun(W65C02Interpreter* interpreter, Loader* loader,
-                         uint64_t entry_address, int argc, char** argv,
-                         int first_arg) {
-  interpreter->memory = calloc(65536, 1);    // 64K of memory.
-  interpreter->s = 0xff;
-  interpreter->zero_page = (uint8_t*)interpreter->memory;
-  interpreter->stack = (uint8_t*)interpreter->memory + interpreter->s + 0x100;
-  interpreter->loader = loader;
-  if (interpreter->bbc != NULL) {
-    BbcMachineSetRam(interpreter->bbc, interpreter->memory);
-  }
-  
-  // Load the support ROM unless a BBC OS image will occupy &C000.
-  if (interpreter->rom_filename.length > 0) {
-    Loader rom_loader;
-    bool ok = LoaderInitFromFile(&rom_loader,
-                                 &interpreter->rom_filename,
-                                 loader->flags, loader->arch, loader->arch_data, NULL);
-    if (!ok) {
-      fprintf(stderr, "Unable to load ROM from file '%s'\n", interpreter->rom_filename.value);
-      exit(1);
-    }
-    for (size_t i = 1; i < rom_loader.regions.length; i++) {
-      Region* region = rom_loader.regions.value.p[i];
-      for (size_t section_index = 0; section_index < region->sections.length; section_index++) {
-        ELFReaderSection* section = region->sections.value.p[section_index];
-        void* section_addr = (char*)region->address + section->header->offset - region->offset;
-        memcpy(interpreter->memory+section->header->addr, section_addr, section->header->size);
-      }
-    }
-  }
- 
-  
-  // Find address of __enter because the entry sequence contains
-  // a register save mask (3 bytes after JSR __enter).
-  interpreter->enter_func = LoaderLookupSymbol(loader, "__enter");
-  interpreter->enter_leaf_func = LoaderLookupSymbol(loader, "__enter_leaf");
-
-  // Copy the memory mapped in from the file into the interpreter's
-  // memory.
-  int memtop = 0;
-  for (size_t i = 1; i < loader->regions.length; i++) {
-    Region* region = loader->regions.value.p[i];
-    for (size_t section_index = 0; section_index < region->sections.length; section_index++) {
-      ELFReaderSection* section = region->sections.value.p[section_index];
-      int top = (int)section->header->addr + (int)section->header->size;
-      if (section->header->type == SHT(nobits)) {
-        if (top > memtop) {
-          memtop = top;
-        }
-        continue;
-      }
-      void* section_addr = (char*)region->address + section->header->offset - region->offset;
-      memcpy(interpreter->memory+section->header->addr, section_addr, section->header->size);
-      if (top > memtop) {
-        memtop = top;
-      }
-    }
-  }
-  if (interpreter->bbc != NULL) {
-    if (interpreter->bbc_os_path != NULL &&
-        !BbcMachineLoadOs(interpreter->bbc, interpreter->bbc_os_path)) {
-      exit(1);
-    }
-    BbcMachineMapSideways(interpreter->bbc);
-    if (interpreter->bbc_initial_mode >= 0) {
-      BbcMachineSelectMode(interpreter->bbc, interpreter->bbc_initial_mode);
-    }
-    // An OS image is a Model B, so the CPU is the NMOS 6502. -bbc-65c02
-    // keeps the CMOS core. A Master always runs the 65C02. A davecc program
-    // with no OS image stays a 65C02.
-    if (interpreter->bbc_os_path != NULL) {
-      if (BbcMachineIsMaster(interpreter->bbc)) {
-        interpreter->bbc_65c02 = true;
-      }
-      interpreter->nmos = !interpreter->bbc_65c02;
-      interpreter->jammed = false;
-    }
-  }
-  int num_args = 0;
-  // Need some space for the stack.
-  if (memtop > 0xbe00) {
-    printf("Program is too big\n");
-    exit(1);
-  }
-  interpreter->entry_address = (int)entry_address;
-  
-  W65C02SetupGuestStartupStack(interpreter);
-  if (!W65C02GuestRunInitArrays(loader, interpreter)) {
-    fprintf(stderr, "Error running guest init arrays\n");
-    exit(1);
-  }
-
-  // Page 5 through the start of the linked program is reserved for argv.
-  // Populate it after loading sections and running constructors so neither
-  // can overwrite it. Include argv[0] and the required null sentinel.
-  if (!W65C02CopyGuestArgv(interpreter, argc, argv, first_arg, &num_args)) {
-    fprintf(stderr, "Program arguments exceed 6502 guest argv space\n");
-    return 1;
-  }
-
-  // Guest constructors use the normal zero-page calling convention and may
-  // clobber i0. Restore argc only after they finish so _start can push the
-  // correct value for main.
-  interpreter->memory[REG_I0] = num_args & 0xff;
-  interpreter->memory[REG_I0 + 1] = (num_args >> 8) & 0xff;
-
-  // Write entry address into zero page 0,1
-  interpreter->memory[0] = entry_address & 0xff;
-  interpreter->memory[1] = (entry_address >> 8) & 0xff;
-
-  // Start execution at the reset handler.
-  interpreter->pc = interpreter->memory[0xfffc] | interpreter->memory[0xfffd] << 8;
-
-  if (interpreter->debug) {
-    interpreter->stop_at_next_instruction = true;
-  }
-
-  interpreter->running = true;
-  interpreter->exit_code = 0;
-
-  // Run processor by fetching instruction at PC and jumping to the handler
-  // function for that opcode.  Each handler function will set the PC to
-  // the next instruction address.
-  while (interpreter->running) {
-    if (interpreter->bbc_step_limit != 0 &&
-        interpreter->bbc_steps >= interpreter->bbc_step_limit) {
-      fprintf(stderr, "bbc: stopped after %llu instructions\n",
-              (unsigned long long)interpreter->bbc_steps);
-      interpreter->running = false;
-      break;
-    }
-    {
-      int step_cycles = StepOneInstruction(interpreter, true);
-      if (step_cycles > 0 && interpreter->bbc != NULL) {
-        BbcMachineRunParasite(interpreter->bbc, step_cycles);
-      }
-    }
-    interpreter->bbc_steps++;
-  }
-  if (!W65C02GuestRunFiniArrays(loader, interpreter)) {
-    return 1;
-  }
-  return interpreter->exit_code;
-}
-
-void W65C02InterpreterDisassemble(W65C02Interpreter* interpreter, Loader* loader) {
-  for (size_t i = 1; i < loader->regions.length; i++) {
-    Region* region = loader->regions.value.p[i];
-    for (size_t section_index = 0; section_index < region->sections.length; section_index++) {
-      ELFReaderSection* section = region->sections.value.p[section_index];
-      if ((section->header->flags & SHF(execinstr)) != 0) {
-        void* addr = (void*)((char*)region->address + section->header->offset);
-        void* end_addr = addr + section->header->size;
-        uint16_t pc = section->header->addr;
-        SymbolScope* symbol = NULL;
-        while (addr <= end_addr) {
-          symbol =
-              LoaderFindSymbolAndCacheResult(loader, pc);
-          void* new_addr = Disassemble6502Instruction(loader, symbol, pc, addr, stdout);
-          pc += new_addr - addr;
-          addr = new_addr;
-        }
-      }
-    }
-  }
-  
-}
-
-// Extract the contents of the EXE file into a binary file containing
-// only the sections with data.  This will be .text and .data sections
-// containing code and static data.  This can be burned into a ROM.
-void W65C02InterpreterExtract(W65C02Interpreter* interpreter, Loader* loader, FILE* fp) {
-  char* memory = calloc(65536, 1);
-  char* start_memory = memory + 65536;
-  char* end_memory = memory;
-  
-  // Copy all section contents to the temporary memory at the correct address.
-  for (size_t i = 1; i < loader->regions.length; i++) {
-    Region* region = loader->regions.value.p[i];
-    for (size_t section_index = 0; section_index < region->sections.length; section_index++) {
-      ELFReaderSection* section = region->sections.value.p[section_index];
-      if (section->header->size == 0) {
-        continue;
-      }
-      void* section_addr = (char*)region->address + section->header->offset;
-      memcpy(memory+section->header->addr, section_addr, section->header->size);
-      
-      // Calculate limits of data.
-      char* start_addr = memory+section->header->addr;
-      if (start_addr < start_memory) {
-        start_memory = start_addr;
-      }
-      char* end_addr = memory+section->header->addr + section->header->size;
-      if (end_addr > end_memory) {
-        end_memory = end_addr;
-      }
-    }
-  }
-  // Write the memory to the file.
-  fwrite(start_memory, end_memory - start_memory, 1, fp);
-  free(memory);
 }
 
 void W65C02InterpreterDestruct(W65C02Interpreter* interpreter) {
@@ -3973,10 +2878,6 @@ W65C02_instruction_def(tax) {
 
 W65C02_instruction_def(txs) {
   interpreter->s = interpreter->x;
-  // TXS does not change the flags. The davecc CMOS core historically did.
-  if (!interpreter->sc12) {
-    SET_FLAGS(interpreter->s);
-  }
   INC_PC(1);
 }
 
@@ -3989,14 +2890,6 @@ W65C02_instruction_def(txy) {
 // *************************************************************************
 // Additional
 // *************************************************************************
-
-// Software break.  Called from hardware BRK handler.  On entry we have
-// A = value of byte after BRK instruction.
-W65C02_instruction_def(sbrk) {
-  // Interpreted 6502 BRK.
-  INC_PC(1);            // Move PC to byte after BRK.
-  BrkHandler(interpreter, interpreter->a);
-}
 
 W65C02_instruction_def(bpt) {
   // Uninstall the current breakpoint.

@@ -105,7 +105,6 @@ cc_library(
     name = "6502_lib",
     srcs = [
         "6502_interpreter/6502_debugger.c",
-        "6502_interpreter/6502_devices.c",
         "6502_interpreter/6502_disassembler.c",
         "6502_interpreter/6502_interpreter.c",
         "6502_interpreter/6502_nmos.c",
@@ -113,22 +112,16 @@ cc_library(
         "6502_interpreter/arm_client.c",
         "6502_interpreter/arm_tube.c",
         "6502_interpreter/bbc_hardware.c",
+        "6502_interpreter/bbc_beam_ula.c",
         "6502_interpreter/tube.c",
         "6502_interpreter/tube_client.c",
         "6502_interpreter/tube_cpu.c",
     ],
-    hdrs = glob(["6502_interpreter/*.h"]) + [
-        "c_compiler/6502/6502_machine.h",
-    ],
+    hdrs = glob(["6502_interpreter/*.h"]),
     copts = COMMON_COPTS,
     includes = COMMON_INCLUDES,
     linkopts = ["-lpthread"],
     deps = [
-        ":elf",
-        ":chrono_host",
-        ":filesystem_host",
-        ":random_host",
-        ":loader",
         ":utils",
     ],
 )
@@ -160,6 +153,15 @@ cc_binary(
     ],
     copts = COMMON_COPTS,
     includes = COMMON_INCLUDES,
+)
+
+cc_binary(
+    name = "joystick",
+    srcs = ["6502_interpreter/joystick_host_mac.m"],
+    copts = COMMON_COPTS + ["-x", "objective-c", "-fobjc-arc"],
+    includes = COMMON_INCLUDES,
+    linkopts = ["-framework AppKit"],
+    target_compatible_with = ["@platforms//os:macos"],
 )
 
 cc_binary(
@@ -238,6 +240,7 @@ cc_test(
     name = "bbc_hardware_test",
     srcs = [
         "6502_interpreter/bbc_hardware.c",
+        "6502_interpreter/bbc_beam_ula.c",
         "6502_interpreter/bbc_hardware_test.c",
         "6502_interpreter/tube.c",
     ] + glob(["6502_interpreter/*.h"]),
