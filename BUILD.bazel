@@ -155,12 +155,28 @@ cc_binary(
     includes = COMMON_INCLUDES,
 )
 
-cc_binary(
-    name = "joystick",
-    srcs = ["6502_interpreter/joystick_host_mac.m"],
+cc_library(
+    name = "joystick_ui",
+    srcs = ["6502_interpreter/joystick_host.c"],
+    hdrs = [
+        "6502_interpreter/bbc_platform.h",
+        "6502_interpreter/joystick.h",
+        "6502_interpreter/joystick_host_mac.m",
+    ],
     copts = COMMON_COPTS + ["-x", "objective-c", "-fobjc-arc"],
     includes = COMMON_INCLUDES,
-    linkopts = ["-framework AppKit"],
+    target_compatible_with = ["@platforms//os:macos"],
+)
+
+cc_binary(
+    name = "joystick",
+    srcs = ["6502_interpreter/joystick_entry.c"],
+    copts = COMMON_COPTS,
+    linkopts = [
+        "-framework",
+        "AppKit",
+    ],
+    deps = [":joystick_ui"],
     target_compatible_with = ["@platforms//os:macos"],
 )
 

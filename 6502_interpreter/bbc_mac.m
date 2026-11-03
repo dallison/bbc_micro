@@ -20,6 +20,7 @@
 #include "bbc_session.h"
 
 #include <mach/mach_time.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -837,6 +838,38 @@ static void UseHostFunctionKeys(bool enable) {
   }
 }
 
+// Put the top row, the volume-up remap, and the Dock shortcut back. Called
+// on resign, quit, atexit, and from the signal sources below so a kill from
+// the terminal cannot leave the host keyboard stuck on F1-F12.
+static void RestoreHostKeyboard(void) {
+  UseHostFunctionKeys(false);
+  UseDockKeyAsBreak(false);
+}
+
+static void InstallKeyboardSignalHandlers(void) {
+  static const int kSignals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+  static dispatch_source_t sources[sizeof(kSignals) / sizeof(kSignals[0])];
+  size_t i;
+  atexit(RestoreHostKeyboard);
+  for (i = 0; i < sizeof(kSignals) / sizeof(kSignals[0]); i++) {
+    int sig = kSignals[i];
+    dispatch_source_t source =
+        dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, (uintptr_t)sig, 0,
+                               dispatch_get_main_queue());
+    if (source == NULL) {
+      continue;
+    }
+    // Deliver the signal to GCD instead of terminating at once.
+    signal(sig, SIG_IGN);
+    dispatch_source_set_event_handler(source, ^{
+      RestoreHostKeyboard();
+      [NSApp terminate:nil];
+    });
+    dispatch_resume(source);
+    sources[i] = source;
+  }
+}
+
 // A keyboard that ignores the switch still sends the picture on the key.
 // On an Apple row the last key is volume up, which is where F12 sits.
 static bool SpecialIsBreak(int type) { return type == NX_KEYTYPE_SOUND_UP; }
@@ -992,8 +1025,7 @@ static NSEvent* _Nullable SpecialKeyEvent(NSEvent* event) {
 
 - (void)applicationWillTerminate:(NSNotification*)notification {
   (void)notification;
-  UseHostFunctionKeys(false);
-  UseDockKeyAsBreak(false);
+  RestoreHostKeyboard();
   [self.timer invalidate];
   if (self.audioQueue != NULL) {
     AudioQueueStop(self.audioQueue, true);
@@ -1037,6 +1069,7 @@ int main(int argc, char** argv) {
     if (!BbcSessionStart(argc, argv, &status)) {
       return status;
     }
+    InstallKeyboardSignalHandlers();
     NSApplication* app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyRegular];
     BbcController* controller = [[BbcController alloc] init];
@@ -1051,6 +1084,7 @@ int main(int argc, char** argv) {
     appItem.submenu = appMenu;
     app.mainMenu = bar;
     [app run];
+    RestoreHostKeyboard();
     BbcSessionFinish();
   }
   return 0;
