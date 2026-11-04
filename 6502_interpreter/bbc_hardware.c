@@ -806,7 +806,10 @@ static uint8_t ViaRead(BbcMachine* bbc, BbcVia* via, bool system, int reg) {
     case 1:
     case 15:
       // PCR bit 0 clear: reading the A port clears the CA1 (vsync) flag.
-      if ((via->pcr & 0x01) == 0) {
+      // Register 15 is the same port without handshake and leaves the flags
+      // alone: the MOS scans the keyboard through it with interrupts off, and
+      // clearing CA1 there dropped any vsync that landed during a scan.
+      if (reg == 1 && (via->pcr & 0x01) == 0) {
         via->ifr &= (uint8_t)~0x02;
       }
       if (system) {
