@@ -123,6 +123,30 @@ int main(void) {
   EXPECT(cpu.flags.bits.c == 1);
   EXPECT(cpu.flags.bits.v == 1);
 
+  // ORA, AND and EOR (zp) use the byte the zero-page pointer addresses, not
+  // the pointer itself. MOS 3.50 matches * command names with EOR ($B0).
+  cpu.nmos = false;
+  mem[0xb0] = 0x37;
+  mem[0xb1] = 0x81;
+  mem[0x8137] = 0x43;
+  mem[0x720] = 0x52;
+  mem[0x721] = 0xb0;
+  mem[0x722] = 0x12;
+  mem[0x723] = 0xb0;
+  mem[0x724] = 0x32;
+  mem[0x725] = 0xb0;
+  cpu.a = 0x43;
+  cpu.pc = 0x720;
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.a == 0x00);
+  EXPECT(cpu.flags.bits.z == 1);
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.a == 0x43);
+  cpu.a = 0x0f;
+  EXPECT(W65C02InterpreterStep(&cpu) > 0);
+  EXPECT(cpu.a == 0x03);
+  EXPECT(cpu.pc == 0x726);
+
   free(mem);
   if (g_failures != 0) {
     fprintf(stderr, "%d NMOS checks failed\n", g_failures);
