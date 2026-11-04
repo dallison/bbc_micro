@@ -33,6 +33,11 @@ mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 sed "s/@VERSION@/${VERSION}/g" "${ROOT}/macos/Info.plist" > "${APP}/Contents/Info.plist"
 cp "${BUILD}/bbc" "${APP}/Contents/MacOS/bbc"
 chmod 755 "${APP}/Contents/MacOS/bbc"
+if [[ -f "${ROOT}/macos/AppIcon.icns" ]]; then
+  cp "${ROOT}/macos/AppIcon.icns" "${APP}/Contents/Resources/AppIcon.icns"
+elif [[ -f "${ROOT}/macos/bbc.jpg" ]]; then
+  "${ROOT}/macos/make_icon.sh" "${ROOT}/macos/bbc.jpg" "${APP}/Contents/Resources/AppIcon.icns"
+fi
 
 cp "${BUILD}/cumana" "${STAGE}/cumana"
 cp "${BUILD}/fileserver" "${STAGE}/fileserver"
@@ -41,7 +46,8 @@ cp "${BUILD}/6502" "${STAGE}/6502"
 chmod 755 "${STAGE}/cumana" "${STAGE}/fileserver" "${STAGE}/cassette" "${STAGE}/6502"
 ln -s "BBC Micro.app/Contents/MacOS/bbc" "${STAGE}/bbc"
 
-for script in blank_disc.py blank_tape.py copy_from_disc.py copy_to_hd.py examine_disc.py; do
+for script in blank_disc.py blank_tape.py copy_from_disc.py copy_to_hd.py examine_disc.py \
+    install_rom.py; do
   cp "${ROOT}/${script}" "${STAGE}/${script}"
   chmod 755 "${STAGE}/${script}"
 done

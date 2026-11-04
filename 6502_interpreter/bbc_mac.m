@@ -1062,6 +1062,45 @@ static int HostKeyboard(void) {
   return kind;
 }
 
+// Dock icon for an .app bundle comes from Info.plist. When running the
+// bare binary (bazel-bin/bbc, ./bbc), load AppIcon.icns ourselves.
+static void ApplyDockIcon(void) {
+  NSMutableArray<NSString*>* candidates = [NSMutableArray array];
+  NSString* bundled =
+      [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+  if (bundled != nil) {
+    [candidates addObject:bundled];
+  }
+  NSString* exe = [[NSBundle mainBundle] executablePath];
+  if (exe.length > 0) {
+    NSString* dir = [exe stringByDeletingLastPathComponent];
+    [candidates addObject:[dir stringByAppendingPathComponent:@"AppIcon.icns"]];
+    [candidates
+        addObject:[[dir stringByAppendingPathComponent:@"../Resources"]
+                      stringByAppendingPathComponent:@"AppIcon.icns"]];
+    // bazel run //:bbc places the icns under the binary's runfiles tree.
+    for (NSString* ws in @[ @"_main", @"__main__", @"bbc_micro" ]) {
+      [candidates
+          addObject:[NSString stringWithFormat:@"%@.runfiles/%@/macos/AppIcon.icns",
+                                               exe, ws]];
+    }
+  }
+  [candidates addObject:@"macos/AppIcon.icns"];
+  [candidates addObject:@"AppIcon.icns"];
+  for (NSString* path in candidates) {
+    NSString* resolved = path.stringByStandardizingPath;
+    if (resolved.length == 0 ||
+        ![[NSFileManager defaultManager] isReadableFileAtPath:resolved]) {
+      continue;
+    }
+    NSImage* image = [[NSImage alloc] initWithContentsOfFile:resolved];
+    if (image != nil) {
+      [NSApp setApplicationIconImage:image];
+      return;
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     int status = 1;
@@ -1072,6 +1111,7 @@ int main(int argc, char** argv) {
     InstallKeyboardSignalHandlers();
     NSApplication* app = [NSApplication sharedApplication];
     [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+    ApplyDockIcon();
     BbcController* controller = [[BbcController alloc] init];
     app.delegate = controller;
     NSMenu* bar = [[NSMenu alloc] init];

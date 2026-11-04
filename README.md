@@ -35,7 +35,14 @@ On Windows `bbc.exe` uses GDI and waveOut, which every install has. It builds wi
 
 ## ROMs
 
-`bbc_b_rom_sockets` is the Model B. `bbc_master_rom_sockets` is the Master. `os.rom` or `os-<name>.rom` is the operating system. `<socket>-<name>.rom` is sideways socket 0–15, for example `15-basic2.rom` and `14-adfs-1.30.rom`.
+`bbc_b_rom_sockets` is the Model B. `bbc_master_rom_sockets` is the Master. `os.rom` or `os-<name>.rom` is the operating system. `<socket>-<name>.rom` is sideways socket 0–15, for example `15-basic2.rom` and `14-adfs-1.30.rom`. Extra images in the same socket are `<socket>.<virtual>-<name>.rom`, with virtual 0–7.
+
+```
+python3 install_rom.py -m master os ~/roms/os-3.50.rom
+python3 install_rom.py -m master 15 ~/roms/terminal.rom
+python3 install_rom.py -m master --name libc 8 ~/roms/libc.rom
+python3 install_rom.py -m master --name libm 8.1 ~/roms/libm.rom
+```
 
 DFS and ADFS images can both stay in that directory. Each is fitted in the socket named by its file, and Break selects the one in the higher socket, as on the machine. `*DISC` and `*ADFS` select the other. The disc controller follows the ROM that uses the drive, so an 8271 DFS and ADFS can both be present. If both files name the same socket, the second is fitted in the highest free socket. `-fs dfs` or `-fs adfs` loads only that one. `-fdc` forces the controller.
 

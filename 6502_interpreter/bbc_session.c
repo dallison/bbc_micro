@@ -612,6 +612,17 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   } else if (BbcMachineIsMaster(g_cpu.bbc)) {
     W65C02InterpreterBbcSetFdc(&g_cpu, BBC_FDC_1770);
   }
+  if (BbcMachineIsMaster(g_cpu.bbc)) {
+    int file_slot = -1;
+    if (filing != BBC_FS_ANY) {
+      file_slot = BbcMachineFilingSocket(g_cpu.bbc, filing);
+    } else if (BbcMachineFilingSocket(g_cpu.bbc, BBC_FS_ADFS) < 0) {
+      // CMOS defaults to ADFS. Without that ROM, Break would select an empty
+      // socket; use DFS when it is the only filing system fitted.
+      file_slot = BbcMachineFilingSocket(g_cpu.bbc, BBC_FS_DFS);
+    }
+    BbcMachineConfigureFiling(g_cpu.bbc, file_slot);
+  }
   if (use_65c02 || BbcMachineIsMaster(g_cpu.bbc)) {
     W65C02InterpreterBbcUse65C02(&g_cpu, true);
   }

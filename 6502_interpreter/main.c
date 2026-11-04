@@ -433,6 +433,15 @@ int main(int argc, char *argv[]) {
     } else if (BbcMachineIsMaster(interpreter.bbc)) {
       W65C02InterpreterBbcSetFdc(&interpreter, BBC_FDC_1770);
     }
+    if (BbcMachineIsMaster(interpreter.bbc)) {
+      int file_slot = -1;
+      if (filing != BBC_FS_ANY) {
+        file_slot = BbcMachineFilingSocket(interpreter.bbc, filing);
+      } else if (BbcMachineFilingSocket(interpreter.bbc, BBC_FS_ADFS) < 0) {
+        file_slot = BbcMachineFilingSocket(interpreter.bbc, BBC_FS_DFS);
+      }
+      BbcMachineConfigureFiling(interpreter.bbc, file_slot);
+    }
     if (bbc_65c02 || BbcMachineIsMaster(interpreter.bbc)) {
       W65C02InterpreterBbcUse65C02(&interpreter, true);
     }

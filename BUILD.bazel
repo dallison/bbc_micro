@@ -215,6 +215,11 @@ cc_library(
     target_compatible_with = ["@platforms//os:macos"],
 )
 
+filegroup(
+    name = "mac_app_icon",
+    srcs = ["macos/AppIcon.icns"],
+)
+
 cc_binary(
     name = "bbc",
     srcs = select({
@@ -222,6 +227,10 @@ cc_binary(
         "//conditions:default": ["6502_interpreter/bbc_entry.c"],
     }),
     copts = COMMON_COPTS,
+    data = select({
+        "@platforms//os:macos": [":mac_app_icon"],
+        "//conditions:default": [],
+    }),
     linkopts = select({
         "@platforms//os:linux": [
             "-lX11",

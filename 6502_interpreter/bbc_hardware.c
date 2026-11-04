@@ -6044,6 +6044,32 @@ static void DiscService(BbcMachine* bbc) {
   }
 }
 
+int BbcMachineFilingSocket(const BbcMachine* bbc, int filing) {
+  int slot;
+  int found = -1;
+  if (bbc == NULL || (filing != BBC_FS_DFS && filing != BBC_FS_ADFS)) {
+    return -1;
+  }
+  for (slot = 0; slot < 16; slot++) {
+    if (bbc->sideways_loaded[slot] && bbc->rom_fs[slot] == filing) {
+      found = slot;
+    }
+  }
+  return found;
+}
+
+void BbcMachineConfigureFiling(BbcMachine* bbc, int slot) {
+  if (bbc == NULL || !bbc->master) {
+    return;
+  }
+  // Location 11 bit 6: clear is NODIR.
+  bbc->cmos[25] = (uint8_t)(bbc->cmos[25] & (uint8_t)~0x40);
+  if (slot >= 0 && slot <= 15) {
+    // Location 5 low nibble is CONFIGURE FILE.
+    bbc->cmos[19] = (uint8_t)((bbc->cmos[19] & 0xf0) | (slot & 0x0f));
+  }
+}
+
 void BbcMachineSetFdc(BbcMachine* bbc, int kind) {
   if (bbc == NULL || (kind != BBC_FDC_8271 && kind != BBC_FDC_1770)) {
     return;
@@ -6515,9 +6541,12 @@ bool BbcMachineSetModel(BbcMachine* bbc, int model) {
     // A flat battery reads as zeros, and a zero checksum selects ROM 0.
     // These are the user bytes MOS 3.50 keeps: language 12 (BASIC) and
     // filing system 13 (ADFS). MOS replaces them if its own checksum fails.
+    // Location 11 bit 6 is DIR/NODIR. Leave NODIR set so ADFS and DFS do not
+    // wait on an empty drive before the language starts; *ROMS and friends
+    // live in the Terminal ROM and need that prompt.
     static const uint8_t kCmosUser[] = {
         0x00, 0xfe, 0x00, 0xeb, 0x00, 0xcd, 0xff, 0xff, 0x15, 0x00, 0x17,
-        0x48, 0x32, 0x08, 0x0a, 0x2d, 0x82,
+        0x08, 0x32, 0x08, 0x0a, 0x2d, 0x82,
     };
     int byte;
     bool blank = true;

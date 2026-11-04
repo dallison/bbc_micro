@@ -149,6 +149,12 @@ bool BbcMachineJoystickRemoteActive(const BbcMachine* bbc);
 int BbcMachineOpenEconet(BbcMachine* bbc, int station, int port);
 void BbcMachineSetFdc(BbcMachine* bbc, int kind);
 void BbcMachineResetFdc(BbcMachine* bbc);
+// Master CMOS: select the default filing-system ROM (CONFIGURE FILE n) and
+// clear DIR so startup does not wait for a disc. slot -1 keeps the current
+// FILE number and only applies NODIR.
+void BbcMachineConfigureFiling(BbcMachine* bbc, int slot);
+// Highest sideways socket holding that filing system, or -1 when none.
+int BbcMachineFilingSocket(const BbcMachine* bbc, int filing);
 // Latched by a falling edge on the FDC interrupt. The CPU consumes it.
 bool BbcMachineNmiPending(const BbcMachine* bbc);
 void BbcMachineClearNmi(BbcMachine* bbc);
