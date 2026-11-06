@@ -221,11 +221,16 @@ cc_binary(
         "@platforms//os:linux": ["6502_interpreter/bbc_linux.c"],
         "//conditions:default": ["6502_interpreter/bbc_entry.c"],
     }),
-    copts = COMMON_COPTS,
+    # Linux sound needs libasound2-dev, the same package CMake looks for.
+    copts = COMMON_COPTS + select({
+        "@platforms//os:linux": ["-DBBC_HAVE_ALSA=1"],
+        "//conditions:default": [],
+    }),
     linkopts = select({
         "@platforms//os:linux": [
             "-lX11",
             "-lpthread",
+            "-lasound",
         ],
         "//conditions:default": [
             "-framework",

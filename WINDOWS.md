@@ -34,6 +34,8 @@ cmake --build build-win
 ctest --test-dir build-win
 ```
 
+Use that `PATH` only for the Windows CMake build. Leave it set when you run `bazel build //:bbc` for Linux and Bazel's host toolchain can pick up `.wintools/llvm-mingw/bin/ld.lld`, after which the Linux link fails with `invalid linker name in argument '-fuse-ld=...'`. Drop `.wintools` from `PATH`, then `bazelisk sync --configure` (or `bazelisk clean --expunge`) before building the Linux `bbc` again.
+
 When Wine is on `PATH` at configure time, `ctest` runs each test `.exe` under it. Start the window the same way:
 
 ```
