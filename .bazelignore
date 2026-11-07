@@ -1,0 +1,5 @@
+# Wine / llvm-mingw tree from windows_tools.sh. Keep it off Bazel's file
+# watch, and do not put it on PATH when configuring the Linux host C++
+# toolchain or Bazel will remember the MinGW linker.
+.wintools
+build-win
