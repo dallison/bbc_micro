@@ -33,9 +33,15 @@ typedef struct {
   int column;
   int row;
   int shift_force;
+  int frames;
+  bool released;
 } HeldKey;
 
 static bool g_host_shift = false;
+static bool g_shift_l = false;
+static bool g_shift_r = false;
+static bool g_ctrl_l = false;
+static bool g_ctrl_r = false;
 static HeldKey g_held[16];
 // Typing presses stay down for two frames, then come up. The MOS toggles
 // Caps Lock on the scan after it first sees the key, so the click has to
@@ -51,10 +57,19 @@ static int g_win_w = 640;
 static int g_win_h = 512;
 static int g_sized_w = 0;
 static int g_sized_h = 0;
+static uint8_t g_prev_fb[BBC_FB_WIDTH * BBC_FB_HEIGHT * 3];
+static int g_prev_src_w = 0;
+static int g_prev_src_h = 0;
+static int g_prev_win_w = 0;
+static int g_prev_win_h = 0;
+static bool g_force_full_blit = true;
 static Atom g_wm_delete = 0;
 static bool g_running = true;
 static int g_fire0 = 0;
 static int g_fire1 = 0;
+static int g_ptr_x = 0;
+static int g_ptr_y = 0;
+static bool g_ptr_valid = false;
 static int g_rshift = 0;
 static int g_gshift = 0;
 static int g_bshift = 0;
@@ -88,7 +103,7 @@ static void SyncShift(void) {
   BbcMachineSetKey(g_cpu.bbc, 0, 0, forced >= 0 ? forced != 0 : g_host_shift);
 }
 
-static void ReleaseHostKey(unsigned code) {
+static void ReleaseHostKeyNow(unsigned code) {
   int i;
   for (i = 0; i < 16; i++) {
     if (!g_held[i].used || g_held[i].code != code) {
@@ -96,8 +111,42 @@ static void ReleaseHostKey(unsigned code) {
     }
     BbcMachineSetKey(g_cpu.bbc, g_held[i].column, g_held[i].row, false);
     g_held[i].used = false;
+    g_held[i].frames = 0;
+    g_held[i].released = false;
   }
   SyncShift();
+}
+
+static void ReleaseHostKey(unsigned code) {
+  int i;
+  for (i = 0; i < 16; i++) {
+    if (!g_held[i].used || g_held[i].code != code) {
+      continue;
+    }
+    // Keep a tap down for two 50 Hz frames so the MOS 100 Hz keyboard
+    // scanner sees it across its debounce pass even when a slow blit made
+    // KeyPress and KeyRelease arrive in the same X11 batch.
+    if (g_held[i].frames > 0) {
+      g_held[i].released = true;
+      if (g_held[i].shift_force < 0) {
+        g_held[i].shift_force = g_host_shift ? 1 : 0;
+      }
+      continue;
+    }
+    BbcMachineSetKey(g_cpu.bbc, g_held[i].column, g_held[i].row, false);
+    g_held[i].used = false;
+  }
+  SyncShift();
+}
+
+static bool KeyHoldPending(void) {
+  int i;
+  for (i = 0; i < 16; i++) {
+    if (g_held[i].used && g_held[i].frames > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void ReleaseAllKeys(void) {
@@ -108,8 +157,14 @@ static void ReleaseAllKeys(void) {
     }
     BbcMachineSetKey(g_cpu.bbc, g_held[i].column, g_held[i].row, false);
     g_held[i].used = false;
+    g_held[i].frames = 0;
+    g_held[i].released = false;
   }
   g_host_shift = false;
+  g_shift_l = false;
+  g_shift_r = false;
+  g_ctrl_l = false;
+  g_ctrl_r = false;
   g_fire0 = 0;
   g_fire1 = 0;
   g_caps_pulse = 0;
@@ -291,7 +346,7 @@ static void PressHostKey(XKeyEvent* event) {
   if (ModifierSym(sym)) {
     return;
   }
-  ReleaseHostKey(event->keycode);
+  ReleaseHostKeyNow(event->keycode);
   // The per-frame poll can lag a fast Shift+key, which would put Shift on ':'.
   g_host_shift = (event->state & ShiftMask) != 0;
   if (FunctionToBbc(sym, &column, &row)) {
@@ -318,7 +373,7 @@ static void PressHostKey(XKeyEvent* event) {
     }
     if (ch >= 32 && GlyphToBbc(ch, &column, &row, &need_shift)) {
       mapped = true;
-      if (ch != ' ' && need_shift != g_host_shift) {
+      if (ch != ' ') {
         shift_force = need_shift ? 1 : 0;
       }
     }
@@ -339,6 +394,8 @@ static void PressHostKey(XKeyEvent* event) {
   g_held[slot].column = column;
   g_held[slot].row = row;
   g_held[slot].shift_force = shift_force;
+  g_held[slot].frames = 2;
+  g_held[slot].released = false;
   // Release Shift before the key is visible. A scan in between would turn
   // the underscore key into &60.
   SyncShift();
@@ -373,46 +430,74 @@ static uint32_t PackPixel(uint8_t r, uint8_t g, uint8_t b) {
   return (pr << g_rshift) | (pg << g_gshift) | (pb << g_bshift);
 }
 
-static void StorePixel(int x, int y, uint32_t pixel) {
-  unsigned char* row;
-  int bpp;
-  if (g_image == NULL || x < 0 || y < 0 || x >= g_image->width || y >= g_image->height) {
+static void ScaleRow(unsigned char* row, const uint32_t* packed, int width, int win_w) {
+  const union {
+    uint32_t u;
+    unsigned char b[4];
+  } endian = {1};
+  int bpp = g_image->bits_per_pixel;
+  int x;
+  int sx = 0;
+  int acc = 0;
+  if (bpp == 32 && ((g_image->byte_order == LSBFirst && endian.b[0] == 1) ||
+                    (g_image->byte_order == MSBFirst && endian.b[0] == 0))) {
+    uint32_t* dst = (uint32_t*)row;
+    for (x = 0; x < win_w; x++) {
+      dst[x] = packed[sx];
+      acc += width;
+      while (acc >= win_w) {
+        acc -= win_w;
+        sx++;
+      }
+      if (sx >= width) {
+        sx = width - 1;
+      }
+    }
     return;
   }
-  bpp = g_image->bits_per_pixel;
-  row = (unsigned char*)g_image->data + (size_t)y * (size_t)g_image->bytes_per_line;
-  if (bpp == 32) {
-    unsigned char* px = row + (size_t)x * 4;
-    if (g_image->byte_order == MSBFirst) {
-      px[0] = (unsigned char)(pixel >> 24);
-      px[1] = (unsigned char)(pixel >> 16);
-      px[2] = (unsigned char)(pixel >> 8);
-      px[3] = (unsigned char)pixel;
-    } else {
-      px[0] = (unsigned char)pixel;
-      px[1] = (unsigned char)(pixel >> 8);
-      px[2] = (unsigned char)(pixel >> 16);
-      px[3] = (unsigned char)(pixel >> 24);
+  for (x = 0; x < win_w; x++) {
+    uint32_t pixel = packed[sx];
+    if (bpp == 32) {
+      unsigned char* px = row + (size_t)x * 4;
+      if (g_image->byte_order == MSBFirst) {
+        px[0] = (unsigned char)(pixel >> 24);
+        px[1] = (unsigned char)(pixel >> 16);
+        px[2] = (unsigned char)(pixel >> 8);
+        px[3] = (unsigned char)pixel;
+      } else {
+        px[0] = (unsigned char)pixel;
+        px[1] = (unsigned char)(pixel >> 8);
+        px[2] = (unsigned char)(pixel >> 16);
+        px[3] = (unsigned char)(pixel >> 24);
+      }
+    } else if (bpp == 16) {
+      unsigned char* px = row + (size_t)x * 2;
+      if (g_image->byte_order == MSBFirst) {
+        px[0] = (unsigned char)(pixel >> 8);
+        px[1] = (unsigned char)pixel;
+      } else {
+        px[0] = (unsigned char)pixel;
+        px[1] = (unsigned char)(pixel >> 8);
+      }
+    } else if (bpp == 24) {
+      unsigned char* px = row + (size_t)x * 3;
+      if (g_image->byte_order == MSBFirst) {
+        px[0] = (unsigned char)(pixel >> 16);
+        px[1] = (unsigned char)(pixel >> 8);
+        px[2] = (unsigned char)pixel;
+      } else {
+        px[0] = (unsigned char)pixel;
+        px[1] = (unsigned char)(pixel >> 8);
+        px[2] = (unsigned char)(pixel >> 16);
+      }
     }
-  } else if (bpp == 16) {
-    unsigned char* px = row + (size_t)x * 2;
-    if (g_image->byte_order == MSBFirst) {
-      px[0] = (unsigned char)(pixel >> 8);
-      px[1] = (unsigned char)pixel;
-    } else {
-      px[0] = (unsigned char)pixel;
-      px[1] = (unsigned char)(pixel >> 8);
+    acc += width;
+    while (acc >= win_w) {
+      acc -= win_w;
+      sx++;
     }
-  } else if (bpp == 24) {
-    unsigned char* px = row + (size_t)x * 3;
-    if (g_image->byte_order == MSBFirst) {
-      px[0] = (unsigned char)(pixel >> 16);
-      px[1] = (unsigned char)(pixel >> 8);
-      px[2] = (unsigned char)pixel;
-    } else {
-      px[0] = (unsigned char)pixel;
-      px[1] = (unsigned char)(pixel >> 8);
-      px[2] = (unsigned char)(pixel >> 16);
+    if (sx >= width) {
+      sx = width - 1;
     }
   }
 }
@@ -448,6 +533,7 @@ static bool CreateImage(int width, int height) {
   }
   g_win_w = width;
   g_win_h = height;
+  g_force_full_blit = true;
   return true;
 }
 
@@ -455,8 +541,18 @@ static void BlitFrame(void) {
   int width;
   int height;
   const uint8_t* src;
+  bool full;
+  int dirty_s0;
+  int dirty_s1;
+  size_t row_bytes;
+  int sy;
   int y;
-  if (g_cpu.bbc == NULL || g_image == NULL) {
+  int dst_y0 = -1;
+  int dst_y1 = -1;
+  int prev_sy = -1;
+  unsigned char* prev_row = NULL;
+  uint32_t packed[BBC_FB_WIDTH];
+  if (g_cpu.bbc == NULL || g_image == NULL || g_win_w <= 0 || g_win_h <= 0) {
     return;
   }
   BbcMachinePresentFrame(g_cpu.bbc, g_cpu.turbo);
@@ -465,24 +561,72 @@ static void BlitFrame(void) {
   if (width <= 0 || height <= 0) {
     return;
   }
+  if (width > BBC_FB_WIDTH) {
+    width = BBC_FB_WIDTH;
+  }
+  if (height > BBC_FB_HEIGHT) {
+    height = BBC_FB_HEIGHT;
+  }
   src = BbcFramebuffer(g_cpu.bbc);
+  full = g_force_full_blit || width != g_prev_src_w || height != g_prev_src_h ||
+         g_win_w != g_prev_win_w || g_win_h != g_prev_win_h;
+  dirty_s0 = full ? 0 : height;
+  dirty_s1 = full ? height - 1 : -1;
+  row_bytes = (size_t)width * 3;
+  for (sy = 0; sy < height; sy++) {
+    const uint8_t* srow = src + (size_t)sy * BBC_FB_WIDTH * 3;
+    uint8_t* prow = g_prev_fb + (size_t)sy * BBC_FB_WIDTH * 3;
+    if (full || memcmp(srow, prow, row_bytes) != 0) {
+      memcpy(prow, srow, row_bytes);
+      if (sy < dirty_s0) {
+        dirty_s0 = sy;
+      }
+      dirty_s1 = sy;
+    }
+  }
+  g_prev_src_w = width;
+  g_prev_src_h = height;
+  g_prev_win_w = g_win_w;
+  g_prev_win_h = g_win_h;
+  g_force_full_blit = false;
+  if (dirty_s0 > dirty_s1) {
+    return;
+  }
   for (y = 0; y < g_win_h; y++) {
-    int sy = y * height / g_win_h;
-    int x;
+    unsigned char* row;
+    sy = y * height / g_win_h;
     if (sy >= height) {
       sy = height - 1;
     }
-    for (x = 0; x < g_win_w; x++) {
-      int sx = x * width / g_win_w;
-      const uint8_t* p;
-      if (sx >= width) {
-        sx = width - 1;
-      }
-      p = src + ((size_t)sy * BBC_FB_WIDTH + (size_t)sx) * 3;
-      StorePixel(x, y, PackPixel(p[0], p[1], p[2]));
+    if (sy < dirty_s0 || sy > dirty_s1) {
+      continue;
     }
+    if (dst_y0 < 0) {
+      dst_y0 = y;
+    }
+    dst_y1 = y;
+    row = (unsigned char*)g_image->data + (size_t)y * (size_t)g_image->bytes_per_line;
+    if (sy == prev_sy && prev_row != NULL) {
+      memcpy(row, prev_row, (size_t)g_image->bytes_per_line);
+      continue;
+    }
+    {
+      const uint8_t* srow = src + (size_t)sy * BBC_FB_WIDTH * 3;
+      int sx;
+      for (sx = 0; sx < width; sx++) {
+        const uint8_t* p = srow + (size_t)sx * 3;
+        packed[sx] = PackPixel(p[0], p[1], p[2]);
+      }
+    }
+    ScaleRow(row, packed, width, g_win_w);
+    prev_sy = sy;
+    prev_row = row;
   }
-  XPutImage(g_dpy, g_win, g_gc, g_image, 0, 0, 0, 0, (unsigned)g_win_w, (unsigned)g_win_h);
+  if (dst_y0 >= 0 && dst_y1 >= dst_y0) {
+    XPutImage(g_dpy, g_win, g_gc, g_image, 0, dst_y0, 0, dst_y0, (unsigned)g_win_w,
+              (unsigned)(dst_y1 - dst_y0 + 1));
+    XSync(g_dpy, False);
+  }
 }
 
 static void UpdateTitle(void) {
@@ -574,7 +718,7 @@ static void FitWindow(int width, int height) {
   }
 }
 
-static void ReadPointer(void) {
+static void QueryPointerOnce(void) {
   Window root;
   Window child;
   int rx;
@@ -582,36 +726,52 @@ static void ReadPointer(void) {
   int x;
   int y;
   unsigned mask;
-  if (g_cpu.bbc == NULL || BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
+  if (g_dpy == NULL || g_win == 0) {
     return;
   }
   if (!XQueryPointer(g_dpy, g_win, &root, &child, &rx, &ry, &x, &y, &mask)) {
     return;
   }
-  g_host_shift = (mask & ShiftMask) != 0;
-  SyncShift();
-  BbcMachineSetKey(g_cpu.bbc, 1, 0, (mask & ControlMask) != 0);
-  if (x >= 0 && y >= 0 && x < g_win_w && y < g_win_h && g_win_w > 1 && g_win_h > 1) {
-    BbcMachineSetAnalogue(g_cpu.bbc, 0, x * 65535 / (g_win_w - 1));
-    BbcMachineSetAnalogue(g_cpu.bbc, 1, y * 65535 / (g_win_h - 1));
+  g_ptr_x = x;
+  g_ptr_y = y;
+  g_ptr_valid = x >= 0 && y >= 0 && x < g_win_w && y < g_win_h;
+  if (!KeyHoldPending()) {
+    g_host_shift = (mask & ShiftMask) != 0;
+    SyncShift();
+  }
+  if (g_cpu.bbc != NULL) {
+    BbcMachineSetKey(g_cpu.bbc, 1, 0, (mask & ControlMask) != 0);
+  }
+}
+
+static void UpdatePointer(void) {
+  if (g_cpu.bbc == NULL || BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
+    return;
+  }
+  if (g_ptr_valid && g_ptr_x >= 0 && g_ptr_y >= 0 && g_ptr_x < g_win_w && g_ptr_y < g_win_h &&
+      g_win_w > 1 && g_win_h > 1) {
+    BbcMachineSetAnalogue(g_cpu.bbc, 0, g_ptr_x * 65535 / (g_win_w - 1));
+    BbcMachineSetAnalogue(g_cpu.bbc, 1, g_ptr_y * 65535 / (g_win_h - 1));
   } else {
     BbcMachineSetAnalogue(g_cpu.bbc, 0, 0x8000);
     BbcMachineSetAnalogue(g_cpu.bbc, 1, 0x8000);
   }
-  BbcMachineSetFire(g_cpu.bbc, 0, g_fire0 || (mask & Button1Mask) != 0);
-  BbcMachineSetFire(g_cpu.bbc, 1, g_fire1 || (mask & Button3Mask) != 0);
+  BbcMachineSetFire(g_cpu.bbc, 0, g_fire0 != 0);
+  BbcMachineSetFire(g_cpu.bbc, 1, g_fire1 != 0);
 }
 
-static void Tick(void) {
+static void Tick(bool draw) {
   int cycles = 0;
   int budget = kFrameCycles;
   int limit;
+  int i;
+  bool released_any = false;
   uint64_t started;
   if (!g_ready || !g_cpu.running) {
     g_running = false;
     return;
   }
-  ReadPointer();
+  UpdatePointer();
   if (g_cpu.clock_mhz > 0) {
     budget = kFrameCycles * g_cpu.clock_mhz / 2;
     if (budget < 1) {
@@ -633,6 +793,22 @@ static void Tick(void) {
       break;
     }
   }
+  if (g_cpu.bbc != NULL) {
+    for (i = 0; i < 16; i++) {
+      if (!g_held[i].used || g_held[i].frames <= 0) {
+        continue;
+      }
+      g_held[i].frames--;
+      if (g_held[i].frames == 0 && g_held[i].released) {
+        BbcMachineSetKey(g_cpu.bbc, g_held[i].column, g_held[i].row, false);
+        g_held[i].used = false;
+        released_any = true;
+      }
+    }
+    if (released_any) {
+      SyncShift();
+    }
+  }
   if (g_caps_pulse > 0 && g_cpu.bbc != NULL && !BbcSessionGameCaps()) {
     g_caps_pulse--;
     if (g_caps_pulse == 0) {
@@ -643,15 +819,39 @@ static void Tick(void) {
     return;
   }
   UpdateTitle();
+  if (!draw) {
+    return;
+  }
   if (BbcFrameWidth(g_cpu.bbc) > 0 && BbcFrameHeight(g_cpu.bbc) > 0) {
     FitWindow(BbcFrameWidth(g_cpu.bbc), BbcFrameHeight(g_cpu.bbc));
   }
   BlitFrame();
-  XFlush(g_dpy);
 }
 
 static void OnKey(XKeyEvent* event, bool down) {
-  bool caps = XLookupKeysym(event, 0) == XK_Caps_Lock;
+  KeySym sym = XLookupKeysym(event, 0);
+  bool caps = sym == XK_Caps_Lock;
+  if (sym == XK_Shift_L || sym == XK_Shift_R) {
+    if (sym == XK_Shift_L) {
+      g_shift_l = down;
+    } else {
+      g_shift_r = down;
+    }
+    g_host_shift = g_shift_l || g_shift_r;
+    SyncShift();
+    return;
+  }
+  if (sym == XK_Control_L || sym == XK_Control_R) {
+    if (sym == XK_Control_L) {
+      g_ctrl_l = down;
+    } else {
+      g_ctrl_r = down;
+    }
+    if (g_cpu.bbc != NULL) {
+      BbcMachineSetKey(g_cpu.bbc, 1, 0, g_ctrl_l || g_ctrl_r);
+    }
+    return;
+  }
   if (!down) {
     XEvent next;
     if (XEventsQueued(g_dpy, QueuedAfterReading) > 0) {
@@ -684,7 +884,7 @@ static void OnKey(XKeyEvent* event, bool down) {
   {
     int i;
     for (i = 0; i < 16; i++) {
-      if (g_held[i].used && g_held[i].code == event->keycode) {
+      if (g_held[i].used && !g_held[i].released && g_held[i].code == event->keycode) {
         return;
       }
     }
@@ -706,11 +906,35 @@ static void HandleEvent(XEvent* event) {
     return;
   }
   if (event->type == Expose && event->xexpose.count == 0 && g_image != NULL) {
-    XPutImage(g_dpy, g_win, g_gc, g_image, 0, 0, 0, 0, (unsigned)g_win_w, (unsigned)g_win_h);
+    if (g_force_full_blit) {
+      BlitFrame();
+    } else {
+      XPutImage(g_dpy, g_win, g_gc, g_image, 0, 0, 0, 0, (unsigned)g_win_w, (unsigned)g_win_h);
+    }
+    return;
+  }
+  if (event->type == FocusIn) {
+    QueryPointerOnce();
     return;
   }
   if (event->type == FocusOut) {
     ReleaseAllKeys();
+    return;
+  }
+  if (event->type == MotionNotify) {
+    g_ptr_x = event->xmotion.x;
+    g_ptr_y = event->xmotion.y;
+    g_ptr_valid = true;
+    return;
+  }
+  if (event->type == EnterNotify) {
+    g_ptr_x = event->xcrossing.x;
+    g_ptr_y = event->xcrossing.y;
+    g_ptr_valid = true;
+    return;
+  }
+  if (event->type == LeaveNotify) {
+    g_ptr_valid = false;
     return;
   }
   if (event->type == KeyPress) {
@@ -830,7 +1054,8 @@ static bool OpenWindow(void) {
   memset(&attr, 0, sizeof(attr));
   attr.background_pixel = BlackPixel(g_dpy, screen);
   attr.event_mask = KeyPressMask | KeyReleaseMask | ExposureMask | StructureNotifyMask |
-                    ButtonPressMask | ButtonReleaseMask | FocusChangeMask | PointerMotionMask;
+                    ButtonPressMask | ButtonReleaseMask | FocusChangeMask | PointerMotionMask |
+                    EnterWindowMask | LeaveWindowMask;
   mask = CWBackPixel | CWEventMask;
   g_win = XCreateWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0,
                         (unsigned)ScaledLength(640), (unsigned)ScaledLength(512), 0,
@@ -847,6 +1072,7 @@ static bool OpenWindow(void) {
   }
   XMapWindow(g_dpy, g_win);
   XFlush(g_dpy);
+  QueryPointerOnce();
   return true;
 }
 
@@ -933,32 +1159,50 @@ int main(int argc, char** argv) {
   StartAudio();
   xfd = ConnectionNumber(g_dpy);
   next = MonoNs();
-  while (g_running) {
-    while (XPending(g_dpy) > 0) {
-      XEvent event;
-      XNextEvent(g_dpy, &event);
-      HandleEvent(&event);
-    }
-    if (!g_running) {
-      break;
-    }
-    {
-      uint64_t now = MonoNs();
-      if (now >= next) {
-        Tick();
-        next += 20000000ull;
-        if (MonoNs() > next + 100000000ull) {
-          next = MonoNs();
+  {
+    int skipped = 0;
+    while (g_running) {
+      while (XPending(g_dpy) > 0) {
+        XEvent event;
+        if (KeyHoldPending()) {
+          XPeekEvent(g_dpy, &event);
+          if (event.type == KeyPress) {
+            KeySym sym = XLookupKeysym(&event.xkey, 0);
+            if (!ModifierSym(sym)) {
+              break;
+            }
+          }
         }
-      } else {
-        struct timeval tv;
-        fd_set fds;
-        uint64_t wait = next - now;
-        FD_ZERO(&fds);
-        FD_SET(xfd, &fds);
-        tv.tv_sec = (time_t)(wait / 1000000000ull);
-        tv.tv_usec = (suseconds_t)((wait % 1000000000ull) / 1000ull);
-        select(xfd + 1, &fds, NULL, NULL, &tv);
+        XNextEvent(g_dpy, &event);
+        HandleEvent(&event);
+      }
+      if (!g_running) {
+        break;
+      }
+      {
+        uint64_t now = MonoNs();
+        if (now >= next) {
+          bool behind = now >= next + 20000000ull && skipped < 3;
+          Tick(!behind);
+          if (behind) {
+            skipped++;
+          } else {
+            skipped = 0;
+          }
+          next += 20000000ull;
+          if (MonoNs() > next + 100000000ull) {
+            next = MonoNs();
+          }
+        } else {
+          struct timeval tv;
+          fd_set fds;
+          uint64_t wait = next - now;
+          FD_ZERO(&fds);
+          FD_SET(xfd, &fds);
+          tv.tv_sec = (time_t)(wait / 1000000000ull);
+          tv.tv_usec = (suseconds_t)((wait % 1000000000ull) / 1000ull);
+          select(xfd + 1, &fds, NULL, NULL, &tv);
+        }
       }
     }
   }
