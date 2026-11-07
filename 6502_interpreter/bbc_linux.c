@@ -6,6 +6,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
+#include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 
@@ -55,6 +56,10 @@ static GC g_gc = 0;
 static XImage* g_image = NULL;
 static int g_win_w = 640;
 static int g_win_h = 512;
+static int g_view_x = 0;
+static int g_view_y = 0;
+static int g_view_w = 640;
+static int g_view_h = 512;
 static int g_sized_w = 0;
 static int g_sized_h = 0;
 static uint8_t g_prev_fb[BBC_FB_WIDTH * BBC_FB_HEIGHT * 3];
@@ -339,6 +344,12 @@ static void PressHostKey(XKeyEvent* event) {
   int slot;
   int n;
   sym = XLookupKeysym(event, 0);
+  if (sym == XK_F11 ||
+      ((event->state & (Mod1Mask | Mod4Mask)) != 0 &&
+       (sym == XK_F4 || sym == XK_q || sym == XK_Q))) {
+    g_running = false;
+    return;
+  }
   if (sym == XK_F12) {
     W65C02InterpreterResetCpu(&g_cpu);
     return;
@@ -509,30 +520,62 @@ static void DestroyImage(void) {
   }
 }
 
+static void ComputeViewport(int win_w, int win_h, int* vx, int* vy, int* vw, int* vh) {
+  if (!BbcSessionFullscreen()) {
+    *vx = 0;
+    *vy = 0;
+    *vw = win_w < 1 ? 1 : win_w;
+    *vh = win_h < 1 ? 1 : win_h;
+    return;
+  }
+  // Fit a 4:3 CRT picture in the middle of a widescreen monitor.
+  if (win_w * 3 >= win_h * 4) {
+    *vh = win_h;
+    *vw = (win_h * 4 + 1) / 3;
+  } else {
+    *vw = win_w;
+    *vh = (win_w * 3 + 2) / 4;
+  }
+  if (*vw < 1) {
+    *vw = 1;
+  }
+  if (*vh < 1) {
+    *vh = 1;
+  }
+  *vx = (win_w - *vw) / 2;
+  *vy = (win_h - *vh) / 2;
+}
+
 static bool CreateImage(int width, int height) {
   Visual* visual;
   int depth;
   char* data;
   int bytes;
+  int vx, vy, vw, vh;
   if (width < 1 || height < 1) {
     return false;
   }
+  ComputeViewport(width, height, &vx, &vy, &vw, &vh);
   visual = DefaultVisual(g_dpy, DefaultScreen(g_dpy));
   depth = DefaultDepth(g_dpy, DefaultScreen(g_dpy));
-  bytes = width * 4 * height;
+  bytes = vw * 4 * vh;
   data = calloc((size_t)bytes, 1);
   if (data == NULL) {
     return false;
   }
   DestroyImage();
-  g_image = XCreateImage(g_dpy, visual, (unsigned)depth, ZPixmap, 0, data, (unsigned)width,
-                         (unsigned)height, 32, 0);
+  g_image = XCreateImage(g_dpy, visual, (unsigned)depth, ZPixmap, 0, data, (unsigned)vw,
+                         (unsigned)vh, 32, 0);
   if (g_image == NULL) {
     free(data);
     return false;
   }
   g_win_w = width;
   g_win_h = height;
+  g_view_x = vx;
+  g_view_y = vy;
+  g_view_w = vw;
+  g_view_h = vh;
   g_force_full_blit = true;
   return true;
 }
@@ -552,7 +595,7 @@ static void BlitFrame(void) {
   int prev_sy = -1;
   unsigned char* prev_row = NULL;
   uint32_t packed[BBC_FB_WIDTH];
-  if (g_cpu.bbc == NULL || g_image == NULL || g_win_w <= 0 || g_win_h <= 0) {
+  if (g_cpu.bbc == NULL || g_image == NULL || g_view_w <= 0 || g_view_h <= 0) {
     return;
   }
   BbcMachinePresentFrame(g_cpu.bbc, g_cpu.turbo);
@@ -569,7 +612,7 @@ static void BlitFrame(void) {
   }
   src = BbcFramebuffer(g_cpu.bbc);
   full = g_force_full_blit || width != g_prev_src_w || height != g_prev_src_h ||
-         g_win_w != g_prev_win_w || g_win_h != g_prev_win_h;
+         g_view_w != g_prev_win_w || g_view_h != g_prev_win_h;
   dirty_s0 = full ? 0 : height;
   dirty_s1 = full ? height - 1 : -1;
   row_bytes = (size_t)width * 3;
@@ -586,15 +629,15 @@ static void BlitFrame(void) {
   }
   g_prev_src_w = width;
   g_prev_src_h = height;
-  g_prev_win_w = g_win_w;
-  g_prev_win_h = g_win_h;
+  g_prev_win_w = g_view_w;
+  g_prev_win_h = g_view_h;
   g_force_full_blit = false;
   if (dirty_s0 > dirty_s1) {
     return;
   }
-  for (y = 0; y < g_win_h; y++) {
+  for (y = 0; y < g_view_h; y++) {
     unsigned char* row;
-    sy = y * height / g_win_h;
+    sy = y * height / g_view_h;
     if (sy >= height) {
       sy = height - 1;
     }
@@ -618,13 +661,13 @@ static void BlitFrame(void) {
         packed[sx] = PackPixel(p[0], p[1], p[2]);
       }
     }
-    ScaleRow(row, packed, width, g_win_w);
+    ScaleRow(row, packed, width, g_view_w);
     prev_sy = sy;
     prev_row = row;
   }
   if (dst_y0 >= 0 && dst_y1 >= dst_y0) {
-    XPutImage(g_dpy, g_win, g_gc, g_image, 0, dst_y0, 0, dst_y0, (unsigned)g_win_w,
-              (unsigned)(dst_y1 - dst_y0 + 1));
+    XPutImage(g_dpy, g_win, g_gc, g_image, 0, dst_y0, g_view_x, g_view_y + dst_y0,
+              (unsigned)g_view_w, (unsigned)(dst_y1 - dst_y0 + 1));
     XSync(g_dpy, False);
   }
 }
@@ -680,7 +723,7 @@ static void FitWindow(int width, int height) {
   int min_w;
   int min_h;
   XSizeHints hints;
-  if (width <= 0 || height <= 0) {
+  if (BbcSessionFullscreen() || width <= 0 || height <= 0) {
     return;
   }
   if (width == g_sized_w && abs(height - g_sized_h) <= 8) {
@@ -745,13 +788,15 @@ static void QueryPointerOnce(void) {
 }
 
 static void UpdatePointer(void) {
+  int vx = g_ptr_x - g_view_x;
+  int vy = g_ptr_y - g_view_y;
   if (g_cpu.bbc == NULL || BbcMachineJoystickRemoteActive(g_cpu.bbc)) {
     return;
   }
-  if (g_ptr_valid && g_ptr_x >= 0 && g_ptr_y >= 0 && g_ptr_x < g_win_w && g_ptr_y < g_win_h &&
-      g_win_w > 1 && g_win_h > 1) {
-    BbcMachineSetAnalogue(g_cpu.bbc, 0, g_ptr_x * 65535 / (g_win_w - 1));
-    BbcMachineSetAnalogue(g_cpu.bbc, 1, g_ptr_y * 65535 / (g_win_h - 1));
+  if (g_ptr_valid && vx >= 0 && vy >= 0 && vx < g_view_w && vy < g_view_h && g_view_w > 1 &&
+      g_view_h > 1) {
+    BbcMachineSetAnalogue(g_cpu.bbc, 0, vx * 65535 / (g_view_w - 1));
+    BbcMachineSetAnalogue(g_cpu.bbc, 1, vy * 65535 / (g_view_h - 1));
   } else {
     BbcMachineSetAnalogue(g_cpu.bbc, 0, 0x8000);
     BbcMachineSetAnalogue(g_cpu.bbc, 1, 0x8000);
@@ -909,7 +954,8 @@ static void HandleEvent(XEvent* event) {
     if (g_force_full_blit) {
       BlitFrame();
     } else {
-      XPutImage(g_dpy, g_win, g_gc, g_image, 0, 0, 0, 0, (unsigned)g_win_w, (unsigned)g_win_h);
+      XPutImage(g_dpy, g_win, g_gc, g_image, 0, 0, g_view_x, g_view_y, (unsigned)g_view_w,
+                (unsigned)g_view_h);
     }
     return;
   }
@@ -1031,11 +1077,58 @@ static void StartAudio(void) {}
 static void StopAudio(void) {}
 #endif
 
+static void HideCursor(void) {
+  static char zero[8] = {0};
+  Pixmap blank;
+  XColor black;
+  Cursor cursor;
+  memset(&black, 0, sizeof(black));
+  blank = XCreateBitmapFromData(g_dpy, g_win, zero, 8, 8);
+  if (blank == None) {
+    return;
+  }
+  cursor = XCreatePixmapCursor(g_dpy, blank, blank, &black, &black, 0, 0);
+  XDefineCursor(g_dpy, g_win, cursor);
+  XFreePixmap(g_dpy, blank);
+}
+
+static void EnterFullscreen(int screen, int width, int height) {
+  struct {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long input_mode;
+    unsigned long status;
+  } motif = {2, 0, 0, 0, 0};
+  Atom motif_atom = XInternAtom(g_dpy, "_MOTIF_WM_HINTS", False);
+  Atom wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
+  Atom fullscreen = XInternAtom(g_dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  XEvent ev;
+  XChangeProperty(g_dpy, g_win, motif_atom, motif_atom, 32, PropModeReplace,
+                  (const unsigned char*)&motif, 5);
+  XChangeProperty(g_dpy, g_win, wm_state, XA_ATOM, 32, PropModeReplace,
+                  (const unsigned char*)&fullscreen, 1);
+  XMapWindow(g_dpy, g_win);
+  XMoveResizeWindow(g_dpy, g_win, 0, 0, (unsigned)width, (unsigned)height);
+  memset(&ev, 0, sizeof(ev));
+  ev.type = ClientMessage;
+  ev.xclient.window = g_win;
+  ev.xclient.message_type = wm_state;
+  ev.xclient.format = 32;
+  ev.xclient.data.l[0] = 1;
+  ev.xclient.data.l[1] = (long)fullscreen;
+  XSendEvent(g_dpy, RootWindow(g_dpy, screen), False,
+             SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+  HideCursor();
+}
+
 static bool OpenWindow(void) {
   int screen;
   Visual* visual;
   XSetWindowAttributes attr;
   unsigned long mask;
+  int init_w;
+  int init_h;
   if (g_dpy == NULL) {
     return false;
   }
@@ -1051,15 +1144,24 @@ static bool OpenWindow(void) {
   g_rbits = MaskBits(visual->red_mask);
   g_gbits = MaskBits(visual->green_mask);
   g_bbits = MaskBits(visual->blue_mask);
+  if (BbcSessionFullscreen()) {
+    BbcSessionMonitorSize(&init_w, &init_h);
+    if (init_w <= 0 || init_h <= 0) {
+      init_w = DisplayWidth(g_dpy, screen);
+      init_h = DisplayHeight(g_dpy, screen);
+    }
+  } else {
+    init_w = ScaledLength(640);
+    init_h = ScaledLength(512);
+  }
   memset(&attr, 0, sizeof(attr));
   attr.background_pixel = BlackPixel(g_dpy, screen);
   attr.event_mask = KeyPressMask | KeyReleaseMask | ExposureMask | StructureNotifyMask |
                     ButtonPressMask | ButtonReleaseMask | FocusChangeMask | PointerMotionMask |
                     EnterWindowMask | LeaveWindowMask;
   mask = CWBackPixel | CWEventMask;
-  g_win = XCreateWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0,
-                        (unsigned)ScaledLength(640), (unsigned)ScaledLength(512), 0,
-                        DefaultDepth(g_dpy, screen), InputOutput, visual, mask, &attr);
+  g_win = XCreateWindow(g_dpy, RootWindow(g_dpy, screen), 0, 0, (unsigned)init_w, (unsigned)init_h,
+                        0, DefaultDepth(g_dpy, screen), InputOutput, visual, mask, &attr);
   if (g_win == 0) {
     return false;
   }
@@ -1067,10 +1169,14 @@ static bool OpenWindow(void) {
   XSetWMProtocols(g_dpy, g_win, &g_wm_delete, 1);
   XStoreName(g_dpy, g_win, "BBC Micro");
   g_gc = XCreateGC(g_dpy, g_win, 0, NULL);
-  if (!CreateImage(ScaledLength(640), ScaledLength(512))) {
+  if (!CreateImage(init_w, init_h)) {
     return false;
   }
-  XMapWindow(g_dpy, g_win);
+  if (BbcSessionFullscreen()) {
+    EnterFullscreen(screen, init_w, init_h);
+  } else {
+    XMapWindow(g_dpy, g_win);
+  }
   XFlush(g_dpy);
   QueryPointerOnce();
   return true;

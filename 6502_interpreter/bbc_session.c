@@ -14,6 +14,9 @@ bool g_ready = false;
 
 static char* g_rom_dir = NULL;
 static double g_screen_scale = 1.0;
+static bool g_fullscreen = false;
+static int g_monitor_w = 0;
+static int g_monitor_h = 0;
 static bool g_game_caps = false;
 static int g_keyboard = BBC_KEYBOARD_UK;
 static bool g_keyboard_explicit = false;
@@ -30,7 +33,7 @@ static void Usage(void) {
           "           [-tube [6502|65c02|arm] [file]]\n"
           "           [-tape file] [-tape-port n] [-joystick-port n]\n"
           "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
-          "           [-keyboard uk|us]\n"
+          "           [-keyboard uk|us] [-fullscreen [WxH]] [-monitor WxH]\n"
           "           [-econet station] [-econet-port n]\n"
           "       The default machine is the Model B. Its ROMs come from\n"
           "       bbc_b_rom_sockets. master and master128 use\n"
@@ -90,6 +93,11 @@ static void Usage(void) {
           "       times that size. The picture keeps its shape and the pixels\n"
           "       grow with the window.\n"
 #endif
+          "       -fullscreen [WxH] or -monitor WxH (for example 1920x1080)\n"
+          "       fills a 16:9 monitor with black side bars and keeps the\n"
+          "       BBC display at a 4:3 aspect ratio in the middle. With no\n"
+          "       WxH, the display's current resolution is used. F11, Alt+F4,\n"
+          "       or Alt+Q quits.\n"
           "       -tube fits a second processor. 6502 is a 3 MHz NMOS chip,\n"
           "       65c02 is a 4 MHz CMOS chip, and arm is an 8 MHz ARM3 with\n"
           "       4 MB of RAM. A file replaces the built-in client. On the\n"
@@ -110,6 +118,38 @@ static void ReleaseRoms(void) {
 }
 
 double BbcSessionScreenScale(void) { return g_screen_scale; }
+
+bool BbcSessionFullscreen(void) { return g_fullscreen; }
+
+void BbcSessionMonitorSize(int* width, int* height) {
+  if (width != NULL) {
+    *width = g_monitor_w;
+  }
+  if (height != NULL) {
+    *height = g_monitor_h;
+  }
+}
+
+static bool ParseMonitorSize(const char* spec, int* width, int* height) {
+  char* end = NULL;
+  long w;
+  long h;
+  if (spec == NULL) {
+    return false;
+  }
+  w = strtol(spec, &end, 10);
+  if (end == spec || (*end != 'x' && *end != 'X')) {
+    return false;
+  }
+  spec = end + 1;
+  h = strtol(spec, &end, 10);
+  if (end == spec || *end != '\0' || w < 320 || w > 16384 || h < 240 || h > 16384) {
+    return false;
+  }
+  *width = (int)w;
+  *height = (int)h;
+  return true;
+}
 
 bool BbcSessionGameCaps(void) { return g_game_caps; }
 
@@ -420,6 +460,22 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         return false;
       }
       g_screen_scale = value;
+    } else if (strcmp(argv[i], "-fullscreen") == 0) {
+      g_fullscreen = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        if (!ParseMonitorSize(argv[++i], &g_monitor_w, &g_monitor_h)) {
+          Usage();
+          *status = 1;
+          return false;
+        }
+      }
+    } else if (strcmp(argv[i], "-monitor") == 0) {
+      if (i + 1 >= argc || !ParseMonitorSize(argv[++i], &g_monitor_w, &g_monitor_h)) {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      g_fullscreen = true;
     } else if (strcmp(argv[i], "-econet") == 0) {
       char* end = NULL;
       long value;

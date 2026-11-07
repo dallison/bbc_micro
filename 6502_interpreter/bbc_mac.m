@@ -380,7 +380,20 @@ static void PressHostKey(NSEvent* event) {
   // Integer scaling. Blending neighbouring scanlines turns the doubled
   // lines into grey bars.
   context.imageInterpolation = NSImageInterpolationNone;
-  [rep drawInRect:self.bounds];
+  NSRect dst = self.bounds;
+  if (BbcSessionFullscreen()) {
+    double bw = dst.size.width;
+    double bh = dst.size.height;
+    double vw = bw;
+    double vh = bh;
+    if (bw * 3.0 >= bh * 4.0) {
+      vw = bh * 4.0 / 3.0;
+    } else {
+      vh = bw * 3.0 / 4.0;
+    }
+    dst = NSMakeRect(dst.origin.x + (bw - vw) * 0.5, dst.origin.y + (bh - vh) * 0.5, vw, vh);
+  }
+  [rep drawInRect:dst];
   context.imageInterpolation = previous;
 }
 
@@ -959,6 +972,16 @@ static NSEvent* _Nullable SpecialKeyEvent(NSEvent* event) {
   // content area, so the pixels grow by the same amount.
   double scale = BbcSessionScreenScale();
   NSRect content = NSMakeRect(0, 0, 800.0 * scale, 640.0 * scale);
+  int mon_w = 0;
+  int mon_h = 0;
+  if (BbcSessionFullscreen()) {
+    BbcSessionMonitorSize(&mon_w, &mon_h);
+    if (mon_w > 0 && mon_h > 0) {
+      content = NSMakeRect(0, 0, (double)mon_w, (double)mon_h);
+    } else if ([NSScreen mainScreen] != nil) {
+      content = [NSScreen mainScreen].frame;
+    }
+  }
   self.window = [[NSWindow alloc]
       initWithContentRect:content
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -966,7 +989,9 @@ static NSEvent* _Nullable SpecialKeyEvent(NSEvent* event) {
                   backing:NSBackingStoreBuffered
                     defer:NO];
   self.window.title = @"BBC Micro";
-  [self.window setContentAspectRatio:NSMakeSize(5, 4)];
+  if (!BbcSessionFullscreen()) {
+    [self.window setContentAspectRatio:NSMakeSize(5, 4)];
+  }
   // 400x320 is the usual smallest size. A scale below 0.5 asks for less
   // than that, so the minimum follows the requested picture.
   if (content.size.width < 400.0) {
@@ -978,6 +1003,9 @@ static NSEvent* _Nullable SpecialKeyEvent(NSEvent* event) {
   self.window.contentView = self.view;
   [self.window center];
   [self.window makeKeyAndOrderFront:nil];
+  if (BbcSessionFullscreen() && (mon_w <= 0 || mon_h <= 0)) {
+    [self.window toggleFullScreen:nil];
+  }
   [self.window makeFirstResponder:self.view];
   [self startAudio];
   self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 50.0

@@ -59,6 +59,13 @@ bbc_b_rom_sockets/14-dfs.rom
 ./build/bbc -scale 1.5
 ```
 
+`-fullscreen` (or `-fullscreen 1920x1080` / `-monitor 1920x1080`) fills a widescreen monitor with black side bars and keeps the BBC picture at a centered 4:3 aspect ratio. With no `WxH` argument it uses the display's current resolution. Press `F11`, `Alt+F4`, or `Alt+Q` to quit.
+
+```
+./build/bbc -fullscreen
+./build/bbc -monitor 1920x1080
+```
+
 ## Keys
 
 F1 to F9 are the BBC keys f1 to f9, and F10 is f0. F12 is Break. End is COPY. The arrow keys, Escape, Tab, Return, and Backspace map to the same BBC keys. The numeric keypad maps to the Master keypad. The left mouse button is joystick fire 0, and the right button is fire 1.
