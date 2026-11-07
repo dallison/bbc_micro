@@ -5,7 +5,10 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 LINUX_COPTS = select({
-    "@platforms//os:linux": ["-D_GNU_SOURCE"],
+    "@platforms//os:linux": [
+        "-D_GNU_SOURCE",
+        "-O3",
+    ],
     "//conditions:default": [],
 })
 

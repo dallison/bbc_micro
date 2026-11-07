@@ -541,7 +541,7 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     *status = 1;
     return false;
   }
-  W65C02InterpreterInit(&g_cpu, false, true, false);
+  W65C02InterpreterInit(&g_cpu, false, false, false);
   cpu_inited = true;
   if (!run_ahead && !W65C02InterpreterSetClockMhz(&g_cpu, clock_mhz)) {
     Usage();
