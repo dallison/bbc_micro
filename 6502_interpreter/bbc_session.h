@@ -20,6 +20,12 @@ void BbcSessionFinish(void);
 // window does not yet.
 double BbcSessionScreenScale(void);
 
+// Full-screen 4:3 CRT mode for a 16:9 monitor. When enabled, the window
+// fills the monitor (or the explicit WxH resolution if non-zero) with black
+// side bars and draws the BBC display as a centered 4:3 picture.
+bool BbcSessionFullscreen(void);
+void BbcSessionMonitorSize(int* width, int* height);
+
 // Each Caps Lock press toggles the BBC lock. With this set, the key
 // stays down only while it is held. Games that read the key, such as
 // Zalaga, need that.

@@ -397,6 +397,8 @@ struct BbcMachine {
     int rx_len;
     int rx_pos;
     bool rx_active;
+    struct sockaddr_in peer_addr;
+    bool peer_valid;
     uint8_t inbox[4][2048];
     int inbox_len[4];
     int inbox_n;
@@ -508,6 +510,19 @@ static bool ViaAdvanceOne(BbcVia* via) {
 
 static void ViaAdvance(BbcVia* via, int cycles) {
   int i;
+  if (cycles <= 0) {
+    return;
+  }
+  if (!via->sr_active && (!via->t1_running || via->t1_counter > cycles) &&
+      (!via->t2_running || via->t2_counter > cycles)) {
+    if (via->t1_running) {
+      via->t1_counter -= cycles;
+    }
+    if (via->t2_running) {
+      via->t2_counter -= cycles;
+    }
+    return;
+  }
   for (i = 0; i < cycles; i++) {
     (void)ViaAdvanceOne(via);
   }
@@ -2033,24 +2048,22 @@ void BbcMachineBeginInstruction(BbcMachine* bbc, uint16_t pc) {
   if (bbc == NULL) {
     return;
   }
-  if (pc == 0x8498) {
-    AdfsNoteClearedMap(bbc);
-  }
-  // ADFS 1.30 enters its map check here on a soft break. OS 1.20 has already
-  // wiped main RAM when the system VIA interrupt enable was clear, which a
-  // game does, and the break is still soft if Ctrl is up. The check would
-  // then report "Bad sum". The same site is the fall-through after a hard
-  // break has written a fresh map, and a matching sum is left alone.
-  if (pc == 0x9b10 && bbc->ram != NULL && bbc->ram[0x9b10] == 0x20 &&
-      bbc->ram[0x9b11] == 0x31 && bbc->ram[0x9b12] == 0xa7 && bbc->ram[0x9af6] == 0xad &&
-      bbc->ram[0x9af9] == 0xf0) {
-    AdfsRepairBrokenMap(bbc);
+  if (pc >= 0x8000) {
+    if (pc == 0x8498) {
+      AdfsNoteClearedMap(bbc);
+    } else if (pc == 0x9b10 && bbc->ram != NULL && bbc->ram[0x9b10] == 0x20 &&
+               bbc->ram[0x9b11] == 0x31 && bbc->ram[0x9b12] == 0xa7 && bbc->ram[0x9af6] == 0xad &&
+               bbc->ram[0x9af9] == 0xf0) {
+      AdfsRepairBrokenMap(bbc);
+    }
   }
   if (!bbc->master) {
     return;
   }
   bbc->last_pc = pc;
-  ApplyLynne(bbc, LynneForCpu(bbc));
+  if ((bbc->acccon & 0x06) != 0 || bbc->lynne_mapped) {
+    ApplyLynne(bbc, LynneForCpu(bbc));
+  }
 }
 
 // ACCCON bit TST makes the OS ROM readable through &FC00-&FEFF, where the
@@ -3552,6 +3565,10 @@ static void EconetPublish(BbcMachine* bbc, const uint8_t* data, int len) {
   dest.sin_port = htons((uint16_t)bbc->econet.port);
   inet_pton(AF_INET, ECONET_GROUP, &dest.sin_addr);
   sendto(bbc->econet.fd, (const char*)packet, 14 + len, 0, (struct sockaddr*)&dest, sizeof(dest));
+  if (bbc->econet.peer_valid) {
+    sendto(bbc->econet.fd, (const char*)packet, 14 + len, 0,
+           (struct sockaddr*)&bbc->econet.peer_addr, sizeof(bbc->econet.peer_addr));
+  }
 }
 
 static void EconetPoll(BbcMachine* bbc) {
@@ -3560,7 +3577,10 @@ static void EconetPoll(BbcMachine* bbc) {
   }
   for (;;) {
     uint8_t buf[14 + ECONET_MAX_FRAME];
-    ssize_t n = recvfrom(bbc->econet.fd, (char*)buf, (int)sizeof(buf), 0, NULL, NULL);
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(bbc->econet.fd, (char*)buf, (int)sizeof(buf), 0,
+                         (struct sockaddr*)&from, &from_len);
     uint32_t instance;
     int len;
     if (n < 0) {
@@ -3572,6 +3592,11 @@ static void EconetPoll(BbcMachine* bbc) {
     instance = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 8) |
                (uint32_t)buf[11];
     len = ((int)buf[12] << 8) | buf[13];
+    if (len == 0 && n == 14 && instance != bbc->econet.instance && from.sin_family == AF_INET) {
+      bbc->econet.peer_addr = from;
+      bbc->econet.peer_valid = true;
+      continue;
+    }
     if (len <= 0 || len > ECONET_MAX_FRAME || 14 + len > (int)n) {
       continue;
     }
@@ -4588,9 +4613,45 @@ static void DrawBeamBitmap(BbcMachine* bbc, int x, int y, uint16_t ma, int ra) {
   int ppc = PixelsPerChar(bbc);
   int ula = UlaMode(bbc);
   int pix;
-  bool cursor = CursorBlinkOn(bbc) &&
-                ma == (uint16_t)(((bbc->crtc[14] << 8) | bbc->crtc[15]) & 0x3fff) &&
-                ra >= (bbc->crtc[10] & 0x1f) && ra <= (bbc->crtc[11] & 0x1f);
+  bool cursor = ma == (uint16_t)(((bbc->crtc[14] << 8) | bbc->crtc[15]) & 0x3fff) &&
+                ra >= (bbc->crtc[10] & 0x1f) && ra <= (bbc->crtc[11] & 0x1f) &&
+                CursorBlinkOn(bbc);
+  if (x >= 0 && x + ppc <= BBC_FB_WIDTH && y >= 0 && y < BBC_FB_HEIGHT && bbc->beam_fb != NULL) {
+    uint8_t* dst = bbc->beam_fb + ((size_t)y * BBC_FB_WIDTH + (size_t)x) * 3;
+    int shift = 3 - ula;
+    int rep = 1 << shift;
+    int groups = ppc >> shift;
+    int g;
+    int r_i;
+    unsigned temp;
+    if (!bbc->scan_disp) {
+      memset(dst, 0, (size_t)ppc * 3);
+      return;
+    }
+    temp = VideoByte(bbc, ma, (uint8_t)(ra & 7));
+    for (g = 0; g < groups; g++) {
+      int idx = (int)(((temp >> 1) & 1u) | ((temp >> 2) & 2u) | ((temp >> 3) & 4u) |
+                      ((temp >> 4) & 8u));
+      uint8_t pal = bbc->ula_pal[idx];
+      int colour = ((pal & 8) && (bbc->ula_control & 1)) ? (pal & 7) : ((pal ^ 7) & 7);
+      uint8_t r = kRgb[colour][0];
+      uint8_t gr = kRgb[colour][1];
+      uint8_t b = kRgb[colour][2];
+      if (cursor) {
+        r = (uint8_t)~r;
+        gr = (uint8_t)~gr;
+        b = (uint8_t)~b;
+      }
+      for (r_i = 0; r_i < rep; r_i++) {
+        dst[0] = r;
+        dst[1] = gr;
+        dst[2] = b;
+        dst += 3;
+      }
+      temp = (temp << 1) | 1u;
+    }
+    return;
+  }
   if (!bbc->scan_disp) {
     for (pix = 0; pix < ppc; pix++) {
       PutBeam(bbc, x + pix, y, kBlack);
@@ -4629,12 +4690,32 @@ static void DrawBeamTeletext(BbcMachine* bbc, int x, int y, uint8_t byte, int ra
   if (span < 1) {
     span = 1;
   }
-  {
+  if ((control || hidden || glyph <= 0x20) && x >= 0 && x + ppc <= BBC_FB_WIDTH && y >= 0 &&
+      y + 1 < BBC_FB_HEIGHT && bbc->beam_fb != NULL) {
+    const uint8_t* bg = kRgb[bbc->tt_bg & 7];
+    uint8_t* dst0 = bbc->beam_fb + ((size_t)y * BBC_FB_WIDTH + (size_t)x) * 3;
+    uint8_t* dst1 = dst0 + (size_t)BBC_FB_WIDTH * 3;
+    if ((bbc->tt_bg & 7) == 0) {
+      memset(dst0, 0, (size_t)ppc * 3);
+      memset(dst1, 0, (size_t)ppc * 3);
+    } else {
+      for (pix = 0; pix < ppc; pix++) {
+        dst0[0] = bg[0];
+        dst0[1] = bg[1];
+        dst0[2] = bg[2];
+        dst1[0] = bg[0];
+        dst1[1] = bg[1];
+        dst1[2] = bg[2];
+        dst0 += 3;
+        dst1 += 3;
+      }
+    }
+  } else {
     int half;
     int row = TeletextLineIndex(ra, span);
     for (half = 0; half < 2; half++) {
       int yy = y + half;
-      if (control || hidden || glyph < 0x20) {
+      if (control || hidden || glyph <= 0x20) {
         for (pix = 0; pix < ppc; pix++) {
           PutBeam(bbc, x + pix, yy, kRgb[bbc->tt_bg & 7]);
         }
@@ -4669,10 +4750,27 @@ static void DrawBeamTeletext(BbcMachine* bbc, int x, int y, uint8_t byte, int ra
       } else {
         uint16_t pattern =
             TeletextPattern(glyph, row, half, bbc->tt_double, bbc->tt_bottom, bbc->keyboard);
-        for (pix = 0; pix < ppc; pix++) {
-          const uint8_t* colour =
-              TeletextPixel(pattern, pix, ppc) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
-          PutBeam(bbc, x + pix, yy, colour);
+        if (x >= 0 && x + ppc <= BBC_FB_WIDTH && yy >= 0 && yy < BBC_FB_HEIGHT &&
+            bbc->beam_fb != NULL) {
+          uint8_t* dst = bbc->beam_fb + ((size_t)yy * BBC_FB_WIDTH + (size_t)x) * 3;
+          const uint8_t* fg = kRgb[bbc->tt_fg & 7];
+          const uint8_t* bg = kRgb[bbc->tt_bg & 7];
+          int origin = (ppc - 12) / 2;
+          for (pix = 0; pix < ppc; pix++) {
+            int h = pix - origin;
+            const uint8_t* colour =
+                (h >= 0 && h <= 11 && (pattern & (uint16_t)(1u << (11 - h))) != 0) ? fg : bg;
+            dst[0] = colour[0];
+            dst[1] = colour[1];
+            dst[2] = colour[2];
+            dst += 3;
+          }
+        } else {
+          for (pix = 0; pix < ppc; pix++) {
+            const uint8_t* colour =
+                TeletextPixel(pattern, pix, ppc) ? kRgb[bbc->tt_fg & 7] : kRgb[bbc->tt_bg & 7];
+            PutBeam(bbc, x + pix, yy, colour);
+          }
         }
       }
     }
@@ -4765,7 +4863,13 @@ static void VideoFlyback(BbcMachine* bbc) {
   }
   bbc->fb = bbc->beam_fb;
   bbc->beam_fb = shown;
-  memset(bbc->beam_fb, 0, (size_t)BBC_FB_WIDTH * BBC_FB_HEIGHT * 3);
+  {
+    int clear_h = bbc->frame_height > height ? bbc->frame_height : height;
+    if (clear_h <= 0 || clear_h > BBC_FB_HEIGHT) {
+      clear_h = BBC_FB_HEIGHT;
+    }
+    memset(bbc->beam_fb, 0, (size_t)BBC_FB_WIDTH * (size_t)clear_h * 3);
+  }
   bbc->frame_width = width;
   bbc->frame_height = height;
   bbc->beam_y = 0;
@@ -4808,13 +4912,13 @@ static void VideoEndFrame(BbcMachine* bbc) {
 static void MaybeInvertCursor(BbcMachine* bbc, int x, int y, int w, uint16_t ma, int ra) {
   int i;
   uint8_t* p;
-  if (!CursorBlinkOn(bbc) || bbc->beam_fb == NULL) {
-    return;
-  }
   if (ma != (uint16_t)(((bbc->crtc[14] << 8) | bbc->crtc[15]) & 0x3fff)) {
     return;
   }
   if (ra < (bbc->crtc[10] & 0x1f) || ra > (bbc->crtc[11] & 0x1f)) {
+    return;
+  }
+  if (!CursorBlinkOn(bbc) || bbc->beam_fb == NULL) {
     return;
   }
   for (i = 0; i < w; i++) {
@@ -4901,9 +5005,6 @@ static void VideoClock(BbcMachine* bbc) {
   bool interlace_sync = (bbc->crtc[8] & 1) != 0;
   bool half_hit = bbc->h_count == (((bbc->crtc[0] & 0xff) + 1) >> 1);
   bool vsync_point = !interlace_sync || !bbc->do_even_frame || half_hit;
-  if (BbcMachineBeamUlaStableCrtcVsync(bbc)) {
-    vsync_point = true;
-  }
   bool vsync_ending = false;
   bool vsync_starting = false;
   bool drawing;
@@ -4918,14 +5019,24 @@ static void VideoClock(BbcMachine* bbc) {
                     bbc->h_count == (bbc->crtc[0] + skew))) {
     bbc->h_disp = false;
   }
-  if (bbc->in_vsync && bbc->vpulse == ((bbc->crtc[3] >> 4) & 0x0f) && vsync_point) {
-    vsync_ending = true;
-    bbc->in_vsync = false;
+  if (bbc->in_vsync && bbc->vpulse == ((bbc->crtc[3] >> 4) & 0x0f)) {
+    if (!vsync_point && BbcMachineBeamUlaStableCrtcVsync(bbc)) {
+      vsync_point = true;
+    }
+    if (vsync_point) {
+      vsync_ending = true;
+      bbc->in_vsync = false;
+    }
   }
-  if (!bbc->in_vsync && !bbc->had_vsync_row && vsync_point &&
+  if (!bbc->in_vsync && !bbc->had_vsync_row &&
       bbc->v_count == (bbc->crtc[7] & 0x7f)) {
-    vsync_starting = true;
-    bbc->in_vsync = true;
+    if (!vsync_point && BbcMachineBeamUlaStableCrtcVsync(bbc)) {
+      vsync_point = true;
+    }
+    if (vsync_point) {
+      vsync_starting = true;
+      bbc->in_vsync = true;
+    }
   }
   if (vsync_starting && !vsync_ending) {
     bbc->had_vsync_row = true;
@@ -4936,7 +5047,7 @@ static void VideoClock(BbcMachine* bbc) {
     VideoSetVsyncPin(bbc, bbc->in_vsync);
   }
   drawing = bbc->h_disp && bbc->v_disp && skew >= 0 && bbc->beam_y < BBC_FB_HEIGHT;
-  if (bbc->v_disp) {
+  if (bbc->v_disp && bbc->first_scanline && bbc->h_count == 0) {
     BbcMachineBeamUlaFieldBegin(bbc);
   }
   if (drawing) {
@@ -4955,7 +5066,7 @@ static void VideoClock(BbcMachine* bbc) {
       MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y, width, ma, bbc->scanline);
       MaybeInvertCursor(bbc, bbc->disp_x, bbc->beam_y + 1, width, ma, bbc->scanline);
     } else {
-      if (BbcMachineBeamUlaOverride(bbc)) {
+      if (bbc->disp_x == 0 && BbcMachineBeamUlaOverride(bbc)) {
         BbcMachineBeamUlaPreparePixelRow(bbc, bbc->beam_y);
       }
       if (bbc->scanline == 0 && bbc->v_disp && bbc->disp_x == 0 &&
@@ -5895,7 +6006,7 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
     SocketClose(fd);
@@ -7664,7 +7775,7 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 2) != 0) {
     SocketClose(fd);
@@ -7881,10 +7992,10 @@ int BbcMachineListenJoystick(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    fprintf(stderr, "Joystick socket bind on 127.0.0.1:%d failed: %s\n", port,
+    fprintf(stderr, "Joystick socket bind on port %d failed: %s\n", port,
             strerror(errno));
     SocketClose(fd);
     return -1;

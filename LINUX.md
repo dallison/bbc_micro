@@ -1,6 +1,6 @@
 # Running on Linux
 
-The machine window uses X11. A desktop Ubuntu or Debian install already has the library. The compiler needs the headers. Sound uses ALSA when those headers were present at build time. Without them the window still runs, and it stays silent.
+The machine window uses X11. A desktop Ubuntu or Debian install already has the library. The compiler needs the headers. Sound uses ALSA. The Bazel build links it always. CMake links it when `libasound2-dev` was present at configure time; without it the window still runs, and it stays silent.
 
 ## Packages
 
@@ -8,19 +8,28 @@ The machine window uses X11. A desktop Ubuntu or Debian install already has the 
 sudo apt install build-essential cmake libx11-dev libasound2-dev
 ```
 
-`libasound2-dev` is only for sound. Leave it out if you want a silent build.
+`libasound2-dev` is for sound. Leave it out of a CMake build if you want a silent program. The Bazel `bbc` needs it.
 
 ## Build
 
 From the repository root:
 
 ```
+bazelisk build //:bbc
 cmake -S . -B build
 cmake --build build
 ctest --test-dir build
 ```
 
-The window program is `build/bbc`. If CMake prints `libX11 not found`, the `libx11-dev` package is missing and `bbc` was not built. The headless `build/6502` interpreter does not need X11.
+Keep `.wintools` off `PATH` for the Bazel build. That directory is only for the Windows cross build in [WINDOWS.md](WINDOWS.md). If it was on `PATH` when Bazel configured the host compiler, the Linux link can fail with `invalid linker name in argument '-fuse-ld=...ld.lld'`. Fix it with:
+
+```
+# remove .wintools entries from PATH, then:
+bazelisk sync --configure
+bazelisk build //:bbc
+```
+
+The window program is `bazel-bin/bbc` or `build/bbc`. If CMake prints `libX11 not found`, the `libx11-dev` package is missing and `bbc` was not built. The headless `build/6502` interpreter does not need X11.
 
 Start `bbc` from a desktop session. Over SSH it needs a display (`ssh -X`, or a local session). With no display it prints `bbc: no X display` and exits.
 
@@ -48,6 +57,13 @@ bbc_b_rom_sockets/14-dfs.rom
 
 ```
 ./build/bbc -scale 1.5
+```
+
+`-fullscreen` (or `-fullscreen 1920x1080` / `-monitor 1920x1080`) fills a widescreen monitor with black side bars and keeps the BBC picture at a centered 4:3 aspect ratio. With no `WxH` argument it uses the display's current resolution. Press `F11`, `Alt+F4`, or `Alt+Q` to quit.
+
+```
+./build/bbc -fullscreen
+./build/bbc -monitor 1920x1080
 ```
 
 ## Keys

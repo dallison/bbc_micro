@@ -805,23 +805,25 @@ static void ChargeCycles(W65C02Interpreter* interpreter, bool cycle_accurate, in
     // The per-instruction hardware update is most of the cost of a memory
     // fill. While running ahead, apply it a block at a time, but never step
     // past a disc byte: the controller raises NMI when the delay expires.
-    int due = BbcMachineDiscHorizon(interpreter->bbc);
-    if (interpreter->turbo_owed > 0) {
-      if (due <= interpreter->turbo_owed) {
-        due = 0;
-      } else {
-        due -= interpreter->turbo_owed;
-      }
-    }
     if (fast && BbcMachineNeedsRealtimeVideo(interpreter->bbc)) {
       fast = false;
       interpreter->turbo = false;
       interpreter->pace_busy = 0;
     }
-    if (fast && due > step_cycles && interpreter->turbo_owed + step_cycles < 1024) {
-      interpreter->turbo_owed += step_cycles;
-      UpdatePace(interpreter, step_cycles);
-      return;
+    if (fast) {
+      int due = BbcMachineDiscHorizon(interpreter->bbc);
+      if (interpreter->turbo_owed > 0) {
+        if (due <= interpreter->turbo_owed) {
+          due = 0;
+        } else {
+          due -= interpreter->turbo_owed;
+        }
+      }
+      if (due > step_cycles && interpreter->turbo_owed + step_cycles < 1024) {
+        interpreter->turbo_owed += step_cycles;
+        UpdatePace(interpreter, step_cycles);
+        return;
+      }
     }
     if (interpreter->turbo_owed > 0) {
       cycles += interpreter->turbo_owed;
@@ -1042,54 +1044,38 @@ static int StepOneInstruction(W65C02Interpreter* interpreter, bool cycle_accurat
   // Columns x3, x7, xB and xF are one-byte, one-cycle NOPs on the G65SC12.
   // The other unused opcodes are multi-byte NOPs. Rockwell BBR/RMB are not
   // part of this CPU.
-  if (interpreter->sc12 && !(interpreter->debug && opcode == 0xff)) {
-    int nop_bytes = 0;
-    int nop_cycles = 0;
-    switch (opcode & 0x0f) {
-      case 0x03:
-      case 0x07:
-      case 0x0b:
-      case 0x0f:
-        nop_bytes = 1;
-        nop_cycles = 1;
-        break;
-      default:
-        break;
-    }
-    if (nop_cycles == 0) {
-      switch (opcode) {
-        case 0x02:
-        case 0x22:
-        case 0x42:
-        case 0x44:
-        case 0x62:
-        case 0x82:
-        case 0xc2:
-        case 0xe2:
-          nop_bytes = 2;
-          nop_cycles = 2;
-          break;
-        case 0x54:
-        case 0xd4:
-        case 0xf4:
-          nop_bytes = 2;
-          nop_cycles = 4;
-          break;
-        case 0xdc:
-        case 0xfc:
-          nop_bytes = 3;
-          nop_cycles = 4;
-          break;
-        case 0x5c:
-          nop_bytes = 3;
-          nop_cycles = 8;
-          break;
-        default:
-          break;
-      }
-    }
-    if (nop_cycles != 0) {
-      interpreter->pc = (uint16_t)(interpreter->pc + nop_bytes);
+  if (interpreter->sc12) {
+    static const uint8_t kSc12NopBytes[256] = {
+        [0x02] = 2, [0x03] = 1, [0x07] = 1, [0x0b] = 1, [0x0f] = 1, [0x13] = 1, [0x17] = 1,
+        [0x1b] = 1, [0x1f] = 1, [0x22] = 2, [0x23] = 1, [0x27] = 1, [0x2b] = 1, [0x2f] = 1,
+        [0x33] = 1, [0x37] = 1, [0x3b] = 1, [0x3f] = 1, [0x42] = 2, [0x43] = 1, [0x44] = 2,
+        [0x47] = 1, [0x4b] = 1, [0x4f] = 1, [0x53] = 1, [0x54] = 2, [0x57] = 1, [0x5b] = 1,
+        [0x5c] = 3, [0x5f] = 1, [0x62] = 2, [0x63] = 1, [0x67] = 1, [0x6b] = 1, [0x6f] = 1,
+        [0x73] = 1, [0x77] = 1, [0x7b] = 1, [0x7f] = 1, [0x82] = 2, [0x83] = 1, [0x87] = 1,
+        [0x8b] = 1, [0x8f] = 1, [0x93] = 1, [0x97] = 1, [0x9b] = 1, [0x9f] = 1, [0xa3] = 1,
+        [0xa7] = 1, [0xab] = 1, [0xaf] = 1, [0xb3] = 1, [0xb7] = 1, [0xbb] = 1, [0xbf] = 1,
+        [0xc2] = 2, [0xc3] = 1, [0xc7] = 1, [0xcb] = 1, [0xcf] = 1, [0xd3] = 1, [0xd4] = 2,
+        [0xd7] = 1, [0xdb] = 1, [0xdc] = 3, [0xdf] = 1, [0xe2] = 2, [0xe3] = 1, [0xe7] = 1,
+        [0xeb] = 1, [0xef] = 1, [0xf3] = 1, [0xf4] = 2, [0xf7] = 1, [0xfb] = 1, [0xfc] = 3,
+        [0xff] = 1,
+    };
+    static const uint8_t kSc12NopCycles[256] = {
+        [0x02] = 2, [0x03] = 1, [0x07] = 1, [0x0b] = 1, [0x0f] = 1, [0x13] = 1, [0x17] = 1,
+        [0x1b] = 1, [0x1f] = 1, [0x22] = 2, [0x23] = 1, [0x27] = 1, [0x2b] = 1, [0x2f] = 1,
+        [0x33] = 1, [0x37] = 1, [0x3b] = 1, [0x3f] = 1, [0x42] = 2, [0x43] = 1, [0x44] = 2,
+        [0x47] = 1, [0x4b] = 1, [0x4f] = 1, [0x53] = 1, [0x54] = 4, [0x57] = 1, [0x5b] = 1,
+        [0x5c] = 8, [0x5f] = 1, [0x62] = 2, [0x63] = 1, [0x67] = 1, [0x6b] = 1, [0x6f] = 1,
+        [0x73] = 1, [0x77] = 1, [0x7b] = 1, [0x7f] = 1, [0x82] = 2, [0x83] = 1, [0x87] = 1,
+        [0x8b] = 1, [0x8f] = 1, [0x93] = 1, [0x97] = 1, [0x9b] = 1, [0x9f] = 1, [0xa3] = 1,
+        [0xa7] = 1, [0xab] = 1, [0xaf] = 1, [0xb3] = 1, [0xb7] = 1, [0xbb] = 1, [0xbf] = 1,
+        [0xc2] = 2, [0xc3] = 1, [0xc7] = 1, [0xcb] = 1, [0xcf] = 1, [0xd3] = 1, [0xd4] = 4,
+        [0xd7] = 1, [0xdb] = 1, [0xdc] = 4, [0xdf] = 1, [0xe2] = 2, [0xe3] = 1, [0xe7] = 1,
+        [0xeb] = 1, [0xef] = 1, [0xf3] = 1, [0xf4] = 4, [0xf7] = 1, [0xfb] = 1, [0xfc] = 4,
+        [0xff] = 1,
+    };
+    int nop_cycles = kSc12NopCycles[opcode];
+    if (nop_cycles != 0 && !(interpreter->debug && opcode == 0xff)) {
+      interpreter->pc = (uint16_t)(interpreter->pc + kSc12NopBytes[opcode]);
       nop_cycles += MaybeTakeIrq(interpreter);
       ChargeCycles(interpreter, cycle_accurate, nop_cycles);
       return nop_cycles;
@@ -1342,8 +1328,9 @@ static void W65C02WriteByte(W65C02Interpreter* interpreter, uint16_t addr, uint8
   if (interpreter->write_protect != 0 && addr >= interpreter->write_protect) {
     return;
   }
-  if (!BbcMachineSidewaysRom(interpreter->bbc, addr) &&
-      !BbcMachineMosRom(interpreter->bbc, addr)) {
+  if (addr < 0x8000 ||
+      (!BbcMachineSidewaysRom(interpreter->bbc, addr) &&
+       !BbcMachineMosRom(interpreter->bbc, addr))) {
     *p = value;
     W65C02NoteStore(interpreter, addr);
   }
@@ -1447,7 +1434,8 @@ SET_OVERFLOW(((~(interpreter->a ^ src)) & (interpreter->a ^ result)) & 0x80);
 // Load a register with a value.
 #define LOAD(reg, addr) { \
   if (!W65C02MemIsIo(interpreter, addr)) {\
-    if (IsWatchedAddress(interpreter, kWatchRead, addr, interpreter->reg)) { \
+    if (interpreter->watchpoints.length != 0 && \
+        IsWatchedAddress(interpreter, kWatchRead, addr, interpreter->reg)) { \
         DebuggerLoop(interpreter);\
     } \
     SET_FLAGS(interpreter->reg = *(addr));\
@@ -1464,21 +1452,26 @@ SET_OVERFLOW(((~(interpreter->a ^ src)) & (interpreter->a ^ result)) & 0x80);
   }\
 }
 
-#define LOAD_ZP(reg, addr)     if (IsWatchedAddress(interpreter, kWatchRead, addr, interpreter->reg)) { \
+#define LOAD_ZP(reg, addr) \
+  if (interpreter->watchpoints.length != 0 && \
+      IsWatchedAddress(interpreter, kWatchRead, addr, interpreter->reg)) { \
     DebuggerLoop(interpreter);\
-} \
-SET_FLAGS(interpreter->reg = *(addr));
+  } \
+  SET_FLAGS(interpreter->reg = *(addr));
 
 // Store a register into an address.
 #define STORE(reg, addr) { \
   if (!W65C02MemIsIo(interpreter, addr)) {\
-    if (IsWatchedAddress(interpreter, kWatchWrite, addr, interpreter->reg)) { \
-    DebuggerLoop(interpreter);\
-  } \
-    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory)) && \
-        !BbcMachineMosRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
+    uint16_t _off = (uint16_t)((addr) - interpreter->memory); \
+    if (interpreter->watchpoints.length != 0 && \
+        IsWatchedAddress(interpreter, kWatchWrite, addr, interpreter->reg)) { \
+      DebuggerLoop(interpreter);\
+    } \
+    if (_off < 0x8000 || \
+        (!BbcMachineSidewaysRom(interpreter->bbc, _off) && \
+         !BbcMachineMosRom(interpreter->bbc, _off))) { \
       *(addr) = interpreter->reg;\
-      W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory)); \
+      W65C02NoteStore(interpreter, _off); \
     } \
   } else {\
     W65C02CatchUp(interpreter); \
@@ -1493,21 +1486,25 @@ SET_FLAGS(interpreter->reg = *(addr));
   }\
 }
 
-#define STORE_ZP(reg, addr)   if (IsWatchedAddress(interpreter, kWatchWrite, addr, interpreter->reg)) { \
-  DebuggerLoop(interpreter);\
-} \
-*(addr) = interpreter->reg; \
-W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory));
+#define STORE_ZP(reg, addr) \
+  if (interpreter->watchpoints.length != 0 && \
+      IsWatchedAddress(interpreter, kWatchWrite, addr, interpreter->reg)) { \
+    DebuggerLoop(interpreter);\
+  } \
+  *(addr) = interpreter->reg;
 
 #define STORE_ZERO(addr) { \
   if (!W65C02MemIsIo(interpreter, addr)) {\
-    if (IsWatchedAddress(interpreter, kWatchWrite, addr, 0)) { \
+    uint16_t _off = (uint16_t)((addr) - interpreter->memory); \
+    if (interpreter->watchpoints.length != 0 && \
+        IsWatchedAddress(interpreter, kWatchWrite, addr, 0)) { \
       DebuggerLoop(interpreter);\
     } \
-    if (!BbcMachineSidewaysRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory)) && \
-        !BbcMachineMosRom(interpreter->bbc, (uint16_t)((addr) - interpreter->memory))) { \
+    if (_off < 0x8000 || \
+        (!BbcMachineSidewaysRom(interpreter->bbc, _off) && \
+         !BbcMachineMosRom(interpreter->bbc, _off))) { \
       *(addr) = 0;\
-      W65C02NoteStore(interpreter, (uint16_t)((addr) - interpreter->memory)); \
+      W65C02NoteStore(interpreter, _off); \
     } \
   } else {\
     W65C02CatchUp(interpreter); \

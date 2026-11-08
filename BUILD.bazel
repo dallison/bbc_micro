@@ -5,7 +5,10 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 LINUX_COPTS = select({
-    "@platforms//os:linux": ["-D_GNU_SOURCE"],
+    "@platforms//os:linux": [
+        "-D_GNU_SOURCE",
+        "-O3",
+    ],
     "//conditions:default": [],
 })
 
@@ -226,7 +229,11 @@ cc_binary(
         "@platforms//os:linux": ["6502_interpreter/bbc_linux.c"],
         "//conditions:default": ["6502_interpreter/bbc_entry.c"],
     }),
-    copts = COMMON_COPTS,
+    # Linux sound needs libasound2-dev, the same package CMake looks for.
+    copts = COMMON_COPTS + select({
+        "@platforms//os:linux": ["-DBBC_HAVE_ALSA=1"],
+        "//conditions:default": [],
+    }),
     data = select({
         "@platforms//os:macos": [":mac_app_icon"],
         "//conditions:default": [],
@@ -235,6 +242,7 @@ cc_binary(
         "@platforms//os:linux": [
             "-lX11",
             "-lpthread",
+            "-lasound",
         ],
         "//conditions:default": [
             "-framework",

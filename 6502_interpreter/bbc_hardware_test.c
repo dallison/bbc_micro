@@ -1548,8 +1548,8 @@ static int CumanaConnect(int port) {
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+  if (!SocketResolveIpv4("localhost", &addr.sin_addr) ||
+      connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
     SocketClose(fd);
     return -1;
   }

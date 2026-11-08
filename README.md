@@ -21,13 +21,13 @@ cmake --build build
 ctest --test-dir build
 ```
 
-`bbc` is the machine window. On a Mac it uses Cocoa and AudioToolbox. On Linux it uses X11, which a desktop Ubuntu or Debian install already has, and ALSA when those headers were present at build time. Compiling the Linux window needs the X11 headers:
+`bbc` is the machine window. On a Mac it uses Cocoa and AudioToolbox. On Linux it uses X11, which a desktop Ubuntu or Debian install already has, and ALSA for sound. Compiling the Linux window needs the X11 and ALSA headers:
 
 ```
 sudo apt install build-essential cmake libx11-dev libasound2-dev
 ```
 
-`libasound2-dev` is only for sound. Step-by-step Ubuntu and Debian instructions are in [LINUX.md](LINUX.md).
+Bazel always links ALSA on Linux. CMake links it when `libasound2-dev` was present at configure time. Step-by-step Ubuntu and Debian instructions are in [LINUX.md](LINUX.md).
 
 On Windows `bbc.exe` uses GDI and waveOut, which every install has. It builds with MinGW-w64 under MSYS2, or on Linux with a cross compiler, and runs there under Wine. Both are in [WINDOWS.md](WINDOWS.md).
 
