@@ -333,6 +333,8 @@ static bool ModifierSym(KeySym sym) {
          sym == XK_Super_R || sym == XK_Meta_L || sym == XK_Meta_R || sym == XK_ISO_Level3_Shift;
 }
 
+static void ToggleFullscreen(void);
+
 static void PressHostKey(XKeyEvent* event) {
   KeySym sym;
   int column = 0;
@@ -348,6 +350,11 @@ static void PressHostKey(XKeyEvent* event) {
       ((event->state & (Mod1Mask | Mod4Mask)) != 0 &&
        (sym == XK_F4 || sym == XK_q || sym == XK_Q))) {
     g_running = false;
+    return;
+  }
+  if ((event->state & (Mod1Mask | Mod4Mask)) != 0 &&
+      (sym == XK_Return || sym == XK_KP_Enter || sym == XK_f || sym == XK_F)) {
+    ToggleFullscreen();
     return;
   }
   if (sym == XK_F12) {
@@ -1089,6 +1096,7 @@ static void HideCursor(void) {
   }
   cursor = XCreatePixmapCursor(g_dpy, blank, blank, &black, &black, 0, 0);
   XDefineCursor(g_dpy, g_win, cursor);
+  XFreeCursor(g_dpy, cursor);
   XFreePixmap(g_dpy, blank);
 }
 
@@ -1103,7 +1111,10 @@ static void EnterFullscreen(int screen, int width, int height) {
   Atom motif_atom = XInternAtom(g_dpy, "_MOTIF_WM_HINTS", False);
   Atom wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
   Atom fullscreen = XInternAtom(g_dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  XSizeHints hints;
   XEvent ev;
+  memset(&hints, 0, sizeof(hints));
+  XSetWMNormalHints(g_dpy, g_win, &hints);
   XChangeProperty(g_dpy, g_win, motif_atom, motif_atom, 32, PropModeReplace,
                   (const unsigned char*)&motif, 5);
   XChangeProperty(g_dpy, g_win, wm_state, XA_ATOM, 32, PropModeReplace,
@@ -1120,6 +1131,67 @@ static void EnterFullscreen(int screen, int width, int height) {
   XSendEvent(g_dpy, RootWindow(g_dpy, screen), False,
              SubstructureRedirectMask | SubstructureNotifyMask, &ev);
   HideCursor();
+}
+
+static void LeaveFullscreen(int screen) {
+  struct {
+    unsigned long flags;
+    unsigned long functions;
+    unsigned long decorations;
+    long input_mode;
+    unsigned long status;
+  } motif = {2, 0, 1, 0, 0};
+  Atom motif_atom = XInternAtom(g_dpy, "_MOTIF_WM_HINTS", False);
+  Atom wm_state = XInternAtom(g_dpy, "_NET_WM_STATE", False);
+  Atom fullscreen = XInternAtom(g_dpy, "_NET_WM_STATE_FULLSCREEN", False);
+  XEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  ev.type = ClientMessage;
+  ev.xclient.window = g_win;
+  ev.xclient.message_type = wm_state;
+  ev.xclient.format = 32;
+  ev.xclient.data.l[0] = 0;
+  ev.xclient.data.l[1] = (long)fullscreen;
+  XSendEvent(g_dpy, RootWindow(g_dpy, screen), False,
+             SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+  XDeleteProperty(g_dpy, g_win, wm_state);
+  XChangeProperty(g_dpy, g_win, motif_atom, motif_atom, 32, PropModeReplace,
+                  (const unsigned char*)&motif, 5);
+  XUndefineCursor(g_dpy, g_win);
+}
+
+static void ToggleFullscreen(void) {
+  int screen;
+  bool full;
+  if (g_dpy == NULL || g_win == 0) {
+    return;
+  }
+  ReleaseAllKeys();
+  screen = DefaultScreen(g_dpy);
+  full = !BbcSessionFullscreen();
+  BbcSessionSetFullscreen(full);
+  g_sized_w = 0;
+  g_sized_h = 0;
+  if (full) {
+    int w = 0;
+    int h = 0;
+    BbcSessionMonitorSize(&w, &h);
+    if (w <= 0 || h <= 0) {
+      w = DisplayWidth(g_dpy, screen);
+      h = DisplayHeight(g_dpy, screen);
+    }
+    CreateImage(w, h);
+    EnterFullscreen(screen, w, h);
+  } else {
+    int fw = g_cpu.bbc != NULL && BbcFrameWidth(g_cpu.bbc) > 0 ? BbcFrameWidth(g_cpu.bbc) : 640;
+    int fh = g_cpu.bbc != NULL && BbcFrameHeight(g_cpu.bbc) > 0 ? BbcFrameHeight(g_cpu.bbc) : 512;
+    LeaveFullscreen(screen);
+    CreateImage(g_win_w, g_win_h);
+    FitWindow(fw, fh);
+  }
+  XClearWindow(g_dpy, g_win);
+  BlitFrame();
+  XFlush(g_dpy);
 }
 
 static bool OpenWindow(void) {

@@ -260,6 +260,32 @@ static bool LetterKey(unsigned short key_code) {
   }
 }
 
+static void ToggleMacFullscreen(void) {
+  NSWindow* window = [NSApp mainWindow];
+  bool full;
+  if (window == nil && [NSApp windows].count > 0) {
+    window = [NSApp windows][0];
+  }
+  if (window == nil) {
+    return;
+  }
+  ReleaseStuckKeys();
+  full = !BbcSessionFullscreen();
+  BbcSessionSetFullscreen(full);
+  if (full) {
+    [window setResizeIncrements:NSMakeSize(1, 1)];
+    if ((window.styleMask & NSWindowStyleMaskFullScreen) == 0) {
+      [window toggleFullScreen:nil];
+    }
+  } else {
+    if ((window.styleMask & NSWindowStyleMaskFullScreen) != 0) {
+      [window toggleFullScreen:nil];
+    }
+    [window setContentAspectRatio:NSMakeSize(5, 4)];
+  }
+  [window.contentView setNeedsDisplay:YES];
+}
+
 static void PressHostKey(NSEvent* event) {
   int column = 0;
   int row = 0;
@@ -279,6 +305,11 @@ static void PressHostKey(NSEvent* event) {
       (event.modifierFlags & NSEventModifierFlagOption) != 0) {
     ApplyMomentaryModifiers(event.modifierFlags);
     W65C02InterpreterResetCpu(&g_cpu);
+    return;
+  }
+  if ((event.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagOption)) != 0 &&
+      (event.keyCode == 36 || event.keyCode == 76 || event.keyCode == 3)) {
+    ToggleMacFullscreen();
     return;
   }
   ReleaseHostKey(event.keyCode);

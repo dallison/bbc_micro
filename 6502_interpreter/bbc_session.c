@@ -96,8 +96,9 @@ static void Usage(void) {
           "       -fullscreen [WxH] or -monitor WxH (for example 1920x1080)\n"
           "       fills a 16:9 monitor with black side bars and keeps the\n"
           "       BBC display at a 4:3 aspect ratio in the middle. With no\n"
-          "       WxH, the display's current resolution is used. F11, Alt+F4,\n"
-          "       or Alt+Q quits.\n"
+          "       WxH, the display's current resolution is used. Alt+Return\n"
+          "       or Alt+F (or Cmd+Return / Cmd+F on a Mac) switches between\n"
+          "       fullscreen and windowed mode. F11, Alt+F4, or Alt+Q quits.\n"
           "       -tube fits a second processor. 6502 is a 3 MHz NMOS chip,\n"
           "       65c02 is a 4 MHz CMOS chip, and arm is an 8 MHz ARM3 with\n"
           "       4 MB of RAM. A file replaces the built-in client. On the\n"
@@ -120,6 +121,8 @@ static void ReleaseRoms(void) {
 double BbcSessionScreenScale(void) { return g_screen_scale; }
 
 bool BbcSessionFullscreen(void) { return g_fullscreen; }
+
+void BbcSessionSetFullscreen(bool fullscreen) { g_fullscreen = fullscreen; }
 
 void BbcSessionMonitorSize(int* width, int* height) {
   if (width != NULL) {

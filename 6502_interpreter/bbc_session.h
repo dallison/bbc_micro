@@ -24,6 +24,7 @@ double BbcSessionScreenScale(void);
 // fills the monitor (or the explicit WxH resolution if non-zero) with black
 // side bars and draws the BBC display as a centered 4:3 picture.
 bool BbcSessionFullscreen(void);
+void BbcSessionSetFullscreen(bool fullscreen);
 void BbcSessionMonitorSize(int* width, int* height);
 
 // Each Caps Lock press toggles the BBC lock. With this set, the key

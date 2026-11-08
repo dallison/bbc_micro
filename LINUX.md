@@ -59,7 +59,7 @@ bbc_b_rom_sockets/14-dfs.rom
 ./build/bbc -scale 1.5
 ```
 
-`-fullscreen` (or `-fullscreen 1920x1080` / `-monitor 1920x1080`) fills a widescreen monitor with black side bars and keeps the BBC picture at a centered 4:3 aspect ratio. With no `WxH` argument it uses the display's current resolution. Press `F11`, `Alt+F4`, or `Alt+Q` to quit.
+`-fullscreen` (or `-fullscreen 1920x1080` / `-monitor 1920x1080`) fills a widescreen monitor with black side bars and keeps the BBC picture at a centered 4:3 aspect ratio. With no `WxH` argument it uses the display's current resolution. Press `Alt+Return` or `Alt+F` (or `Cmd+Return` / `Cmd+F` on a Mac) to switch between fullscreen and windowed mode. Press `F11`, `Alt+F4`, or `Alt+Q` to quit.
 
 ```
 ./build/bbc -fullscreen
