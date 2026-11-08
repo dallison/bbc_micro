@@ -130,14 +130,17 @@ static uint32_t g_put_valid = 0;
 
 static uint8_t g_stash[ECONET_MAX_FRAME];
 static int g_stash_len = 0;
+static struct sockaddr_in g_peer_addr;
+static bool g_peer_valid = false;
 
 static void Usage(void) {
   fprintf(stderr,
-          "usage: fileserver [-station 1-254] [-port n] directory\n"
+          "usage: fileserver [-station 1-254] [-host addr] [-port n] directory\n"
           "       Serves that directory as an Econet file server disc.\n"
           "       The default station is 254, which is the file server a\n"
           "       BBC looks for. The default wire is UDP port %d, the same\n"
-          "       one as bbc -econet. The BBC needs an NFS or ANFS ROM,\n"
+          "       one as bbc -econet. -host names a remote bbc machine by\n"
+          "       IP address or hostname. The BBC needs an NFS or ANFS ROM,\n"
           "       then the network filing system, then *I AM name.\n",
           ECONET_PORT);
 }
@@ -1009,11 +1012,32 @@ static void SendRaw(const uint8_t* frame, int len) {
   packet[12] = (uint8_t)(len >> 8);
   packet[13] = (uint8_t)len;
   memcpy(packet + 14, frame, (size_t)len);
+  if (g_peer_valid) {
+    sendto(g_fd, (const char*)packet, 14 + len, 0, (struct sockaddr*)&g_peer_addr,
+           sizeof(g_peer_addr));
+    return;
+  }
   memset(&dest, 0, sizeof(dest));
   dest.sin_family = AF_INET;
   dest.sin_port = htons((uint16_t)g_udp_port);
   inet_pton(AF_INET, ECONET_GROUP, &dest.sin_addr);
   sendto(g_fd, (const char*)packet, 14 + len, 0, (struct sockaddr*)&dest, sizeof(dest));
+}
+
+static void SendBeacon(void) {
+  uint8_t packet[14];
+  if (!g_peer_valid || g_fd < 0) {
+    return;
+  }
+  memcpy(packet, "ECONET01", 8);
+  packet[8] = (uint8_t)(g_instance >> 24);
+  packet[9] = (uint8_t)(g_instance >> 16);
+  packet[10] = (uint8_t)(g_instance >> 8);
+  packet[11] = (uint8_t)g_instance;
+  packet[12] = 0;
+  packet[13] = 0;
+  sendto(g_fd, (const char*)packet, sizeof(packet), 0, (struct sockaddr*)&g_peer_addr,
+         sizeof(g_peer_addr));
 }
 
 static int MakeDir(const char* path) {
@@ -1040,7 +1064,9 @@ static int RecvRaw(uint8_t* frame, int cap, int timeout_ms, bool use_stash) {
   }
   for (;;) {
     uint8_t buf[14 + ECONET_MAX_FRAME];
-    ssize_t n = recvfrom(g_fd, (char*)buf, (int)sizeof(buf), 0, NULL, NULL);
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(g_fd, (char*)buf, (int)sizeof(buf), 0, (struct sockaddr*)&from, &from_len);
     uint32_t instance;
     int len;
     if (n < 0) {
@@ -1052,7 +1078,13 @@ static int RecvRaw(uint8_t* frame, int cap, int timeout_ms, bool use_stash) {
     instance = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 8) |
                (uint32_t)buf[11];
     len = ((int)buf[12] << 8) | buf[13];
-    if (instance == g_instance || len <= 0 || len > cap || 14 + len > (int)n) {
+    if (instance == g_instance) {
+      continue;
+    }
+    if (g_peer_valid && from.sin_family == AF_INET) {
+      g_peer_addr = from;
+    }
+    if (len <= 0 || len > cap || 14 + len > (int)n) {
       continue;
     }
     memcpy(frame, buf + 14, (size_t)len);
@@ -4138,19 +4170,26 @@ static void OnFrame(const uint8_t* frame, int len) {
 }
 
 static void Serve(void) {
+  int idle = 0;
   fprintf(stderr, "File server station %u, UDP port %d, disc %s\n", g_station, g_udp_port, g_root);
   fprintf(stderr, "On the BBC: -econet 1, select NFS, then *I AM name\n");
+  SendBeacon();
   for (;;) {
     uint8_t frame[ECONET_MAX_FRAME];
     int n = RecvRaw(frame, (int)sizeof(frame), 200, true);
     if (n > 0) {
+      idle = 0;
       OnFrame(frame, n);
+    } else if (++idle >= 10) {
+      idle = 0;
+      SendBeacon();
     }
   }
 }
 
 int main(int argc, char** argv) {
   int i;
+  const char* host = NULL;
   const char* dir = NULL;
   char resolved[1024];
   for (i = 1; i < argc; i++) {
@@ -4161,6 +4200,12 @@ int main(int argc, char** argv) {
         return 1;
       }
       g_station = (uint8_t)station;
+    } else if (strcmp(argv[i], "-host") == 0) {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+        Usage();
+        return 1;
+      }
+      host = argv[++i];
     } else if (strcmp(argv[i], "-port") == 0) {
       if (i + 1 >= argc || (g_udp_port = ParsePort(argv[++i])) < 0) {
         Usage();
@@ -4180,6 +4225,16 @@ int main(int argc, char** argv) {
       strlen(resolved) >= sizeof(g_root)) {
     Usage();
     return 1;
+  }
+  if (host != NULL) {
+    memset(&g_peer_addr, 0, sizeof(g_peer_addr));
+    g_peer_addr.sin_family = AF_INET;
+    g_peer_addr.sin_port = htons((uint16_t)g_udp_port);
+    if (!SocketResolveIpv4(host, &g_peer_addr.sin_addr)) {
+      fprintf(stderr, "fileserver: cannot resolve host '%s'\n", host);
+      return 1;
+    }
+    g_peer_valid = true;
   }
   snprintf(g_root, sizeof(g_root), "%s", resolved);
   DiscName(g_root);

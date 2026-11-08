@@ -108,7 +108,7 @@ static int ConnectTo(const char* host, int port) {
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)port);
-  if (inet_pton(AF_INET, host, &addr.sin_addr) != 1 ||
+  if (!SocketResolveIpv4(host, &addr.sin_addr) ||
       connect(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
     SocketClose(fd);
     return -1;

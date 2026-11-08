@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 
 #ifdef _WIN32
@@ -32,6 +33,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -198,6 +200,27 @@ static inline uint32_t HostProcessId(void) {
 }
 
 #endif
+
+// Resolve an IPv4 address or hostname (for example "192.168.1.50" or
+// "raspberrypi.local") into *out.
+static inline bool SocketResolveIpv4(const char* host, struct in_addr* out) {
+  struct addrinfo hints;
+  struct addrinfo* res = NULL;
+  if (host == NULL || host[0] == '\0' || out == NULL) {
+    return false;
+  }
+  if (inet_pton(AF_INET, host, out) == 1) {
+    return true;
+  }
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) {
+    return false;
+  }
+  *out = ((struct sockaddr_in*)res->ai_addr)->sin_addr;
+  freeaddrinfo(res);
+  return true;
+}
 
 #ifdef __cplusplus
 }

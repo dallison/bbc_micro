@@ -397,6 +397,8 @@ struct BbcMachine {
     int rx_len;
     int rx_pos;
     bool rx_active;
+    struct sockaddr_in peer_addr;
+    bool peer_valid;
     uint8_t inbox[4][2048];
     int inbox_len[4];
     int inbox_n;
@@ -3563,6 +3565,10 @@ static void EconetPublish(BbcMachine* bbc, const uint8_t* data, int len) {
   dest.sin_port = htons((uint16_t)bbc->econet.port);
   inet_pton(AF_INET, ECONET_GROUP, &dest.sin_addr);
   sendto(bbc->econet.fd, (const char*)packet, 14 + len, 0, (struct sockaddr*)&dest, sizeof(dest));
+  if (bbc->econet.peer_valid) {
+    sendto(bbc->econet.fd, (const char*)packet, 14 + len, 0,
+           (struct sockaddr*)&bbc->econet.peer_addr, sizeof(bbc->econet.peer_addr));
+  }
 }
 
 static void EconetPoll(BbcMachine* bbc) {
@@ -3571,7 +3577,10 @@ static void EconetPoll(BbcMachine* bbc) {
   }
   for (;;) {
     uint8_t buf[14 + ECONET_MAX_FRAME];
-    ssize_t n = recvfrom(bbc->econet.fd, (char*)buf, (int)sizeof(buf), 0, NULL, NULL);
+    struct sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    ssize_t n = recvfrom(bbc->econet.fd, (char*)buf, (int)sizeof(buf), 0,
+                         (struct sockaddr*)&from, &from_len);
     uint32_t instance;
     int len;
     if (n < 0) {
@@ -3583,6 +3592,11 @@ static void EconetPoll(BbcMachine* bbc) {
     instance = ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) | ((uint32_t)buf[10] << 8) |
                (uint32_t)buf[11];
     len = ((int)buf[12] << 8) | buf[13];
+    if (len == 0 && n == 14 && instance != bbc->econet.instance && from.sin_family == AF_INET) {
+      bbc->econet.peer_addr = from;
+      bbc->econet.peer_valid = true;
+      continue;
+    }
     if (len <= 0 || len > ECONET_MAX_FRAME || 14 + len > (int)n) {
       continue;
     }
@@ -5992,7 +6006,7 @@ int BbcMachineListenDiscs(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 4) != 0) {
     SocketClose(fd);
@@ -7732,7 +7746,7 @@ int BbcMachineListenTapes(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0 || listen(fd, 2) != 0) {
     SocketClose(fd);
@@ -7949,10 +7963,10 @@ int BbcMachineListenJoystick(BbcMachine* bbc, int port) {
 #endif
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
   addr.sin_port = htons((uint16_t)port);
   if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-    fprintf(stderr, "Joystick socket bind on 127.0.0.1:%d failed: %s\n", port,
+    fprintf(stderr, "Joystick socket bind on port %d failed: %s\n", port,
             strerror(errno));
     SocketClose(fd);
     return -1;
