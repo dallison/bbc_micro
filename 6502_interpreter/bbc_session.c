@@ -35,10 +35,10 @@ static void Usage(void) {
           "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
           "           [-keyboard uk|us] [-fullscreen [WxH]] [-monitor WxH]\n"
           "           [-econet station] [-econet-port n]\n"
-          "       The default machine is the Model B. Its ROMs come from\n"
-          "       bbc_b_rom_sockets. master and master128 use\n"
-          "       bbc_master_rom_sockets, a 65SC12, a WD1770, and sideways RAM\n"
-          "       in sockets 4-7. master256 makes every sideways socket RAM.\n"
+          "       The default machine is the Master (master or master128). Its\n"
+          "       ROMs come from bbc_master_rom_sockets, with a 65SC12, a WD1770,\n"
+          "       and sideways RAM in sockets 4-7. master256 makes every sideways\n"
+          "       socket RAM. -machine b selects the Model B (bbc_b_rom_sockets).\n"
           "       -sram 4, 8, 16, or a list such as 4-7 replaces that set.\n"
           "       os.rom or os-<name>.rom is the OS. <socket>-<name>.rom is\n"
           "       sideways socket 0-15, virtual image 0. <socket>.<virtual>-<name>.rom\n"
@@ -203,7 +203,7 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
   int econet_station = 0;
   int econet_port = BBC_ECONET_PORT;
   const char* roms_arg = NULL;
-  int machine = BBC_MACHINE_B;
+  int machine = BBC_MACHINE_MASTER;
   bool sram_set = false;
   bool sram[16];
   bool skip_slot[16];

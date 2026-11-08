@@ -85,7 +85,7 @@ int main(int argc, char *argv[]) {
   int bbc_keyboard = BBC_KEYBOARD_UK;
   bool bbc_65c02 = false;
   int bbc_mhz = 0;
-  int bbc_model = BBC_MACHINE_B;
+  int bbc_model = BBC_MACHINE_MASTER;
   bool bbc_sram_set = false;
   bool bbc_sram[16];
   const char* bbc_tape = NULL;
