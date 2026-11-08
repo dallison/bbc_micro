@@ -553,6 +553,26 @@ static void ComputeViewport(int win_w, int win_h, int* vx, int* vy, int* vw, int
   *vy = (win_h - *vh) / 2;
 }
 
+static void ClearBorders(void) {
+  if (g_dpy == NULL || g_win == 0) {
+    return;
+  }
+  if (g_view_x > 0) {
+    XClearArea(g_dpy, g_win, 0, 0, (unsigned)g_view_x, (unsigned)g_win_h, False);
+  }
+  if (g_view_x + g_view_w < g_win_w) {
+    int rx = g_view_x + g_view_w;
+    XClearArea(g_dpy, g_win, rx, 0, (unsigned)(g_win_w - rx), (unsigned)g_win_h, False);
+  }
+  if (g_view_y > 0) {
+    XClearArea(g_dpy, g_win, 0, 0, (unsigned)g_win_w, (unsigned)g_view_y, False);
+  }
+  if (g_view_y + g_view_h < g_win_h) {
+    int by = g_view_y + g_view_h;
+    XClearArea(g_dpy, g_win, 0, by, (unsigned)g_win_w, (unsigned)(g_win_h - by), False);
+  }
+}
+
 static bool CreateImage(int width, int height) {
   Visual* visual;
   int depth;
@@ -639,6 +659,9 @@ static void BlitFrame(void) {
   g_prev_win_w = g_view_w;
   g_prev_win_h = g_view_h;
   g_force_full_blit = false;
+  if (full) {
+    ClearBorders();
+  }
   if (dirty_s0 > dirty_s1) {
     return;
   }
@@ -954,10 +977,14 @@ static void HandleEvent(XEvent* event) {
     int h = event->xconfigure.height;
     if (w != g_win_w || h != g_win_h) {
       CreateImage(w, h);
+    } else {
+      g_force_full_blit = true;
     }
+    ClearBorders();
     return;
   }
   if (event->type == Expose && event->xexpose.count == 0 && g_image != NULL) {
+    ClearBorders();
     if (g_force_full_blit) {
       BlitFrame();
     } else {
