@@ -51,7 +51,16 @@ bbc_b_rom_sockets/14-dfs.rom
 ./build/bbc -volume 7
 ```
 
-`-volume` is 0 for silence through 11 for full volume. The default is 7. Sound goes to the ALSA device named `default`.
+`-volume` is 0 for silence through 11 for full volume. The default is 7.
+
+Sound uses ALSA. With no `-sound` flag, HDMI is preferred when an HDMI card is present (typical on a Raspberry Pi attached to a TV), otherwise the system `default` device. Force the system default with `-sound default`, or name a PCM directly:
+
+```
+./build/bbc -sound default
+./build/bbc -sound sysdefault:CARD=vc4hdmi0
+```
+
+`aplay -L | grep -E 'sysdefault|hdmi'` lists the names on this machine.
 
 `-scale` multiplies the window. `1` is the picture's own size, and the value can be any number greater than 0 up to `4`, so `1.5` is one and a half times as wide and tall. The picture keeps its shape, and the pixels grow with the window.
 

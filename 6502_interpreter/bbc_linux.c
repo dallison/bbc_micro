@@ -86,6 +86,7 @@ static int g_bbits = 8;
 static volatile int g_audio_run = 0;
 static pthread_t g_audio_thread;
 static snd_pcm_t* g_pcm = NULL;
+static int g_audio_channels = 1;
 #endif
 
 static uint64_t MonoNs(void) {
@@ -1043,20 +1044,138 @@ static void HandleEvent(XEvent* event) {
 }
 
 #ifdef BBC_HAVE_ALSA
+static int ContainsIgnoreCase(const char* text, const char* needle) {
+  size_t n;
+  size_t i;
+  if (text == NULL || needle == NULL || needle[0] == '\0') {
+    return 0;
+  }
+  n = strlen(needle);
+  for (i = 0; text[i] != '\0'; i++) {
+    size_t j;
+    for (j = 0; j < n; j++) {
+      char a = text[i + j];
+      char b = needle[j];
+      if (a >= 'A' && a <= 'Z') {
+        a = (char)(a - 'A' + 'a');
+      }
+      if (b >= 'A' && b <= 'Z') {
+        b = (char)(b - 'A' + 'a');
+      }
+      if (a == '\0' || a != b) {
+        break;
+      }
+    }
+    if (j == n) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// HDMI cards need the plug-bearing PCMs (sysdefault/default:CARD=...), not
+// raw hw:, so S16 mono can be converted for the TV. Prefer sysdefault first.
+static int CollectHdmiDevices(char* devices[], int capacity) {
+  void** hints = NULL;
+  int count = 0;
+  int pass;
+  if (capacity <= 0 || snd_device_name_hint(-1, "pcm", &hints) < 0 || hints == NULL) {
+    return 0;
+  }
+  for (pass = 0; pass < 3 && count < capacity; pass++) {
+    int i;
+    for (i = 0; hints[i] != NULL && count < capacity; i++) {
+      char* name = snd_device_name_get_hint(hints[i], "NAME");
+      char* ioid = snd_device_name_get_hint(hints[i], "IOID");
+      char* desc = snd_device_name_get_hint(hints[i], "DESC");
+      int is_hdmi;
+      int useful;
+      if (name == NULL) {
+        free(ioid);
+        free(desc);
+        continue;
+      }
+      if (ioid != NULL && strcmp(ioid, "Input") == 0) {
+        free(name);
+        free(ioid);
+        free(desc);
+        continue;
+      }
+      is_hdmi = ContainsIgnoreCase(name, "hdmi") || ContainsIgnoreCase(desc, "hdmi");
+      if (pass == 0) {
+        useful = strncmp(name, "sysdefault:", 11) == 0;
+      } else if (pass == 1) {
+        useful = strncmp(name, "default:CARD=", 13) == 0;
+      } else {
+        useful = strncmp(name, "hdmi:", 5) == 0;
+      }
+      if (is_hdmi && useful) {
+        devices[count] = strdup(name);
+        if (devices[count] != NULL) {
+          count++;
+        }
+      }
+      free(name);
+      free(ioid);
+      free(desc);
+    }
+  }
+  snd_device_name_free_hint(hints);
+  return count;
+}
+
+static int OpenPlayback(const char* device, unsigned* rate_inout, int* channels_out) {
+  snd_pcm_t* pcm = NULL;
+  unsigned rate = *rate_inout;
+  int channels;
+  int err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0);
+  if (err < 0) {
+    return err;
+  }
+  for (channels = 1; channels <= 2; channels++) {
+    unsigned try_rate = rate;
+    err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels,
+                             try_rate, 1, 40000);
+    if (err < 0 && try_rate != 48000) {
+      try_rate = 48000;
+      err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, channels,
+                               try_rate, 1, 40000);
+    }
+    if (err >= 0) {
+      g_pcm = pcm;
+      *rate_inout = try_rate;
+      *channels_out = channels;
+      return 0;
+    }
+  }
+  snd_pcm_close(pcm);
+  return err;
+}
+
 static void* AudioThread(void* unused) {
-  int16_t samples[1024];
+  int16_t mono[1024];
+  int16_t stereo[2048];
   (void)unused;
   while (g_audio_run) {
     int frames = 1024;
     int got = 0;
+    int i;
     snd_pcm_sframes_t wrote;
+    const int16_t* out = mono;
     if (g_ready && g_cpu.bbc != NULL) {
-      got = BbcMachineReadAudio(g_cpu.bbc, samples, frames);
+      got = BbcMachineReadAudio(g_cpu.bbc, mono, frames);
     }
     if (got < frames) {
-      memset(samples + got, 0, (size_t)(frames - got) * sizeof(int16_t));
+      memset(mono + got, 0, (size_t)(frames - got) * sizeof(int16_t));
     }
-    wrote = snd_pcm_writei(g_pcm, samples, (snd_pcm_uframes_t)frames);
+    if (g_audio_channels == 2) {
+      for (i = 0; i < frames; i++) {
+        stereo[i * 2] = mono[i];
+        stereo[i * 2 + 1] = mono[i];
+      }
+      out = stereo;
+    }
+    wrote = snd_pcm_writei(g_pcm, out, (snd_pcm_uframes_t)frames);
     if (wrote < 0) {
       snd_pcm_recover(g_pcm, (int)wrote, 1);
     }
@@ -1067,26 +1186,51 @@ static void* AudioThread(void* unused) {
 static void StartAudio(void) {
   int mhz = g_cpu.clock_mhz > 0 ? g_cpu.clock_mhz : 2;
   unsigned rate = (unsigned)(48000 * mhz / 2);
-  int err;
-  err = snd_pcm_open(&g_pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-  if (err < 0) {
-    fprintf(stderr, "ALSA: unable to open the default sound device (%s)\n", snd_strerror(err));
-    g_pcm = NULL;
-    return;
+  const char* forced = BbcSessionSoundDevice();
+  char* hdmi[16];
+  int hdmi_count = 0;
+  int i;
+  int err = -1;
+  const char* opened = NULL;
+
+  g_pcm = NULL;
+  g_audio_channels = 1;
+
+  if (forced != NULL && forced[0] != '\0') {
+    err = OpenPlayback(forced, &rate, &g_audio_channels);
+    if (err < 0) {
+      fprintf(stderr, "ALSA: unable to open '%s' (%s)\n", forced, snd_strerror(err));
+      return;
+    }
+    opened = forced;
+  } else {
+    hdmi_count = CollectHdmiDevices(hdmi, 16);
+    for (i = 0; i < hdmi_count; i++) {
+      err = OpenPlayback(hdmi[i], &rate, &g_audio_channels);
+      if (err >= 0) {
+        opened = hdmi[i];
+        break;
+      }
+    }
+    if (g_pcm == NULL) {
+      err = OpenPlayback("default", &rate, &g_audio_channels);
+      if (err < 0) {
+        fprintf(stderr, "ALSA: unable to open a sound device (%s)\n", snd_strerror(err));
+        for (i = 0; i < hdmi_count; i++) {
+          free(hdmi[i]);
+        }
+        return;
+      }
+      opened = "default";
+    }
   }
-  err = snd_pcm_set_params(g_pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, rate, 1,
-                           40000);
-  if (err < 0 && rate != 48000) {
-    rate = 48000;
-    err = snd_pcm_set_params(g_pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 1, rate, 1,
-                             40000);
+
+  fprintf(stderr, "ALSA: playing on %s (%d channel%s)\n", opened, g_audio_channels,
+          g_audio_channels == 1 ? "" : "s");
+  for (i = 0; i < hdmi_count; i++) {
+    free(hdmi[i]);
   }
-  if (err < 0) {
-    fprintf(stderr, "ALSA: unable to set the sound format (%s)\n", snd_strerror(err));
-    snd_pcm_close(g_pcm);
-    g_pcm = NULL;
-    return;
-  }
+
   g_audio_run = 1;
   if (pthread_create(&g_audio_thread, NULL, AudioThread, NULL) != 0) {
     g_audio_run = 0;

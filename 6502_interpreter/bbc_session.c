@@ -20,6 +20,7 @@ static int g_monitor_h = 0;
 static bool g_game_caps = false;
 static int g_keyboard = BBC_KEYBOARD_UK;
 static bool g_keyboard_explicit = false;
+static char* g_sound_device = NULL;
 static BbcRomFile g_rom_files[BBC_ROM_IMAGE_MAX];
 static int g_rom_file_count = 0;
 
@@ -34,7 +35,7 @@ static void Usage(void) {
           "           [-tape file] [-tape-port n] [-joystick-port n]\n"
           "           [-printer file] [-mhz n] [-turbo] [-volume n] [-game-caps]\n"
           "           [-keyboard uk|us] [-fullscreen [WxH]] [-monitor WxH]\n"
-          "           [-econet station] [-econet-port n]\n"
+          "           [-sound device] [-econet station] [-econet-port n]\n"
           "       The default machine is the Master (master or master128). Its\n"
           "       ROMs come from bbc_master_rom_sockets, with a 65SC12, a WD1770,\n"
           "       and sideways RAM in sockets 4-7. master256 makes every sideways\n"
@@ -75,6 +76,13 @@ static void Usage(void) {
           "       the same as -mhz 2. -turbo lets a busy program run ahead\n"
           "       of the wall clock. -volume n is 0 for silence through 11\n"
           "       for full volume. The default is 7.\n"
+#if defined(__linux__)
+          "       -sound device selects the ALSA playback PCM. With no flag,\n"
+          "       HDMI is preferred when an HDMI card is present (for example\n"
+          "       on a Raspberry Pi), otherwise default. -sound default uses\n"
+          "       the system default. -sound sysdefault:CARD=vc4hdmi0 is a\n"
+          "       typical Pi HDMI device.\n"
+#endif
           "       Each Caps Lock press toggles the BBC lock. -game-caps keeps\n"
           "       the key down only while it is held, which games such as\n"
           "       Zalaga read directly.\n"
@@ -156,6 +164,8 @@ static bool ParseMonitorSize(const char* spec, int* width, int* height) {
 
 bool BbcSessionGameCaps(void) { return g_game_caps; }
 
+const char* BbcSessionSoundDevice(void) { return g_sound_device; }
+
 void BbcSessionPreferKeyboard(int kind) {
   if (g_keyboard_explicit) {
     return;
@@ -167,6 +177,8 @@ void BbcSessionPreferKeyboard(int kind) {
 }
 
 void BbcSessionFinish(void) {
+  free(g_sound_device);
+  g_sound_device = NULL;
   g_ready = false;
   g_cpu.running = false;
   W65C02InterpreterDestruct(&g_cpu);
@@ -448,6 +460,19 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
         return false;
       }
       volume = (int)value;
+    } else if (strcmp(argv[i], "-sound") == 0) {
+      if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+        Usage();
+        *status = 1;
+        return false;
+      }
+      free(g_sound_device);
+      g_sound_device = strdup(argv[++i]);
+      if (g_sound_device == NULL) {
+        fprintf(stderr, "Out of memory\n");
+        *status = 1;
+        return false;
+      }
     } else if (strcmp(argv[i], "-scale") == 0) {
       char* end = NULL;
       double value;

@@ -36,4 +36,8 @@ bool BbcSessionGameCaps(void);
 // -keyboard on the command line keeps its choice.
 void BbcSessionPreferKeyboard(int kind);
 
+// Linux ALSA playback device from -sound. NULL means pick HDMI when
+// present, otherwise the system default. "default" forces that device.
+const char* BbcSessionSoundDevice(void);
+
 #endif
