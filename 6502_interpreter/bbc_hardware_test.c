@@ -1175,9 +1175,10 @@ static void TestVirtualRoms(void) {
   WriteNamed(dir, "5.1-lib.rom", 0x55);
   WriteNamed(dir, "9-main.rom", 0x61);
   WriteNamed(dir, "9.1-lib.rom", 0x62);
+  WriteNamed(dir, "12-basic.rom", 0xe2);
   WriteNamed(dir, "notes.txt", 0x00);
   count = BbcMachineListRomDirectory(dir, files, BBC_ROM_IMAGE_MAX, BBC_FS_ANY);
-  EXPECT(count == 8);
+  EXPECT(count == 9);
   EXPECT(FindVirt(files, count, 4, 0) >= 0);
   EXPECT(FindVirt(files, count, 4, 1) >= 0);
   EXPECT(FindVirt(files, count, 4, 2) >= 0);
@@ -1231,6 +1232,18 @@ static void TestVirtualRoms(void) {
     EXPECT(ram[0x8000] == 0x62);
     BbcMachineWrite(bbc, 0xfe30, 0x99);
     EXPECT(ram[0x8000] == 0x77);
+    // Socket 12 has no virtual sub-ROMs, so bit 6 (&4C from *BASIC / OSBYTE
+    // 142) must keep image 0 mapped rather than switching to an empty page.
+    BbcMachineWrite(bbc, 0xfe30, 0x4c);
+    EXPECT(ram[0x8000] == 0xe2);
+    // Loading ROM files on a Master marks loaded sockets 4-5 as read-only ROM
+    // (so MOS 3.50's cold-reset sideways RAM clear at &FC32-&FC4D does not
+    // wipe them), while leaving unloaded sockets 6-7 as sideways RAM.
+    EXPECT(BbcMachineLoadRomFiles(bbc, files, count, skip));
+    BbcMachineWrite(bbc, 0xfe30, 5);
+    EXPECT(BbcMachineSidewaysRom(bbc, 0x8000));
+    BbcMachineWrite(bbc, 0xfe30, 6);
+    EXPECT(!BbcMachineSidewaysRom(bbc, 0x8000));
   }
   BbcRomFileFree(files, count);
   BbcMachineDestroy(bbc);
@@ -1265,6 +1278,8 @@ static void TestVirtualRoms(void) {
   snprintf(path, sizeof(path), "%s/9-main.rom", dir);
   remove(path);
   snprintf(path, sizeof(path), "%s/9.1-lib.rom", dir);
+  remove(path);
+  snprintf(path, sizeof(path), "%s/12-basic.rom", dir);
   remove(path);
   snprintf(path, sizeof(path), "%s/notes.txt", dir);
   remove(path);

@@ -637,10 +637,6 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     goto fail;
   }
   BbcMachineSetKeyboard(g_cpu.bbc, g_keyboard);
-  if (sram_set && !BbcMachineSetSidewaysRam(g_cpu.bbc, sram)) {
-    fprintf(stderr, "Unable to allocate sideways RAM\n");
-    goto fail;
-  }
   for (i = 0; i < rom_count; i++) {
     if (!W65C02InterpreterBbcLoadRom(&g_cpu, rom_slots[i], rom_paths[i])) {
       goto fail;
@@ -648,6 +644,10 @@ bool BbcSessionStart(int argc, char** argv, int* status) {
     skip_slot[rom_slots[i]] = true;
   }
   if (!BbcMachineLoadRomFiles(g_cpu.bbc, g_rom_files, g_rom_file_count, skip_slot)) {
+    goto fail;
+  }
+  if (sram_set && !BbcMachineSetSidewaysRam(g_cpu.bbc, sram)) {
+    fprintf(stderr, "Unable to allocate sideways RAM\n");
     goto fail;
   }
   for (i = 0; i < 2; i++) {

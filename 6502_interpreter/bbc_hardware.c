@@ -1860,6 +1860,32 @@ static bool EnsureMasterRam(BbcMachine* bbc) {
 
 static bool SidewaysActive(const BbcMachine* bbc);
 
+static bool SlotHasVirtual(const BbcMachine* bbc, int slot) {
+  int page;
+  if (bbc == NULL || slot < 0 || slot > 15) {
+    return false;
+  }
+  for (page = 0; page < 7; page++) {
+    if (bbc->sideways_page[slot][page] != NULL) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static int SelectedVirt(const BbcMachine* bbc) {
+  int slot = bbc->romsel & 0x0f;
+  int virt = (bbc->romsel >> 4) & 7;
+  // On a real BBC Micro, bits 4-6 of ROMSEL (&FE30) are unconnected, and
+  // MOS 3.50 / BASIC IV leave bit 6 (&40) set in X when writing $F4 and
+  // $FE30 during *BASIC (OSBYTE 142 with X = &4C for socket 12). Only treat
+  // bits 4-6 as a virtual image selector when the socket holds virtual ROMs.
+  if (virt != 0 && !SlotHasVirtual(bbc, slot)) {
+    return 0;
+  }
+  return virt;
+}
+
 bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr) {
   if (bbc == NULL || addr < 0x8000 || addr > 0xbfff || !SidewaysActive(bbc)) {
     return false;
@@ -1869,7 +1895,7 @@ bool BbcMachineSidewaysRom(const BbcMachine* bbc, uint16_t addr) {
     return false;
   }
   // Bits 4-6 select a virtual image. Those images are ROM.
-  if (((bbc->romsel >> 4) & 7) != 0) {
+  if (SelectedVirt(bbc) != 0) {
     return true;
   }
   return !bbc->sideways_ram[bbc->romsel & 0x0f];
@@ -1977,7 +2003,7 @@ static void MapRomsel(BbcMachine* bbc) {
     return;
   }
   slot = bbc->romsel & 0x0f;
-  virt = (bbc->romsel >> 4) & 7;
+  virt = SelectedVirt(bbc);
   andy = bbc->master && (bbc->romsel & 0x80) != 0;
   if (!SidewaysActive(bbc)) {
     bbc->mapped_slot = slot;
@@ -6247,10 +6273,18 @@ bool BbcMachineLoadSideways(BbcMachine* bbc, int slot, const char* path) {
   uint8_t* buf = NULL;
   size_t length = 0;
   bool ok;
+  if (bbc == NULL || slot < 0 || slot > 15) {
+    return false;
+  }
   if (!ReadWholeFile(path, &buf, &length)) {
     fprintf(stderr, "Unable to read sideways ROM '%s'\n", path);
     return false;
   }
+  // On the Master 128, sockets 4-7 default to sideways RAM, and MOS 3.50
+  // zeros sockets 7 down to 4 at &FC32-&FC4D during cold reset. Fitting a
+  // ROM image into one of those sockets makes it read-only ROM so MOS reset
+  // does not erase it.
+  bbc->sideways_ram[slot] = false;
   ok = BbcMachineLoadSidewaysBytes(bbc, slot, buf, length);
   free(buf);
   if (ok) {
@@ -6290,7 +6324,8 @@ static bool LoadSidewaysVirtual(BbcMachine* bbc, int slot, int virt, const char*
   }
   free(buf);
   bbc->any_sideways = true;
-  if (bbc->ram != NULL && bbc->mapped_slot == slot && bbc->mapped_virt == virt) {
+  if (bbc->ram != NULL && bbc->mapped_slot == slot) {
+    CommitSideways(bbc);
     bbc->mapped_slot = -1;
     bbc->mapped_virt = -1;
   }
@@ -6655,11 +6690,13 @@ bool BbcMachineSetModel(BbcMachine* bbc, int model) {
     // A flat battery reads as zeros, and a zero checksum selects ROM 0.
     // These are the user bytes MOS 3.50 keeps: language 12 (BASIC) and
     // filing system 13 (ADFS). MOS replaces them if its own checksum fails.
+    // Location 0 (CMOS byte 14) is the Econet station number (1-254); 0 and
+    // 255 are invalid and make ANFS print "Badly configured station number".
     // Location 11 bit 6 is DIR/NODIR. Leave NODIR set so ADFS and DFS do not
     // wait on an empty drive before the language starts; *ROMS and friends
     // live in the Terminal ROM and need that prompt.
     static const uint8_t kCmosUser[] = {
-        0x00, 0xfe, 0x00, 0xeb, 0x00, 0xcd, 0xff, 0xff, 0x15, 0x00, 0x17,
+        0xfe, 0xfe, 0x00, 0xeb, 0x00, 0xcd, 0xff, 0xff, 0x15, 0x00, 0x17,
         0x08, 0x32, 0x08, 0x0a, 0x2d, 0x82,
     };
     int byte;
